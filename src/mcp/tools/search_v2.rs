@@ -150,6 +150,8 @@ fn run_search_v2(
         ));
     }
     let mut follows: Vec<Option<Follow>> = Vec::with_capacity(entries.len());
+    // A pattern that does not compile fails only its own entry.
+    let mut pattern_errors: Vec<Option<String>> = Vec::with_capacity(entries.len());
     let mut structural = crate::search::StructuralPatterns::default();
     for entry in entries {
         let object = entry
@@ -176,8 +178,9 @@ fn run_search_v2(
             follows.push(Some(
                 Follow::parse_shape(hint).map_err(|e| SearchFailure::new(e, "bad_follow"))?,
             ));
+            pattern_errors.push(None);
         } else if object.contains_key("pattern") {
-            parse_structural_entry(object, cwd, &mut structural)?;
+            pattern_errors.push(parse_structural_entry(object, cwd, &mut structural)?);
             follows.push(None);
         } else {
             if object.keys().any(|k| k != "query" && k != "glob") {
@@ -194,6 +197,7 @@ fn run_search_v2(
             }
             validate_entry_glob(object, cwd, "bad_query_entry")?;
             follows.push(None);
+            pattern_errors.push(None);
         }
     }
     let mut results: Vec<(Value, Option<FileCounts>)> = Vec::with_capacity(entries.len());
@@ -202,9 +206,9 @@ fn run_search_v2(
     let mut routes_tried = Vec::with_capacity(entries.len());
     let mut normalizations = Vec::new();
     let mut failed = 0;
-    let mut first_failure: Option<String> = None;
+    let mut first_failure: Option<SearchFailure> = None;
     let entry_budget = budget / entries.len().max(1) as u64;
-    for (entry, follow) in entries.iter().zip(&follows) {
+    for ((entry, follow), pattern_error) in entries.iter().zip(&follows).zip(&pattern_errors) {
         let mut counts = None;
         let (mut result, route, mut entry_hints, diagnostic) = if let Some(follow) = follow {
             session.record_follow();
@@ -215,25 +219,33 @@ fn run_search_v2(
                     result["error"] = json!(message);
                     result["completeness"] = json!("partial");
                     failed += 1;
-                    first_failure.get_or_insert(message);
+                    first_failure.get_or_insert(SearchFailure::new(message, "route_error"));
                     (result, "error".to_string(), Vec::new(), None)
                 }
             }
         } else if let Some(pattern) = entry.get("pattern").and_then(Value::as_str) {
             let language = entry["language"].as_str().unwrap();
             session.record_structural_search();
-            let (result, route, file_counts, failure) = execute_structural_entry(
-                &structural,
-                language,
-                pattern,
-                cwd,
-                entry.get("glob").and_then(Value::as_str).or(top_glob),
-                cache,
-            );
+            let (result, route, file_counts, failure) = match pattern_error {
+                Some(message) => structural_error(pattern, message.clone()),
+                None => execute_structural_entry(
+                    &structural,
+                    language,
+                    pattern,
+                    cwd,
+                    entry.get("glob").and_then(Value::as_str).or(top_glob),
+                    cache,
+                ),
+            };
             counts = file_counts;
             if let Some(message) = failure {
                 failed += 1;
-                first_failure.get_or_insert(message);
+                let class = if pattern_error.is_some() {
+                    "bad_structural"
+                } else {
+                    "route_error"
+                };
+                first_failure.get_or_insert(SearchFailure::new(message, class));
             }
             (result, route, Vec::new(), None)
         } else {
@@ -253,7 +265,7 @@ fn run_search_v2(
                     result["error"] = json!(message);
                     result["completeness"] = json!("partial");
                     failed += 1;
-                    first_failure.get_or_insert(message);
+                    first_failure.get_or_insert(SearchFailure::new(message, "route_error"));
                     (result, "error".to_string(), Vec::new(), None)
                 }
             }
@@ -267,10 +279,7 @@ fn run_search_v2(
         }
     }
     if failed == entries.len() {
-        return Err(SearchFailure::new(
-            first_failure.unwrap_or_default(),
-            "route_error",
-        ));
+        return Err(first_failure.unwrap_or_else(|| SearchFailure::new("", "route_error")));
     }
     let partial = results.iter().any(|(r, _)| r["completeness"] == "partial");
     let route = if routes_tried.len() > 1 {
@@ -319,11 +328,13 @@ fn validate_entry_glob(
 }
 
 /// Validate one structural entry and compile its pattern into `structural`.
+/// A malformed entry fails the request; a pattern or language that does not
+/// compile returns its message so only that entry fails.
 fn parse_structural_entry(
     object: &serde_json::Map<String, Value>,
     cwd: &Path,
     structural: &mut crate::search::StructuralPatterns,
-) -> Result<(), SearchFailure> {
+) -> Result<Option<String>, SearchFailure> {
     if object
         .keys()
         .any(|key| !matches!(key.as_str(), "pattern" | "language" | "glob"))
@@ -350,9 +361,7 @@ fn parse_structural_entry(
             )
         })?;
     validate_entry_glob(object, cwd, "bad_structural")?;
-    structural
-        .prepare(language, pattern)
-        .map_err(|error| SearchFailure::new(error, "bad_structural"))
+    Ok(structural.prepare(language, pattern).err())
 }
 
 /// Build the result record for one structural scan, returning it with the
@@ -403,14 +412,19 @@ fn execute_structural_entry(
             let (result, counts) = structural_result(scan, pattern, language);
             (result, "structural".into(), Some(counts), None)
         }
-        Err(error) => {
-            let message = error.to_string();
-            let mut result = base_result(pattern, "error", "error");
-            result["error"] = json!(&message);
-            result["completeness"] = json!("partial");
-            (result, "error".into(), None, Some(message))
-        }
+        Err(error) => structural_error(pattern, error.to_string()),
     }
+}
+
+/// The error record for one structural entry that cannot run.
+fn structural_error(
+    pattern: &str,
+    message: String,
+) -> (Value, String, Option<FileCounts>, Option<String>) {
+    let mut result = base_result(pattern, "error", "error");
+    result["error"] = json!(&message);
+    result["completeness"] = json!("partial");
+    (result, "error".into(), None, Some(message))
 }
 
 /// Mark a result incomplete. Only an `ok` status degrades to `partial`; an
@@ -848,6 +862,7 @@ fn route_query(
         let (mut result, route, hints) = route_identifier(
             signature.name,
             receiver_scope,
+            None,
             glob,
             cwd,
             cache,
@@ -881,11 +896,12 @@ fn route_query(
 
     // 3. signature-prefix normalization — strip a leading declaration keyword
     // (`fn foo` -> `foo`) before identifier/path routing, so a pasted
-    // signature-shaped phrase still hits the underlying symbol.
+    // signature-shaped phrase still hits the underlying symbol. The keyword
+    // narrows the definitions to that kind.
     if let Some((kw, ident)) = strip_signature_prefix(query) {
         if is_identifier(ident) {
             let (mut result, route, hints) =
-                route_identifier(ident, None, glob, cwd, cache, session, budget)?;
+                route_identifier(ident, None, Some(kw), glob, cwd, cache, session, budget)?;
             result["query"] = json!(query);
             let diag = json!({
                 "query": query,
@@ -922,7 +938,7 @@ fn route_query(
     // usage matches or search literal content when no symbols were found.
     if is_identifier(query) {
         let (result, route, hints) =
-            route_identifier(query, None, glob, cwd, cache, session, budget)?;
+            route_identifier(query, None, None, glob, cwd, cache, session, budget)?;
         return Ok((result, route, hints, None));
     }
 
@@ -937,9 +953,13 @@ fn route_query(
 /// signature-prefix-normalized route. `receiver_scope` is a Go receiver type
 /// plus the full signature text: only that type's methods count as
 /// definitions; with none left the signature text is searched literally.
+/// `keyword` is a stripped declaration keyword: definitions of that kind win
+/// when at least one exists. A trait or interface implementation counts as a
+/// definition only for the `impl` keyword.
 fn route_identifier(
     query: &str,
     receiver_scope: Option<(&str, &str)>,
+    keyword: Option<&str>,
     glob: Option<&str>,
     cwd: &Path,
     cache: &OutlineCache,
@@ -967,7 +987,7 @@ fn route_identifier(
                 .iter()
                 .filter(|m| m.is_definition)
                 .count();
-    let mut code_defs: Vec<Match> = sym_result
+    let all_code_defs: Vec<&Match> = sym_result
         .matches
         .iter()
         .filter(|m| {
@@ -977,8 +997,17 @@ fn route_identifier(
                     crate::types::FileType::Code(_)
                 )
         })
-        .cloned()
         .collect();
+    let mut code_defs: Vec<Match> = keyword
+        .map(|keyword| declared_as(&all_code_defs, keyword))
+        .filter(|kept| !kept.is_empty())
+        .unwrap_or_else(|| {
+            all_code_defs
+                .iter()
+                .filter(|m| m.impl_target.is_none())
+                .map(|m| (*m).clone())
+                .collect()
+        });
     code_defs.sort_by(|a, b| {
         a.path
             .cmp(&b.path)
@@ -1032,28 +1061,12 @@ fn route_identifier(
         return Ok((result, "symbol".to_string(), hints));
     }
     if code_defs.len() > 1 {
+        // The candidates are the answer. A content search of the bare name
+        // would preview unrelated lines and skew completeness.
         let mut result = base_result(query, "ambiguous", "ambiguous");
         result["candidates"] = json!(candidates(&code_defs, cwd));
-        // A receiver-scoped result lists only the scoped methods, so the bare-name
-        // content search would preview unrelated lines and skew completeness.
-        if receiver_scope.is_some() {
-            if discovery_partial {
-                mark_partial(&mut result);
-            }
-            return Ok((result, "ambiguous".to_string(), Vec::new()));
-        }
-        let content_result = crate::search::search_content_raw_budgeted(query, cwd, glob, budget)?;
-        if discovery_partial
-            || content_result.files_unreadable > 0
-            || content_result.total_found > content_result.matches.len()
-        {
+        if discovery_partial {
             mark_partial(&mut result);
-        }
-        if content_result.total_found > 0 {
-            set_preview(
-                &mut result,
-                crate::search::format_raw_result_deferred(&content_result, cache, session, budget)?,
-            );
         }
         return Ok((result, "ambiguous".to_string(), Vec::new()));
     }
@@ -1099,6 +1112,32 @@ fn content_route(
         );
     }
     Ok((result, route.to_string()))
+}
+
+/// The definitions a stripped declaration keyword names. `impl` keeps trait
+/// and interface implementations. Any other keyword keeps the definitions
+/// whose declaration line holds that word; a function keyword accepts every
+/// language's function keyword.
+fn declared_as(defs: &[&Match], keyword: &str) -> Vec<Match> {
+    const FUNCTION_WORDS: &[&str] = &["fn", "function", "def", "defp", "fun", "func"];
+    let words = if FUNCTION_WORDS.contains(&keyword) {
+        FUNCTION_WORDS
+    } else {
+        std::slice::from_ref(&keyword)
+    };
+    let keep = |m: &Match| {
+        if keyword == "impl" {
+            return m.impl_target.is_some();
+        }
+        m.impl_target.is_none()
+            && m.text
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|word| words.contains(&word))
+    };
+    defs.iter()
+        .filter(|m| keep(m))
+        .map(|m| (*m).clone())
+        .collect()
 }
 
 /// Split `query` into `(keyword, identifier)` when it is exactly a
@@ -1726,8 +1765,17 @@ mod tests {
         std::fs::write(tmp.path().join("a.rs"), "fn root() {}\n").unwrap();
         std::fs::write(tmp.path().join("unreadable.rs"), [0xff, 0xfe]).unwrap();
         let (cache, session, _bloom) = components();
-        let (result, route, hints) =
-            route_identifier("root", None, None, tmp.path(), &cache, &session, 24_000).unwrap();
+        let (result, route, hints) = route_identifier(
+            "root",
+            None,
+            None,
+            None,
+            tmp.path(),
+            &cache,
+            &session,
+            24_000,
+        )
+        .unwrap();
         assert_eq!(route, "symbol");
         assert_eq!(result["status"], "partial");
         assert_eq!(result["completeness"], "partial");
@@ -1780,8 +1828,10 @@ mod tests {
     }
 
     #[test]
-    fn capped_ambiguous_candidates_and_preview_report_partial() {
-        for (definitions, references) in [(200, 0), (2, 400)] {
+    fn capped_ambiguous_candidates_report_partial() {
+        // Only the candidate cap makes an ambiguous result partial; references
+        // elsewhere are not part of the answer.
+        for (definitions, references, partial) in [(200, 0, true), (2, 400, false)] {
             let tmp = tempfile::tempdir().unwrap();
             for index in 0..definitions {
                 std::fs::write(
@@ -1800,7 +1850,11 @@ mod tests {
                     .unwrap();
             assert_eq!(result["results"][0]["resolved_as"], "ambiguous");
             assert_eq!(result["results"][0]["status"], "ambiguous");
-            assert_eq!(result["results"][0]["completeness"], "partial");
+            assert_eq!(
+                result["results"][0]["completeness"],
+                if partial { "partial" } else { "complete" }
+            );
+            assert!(result["results"][0].get("preview").is_none());
             let shown = result["results"][0]["candidates"].as_array().unwrap().len();
             assert_eq!(
                 shown,
@@ -1814,7 +1868,7 @@ mod tests {
                     .trim(),
             )
             .unwrap();
-            assert_eq!(record["partial"], true);
+            assert_eq!(record["partial"], partial);
         }
     }
 
@@ -2207,7 +2261,7 @@ mod tests {
         let outcome = h.write(
             dir.path(),
             json!({"path": "n.txt", "tag": tag, "ops": [
-                {"op": "replace_text", "old": "delta", "new": "omega"}]}),
+                {"op": "replace", "start": 74, "end": 74, "content": "omega"}]}),
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         let message = outcome.unwrap_or_else(|e| e);
@@ -2337,7 +2391,7 @@ mod tests {
         let outcome = h.write(
             dir.path(),
             json!({"path": "n.txt", "tag": tag, "ops": [
-                {"op": "replace_text", "old": "needle line 1\n", "new": "edited\n"}]}),
+                {"op": "replace", "start": 1, "end": 1, "content": "edited"}]}),
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         let message = outcome.unwrap_or_else(|e| e);
@@ -2351,7 +2405,7 @@ mod tests {
         h.write(
             dir.path(),
             json!({"path": "n.txt", "tag": tag, "ops": [
-                {"op": "replace_text", "old": "needle line 1\n", "new": "edited\n"}]}),
+                {"op": "replace", "start": 1, "end": 1, "content": "edited"}]}),
         )
         .expect("untrimmed preview lines stay editable");
     }
@@ -2374,7 +2428,7 @@ mod tests {
         let outcome = h.write(
             dir.path(),
             json!({"path": "a.rs", "tag": tag, "ops": [
-                {"op": "replace_text", "old": "let v1 = 1;", "new": "let v1 = 9;"}]}),
+                {"op": "replace", "start": 3, "end": 3, "content": "    let v1 = 9;"}]}),
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         assert!(outcome.is_err() || outcome.unwrap().contains("seen"));
@@ -2844,7 +2898,7 @@ mod tests {
     }
 
     #[test]
-    fn two_code_definitions_and_content_hits_yield_ambiguous_with_preview() {
+    fn two_code_definitions_yield_ambiguous_candidates_without_a_preview() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("a.rs"), "fn tilth_probe_dupe() {}\n").expect("write a.rs");
         std::fs::write(tmp.path().join("b.rs"), "fn tilth_probe_dupe() {}\n").expect("write b.rs");
@@ -2860,8 +2914,120 @@ mod tests {
         assert_eq!(result["resolved_as"], "ambiguous");
         let candidates = result["candidates"].as_array().expect("candidates array");
         assert_eq!(candidates.len(), 2, "candidates: {candidates:?}");
-        let preview = result["preview"].as_str().expect("preview must be present");
-        assert!(!preview.is_empty(), "preview must not be empty");
+        assert_eq!(result["completeness"], "complete");
+        assert!(result.get("preview").is_none(), "{result}");
+    }
+
+    fn trait_fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("matcher.rs"),
+            "pub trait Matcher {\n    fn is_match(&self) -> bool;\n}\n",
+        )
+        .unwrap();
+        for name in ["Regex", "Literal", "Glob"] {
+            std::fs::write(
+                tmp.path().join(format!("{}.rs", name.to_lowercase())),
+                format!(
+                    "pub struct {name};\n\nimpl Matcher for {name} {{\n    \
+                     fn is_match(&self) -> bool {{\n        true\n    }}\n}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn trait_resolves_uniquely_past_its_impl_blocks() {
+        let tmp = trait_fixture();
+        // `struct Matcher` names no definition, so the keyword falls back to the bare name.
+        for query in ["trait Matcher", "Matcher", "struct Matcher"] {
+            let response =
+                call(&json!({"cwd": tmp.path(), "queries": [{"query": query}]})).unwrap();
+            let result = &response["results"][0];
+            assert_eq!(result["resolved_as"], "symbol", "{query}: {result}");
+            assert_eq!(result["status"], "ok", "{query}: {result}");
+            assert_eq!(result["target"]["path"], "matcher.rs", "{query}");
+            assert!(
+                result["core"]
+                    .as_str()
+                    .unwrap()
+                    .contains("pub trait Matcher"),
+                "{query}: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn impl_keyword_lists_the_impl_blocks_as_candidates() {
+        let tmp = trait_fixture();
+        let response =
+            call(&json!({"cwd": tmp.path(), "queries": [{"query": "impl Matcher"}]})).unwrap();
+        let result = &response["results"][0];
+        assert_eq!(result["resolved_as"], "ambiguous", "{result}");
+        assert_eq!(result["status"], "ambiguous");
+        assert_eq!(result["completeness"], "complete");
+        assert!(result.get("preview").is_none(), "{result}");
+        let mut paths: Vec<&str> = result["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate["path"].as_str().unwrap())
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["glob.rs", "literal.rs", "regex.rs"]);
+    }
+
+    #[test]
+    fn inherent_impl_does_not_compete_with_its_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("widget.rs"),
+            "pub struct Widget;\n\nimpl Widget {\n    pub fn new() -> Self {\n        Widget\n    }\n}\n",
+        )
+        .unwrap();
+        for query in ["Widget", "struct Widget", "impl Widget"] {
+            let response =
+                call(&json!({"cwd": tmp.path(), "queries": [{"query": query}]})).unwrap();
+            let result = &response["results"][0];
+            assert_eq!(result["resolved_as"], "symbol", "{query}: {result}");
+            assert_eq!(result["target"]["line"], 1, "{query}: {result}");
+        }
+    }
+
+    #[test]
+    fn kind_keyword_selects_one_of_mixed_definitions() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("options.ts"),
+            "export interface Options {\n  verbose: boolean;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("build.py"),
+            "def Options():\n    return {}\n",
+        )
+        .unwrap();
+        let resolve = |query: &str| {
+            let response =
+                call(&json!({"cwd": tmp.path(), "queries": [{"query": query}]})).unwrap();
+            response["results"][0].clone()
+        };
+        // `fn` also accepts Python's `def`; `class` names no definition and falls back.
+        for (query, path) in [
+            ("interface Options", "options.ts"),
+            ("fn Options", "build.py"),
+        ] {
+            let result = resolve(query);
+            assert_eq!(result["resolved_as"], "symbol", "{query}: {result}");
+            assert_eq!(result["target"]["path"], path, "{query}: {result}");
+        }
+        for query in ["Options", "class Options"] {
+            let result = resolve(query);
+            assert_eq!(result["resolved_as"], "ambiguous", "{query}: {result}");
+            assert_eq!(result["candidates"].as_array().unwrap().len(), 2, "{query}");
+        }
     }
 
     #[test]
@@ -3318,6 +3484,12 @@ mod tests {
                 "UTF-8",
                 "route_error",
             ),
+            (
+                "invalid pattern",
+                json!({"cwd": root, "queries": [{"pattern": "fn broken( {", "language": "rust"}]}),
+                "invalid structural pattern",
+                "bad_structural",
+            ),
         ];
 
         for (name, args, expected_error, expected_class) in cases {
@@ -3484,6 +3656,34 @@ mod tests {
         assert!(result["error"].as_str().unwrap().contains("invalid glob"));
         assert!(counts.is_none());
         assert!(failure.is_some());
+    }
+
+    #[test]
+    fn invalid_structural_pattern_fails_only_its_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "pub fn alive() {}\n\nfn caller() {\n    alive();\n}\n",
+        )
+        .unwrap();
+        let response = call(&json!({"cwd": tmp.path(), "queries": [
+            {"query": "alive"},
+            {"pattern": "fn broken( {", "language": "rust"},
+            {"pattern": "alive()", "language": "rust"},
+        ]}))
+        .expect("one bad pattern must not abort the batch");
+        let results = response["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["resolved_as"], "symbol", "{}", results[0]);
+        assert_eq!(results[0]["status"], "ok");
+        assert_eq!(results[1]["status"], "error");
+        assert_eq!(results[1]["query"], "fn broken( {");
+        assert!(results[1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid structural pattern"));
+        assert_eq!(results[2]["resolved_as"], "structural", "{}", results[2]);
+        assert_eq!(results[2]["total_matches"], 1);
     }
 
     #[test]

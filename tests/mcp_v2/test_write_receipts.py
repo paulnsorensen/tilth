@@ -79,7 +79,7 @@ class WriteReceipts(unittest.TestCase):
         self.assertNotRegex(receipt, r"(?m)^\d+:")
         self.assertLess(len(receipt), 300, receipt)
         new_tag = TAG.search(receipt).group(1)
-        second = self.write(new_tag, [{"op": "replace_text", "old": "WRITTEN-TEXT", "new": "again"}])
+        second = self.write(new_tag, [{"op": "replace", "start": 50, "end": 50, "content": "again"}])
         self.assertFalse(harness.tool_is_error(second), harness.tool_result_text(second))
         self.assertIn("again", self.target.read_text())
 
@@ -88,7 +88,7 @@ class WriteReceipts(unittest.TestCase):
         receipt = harness.tool_result_text(
             self.write(tag, [{"op": "replace_text", "old": "row-050", "new": "WRITTEN-TEXT"}]))
         rejected = self.write(TAG.search(receipt).group(1), [
-            {"op": "replace_text", "old": "row-051", "new": "X"}])
+            {"op": "replace", "start": 51, "end": 51, "content": "X"}])
         self.assertTrue(harness.tool_is_error(rejected))
         self.assertIn("never displayed", harness.tool_result_text(rejected))
         self.assertNotIn("X\n", self.target.read_text())
@@ -98,10 +98,10 @@ class WriteReceipts(unittest.TestCase):
         receipt = harness.tool_result_text(
             self.write(tag, [{"op": "insert_after", "line": 30, "content": "new-a\nnew-b"}]))
         new_tag = TAG.search(receipt).group(1)
-        refused = self.write(new_tag, [{"op": "replace_text", "old": "row-090", "new": "X"}])
+        refused = self.write(new_tag, [{"op": "replace", "start": 92, "end": 92, "content": "X"}])
         self.assertTrue(harness.tool_is_error(refused))
         self.assertIn("never displayed", harness.tool_result_text(refused))
-        moved = self.write(new_tag, [{"op": "replace_text", "old": "row-050", "new": "moved-050"}])
+        moved = self.write(new_tag, [{"op": "replace", "start": 52, "end": 52, "content": "moved-050"}])
         self.assertFalse(harness.tool_is_error(moved), harness.tool_result_text(moved))
         self.assertIn("moved-050", self.target.read_text())
 
@@ -112,12 +112,13 @@ class WriteReceipts(unittest.TestCase):
         self.assertIn("deleted at 50", receipt)
         self.assertNotIn("changed", receipt)
 
-    def test_missing_tag_error_states_current_tag(self):
-        tag = self.read_tag()
-        rejected = self.write(None, [{"op": "replace_text", "old": "row-050", "new": "X"}])
-        message = harness.tool_result_text(rejected)
-        self.assertIn(f'tag "{tag}"', message)
-        self.assertEqual(self.target.read_text(), BODY, "a rejected edit must not write")
+    def test_missing_tag_takes_the_live_tag_after_a_read(self):
+        self.read_tag()
+        written = self.write(None, [{"op": "replace_text", "old": "row-050", "new": "X"}])
+        receipt = harness.tool_result_text(written)
+        self.assertFalse(harness.tool_is_error(written), receipt)
+        self.assertIn("changed 50", receipt)
+        self.assertEqual(self.target.read_text(), BODY.replace("row-050", "X"))
 
     def test_control_character_error_names_field_and_character(self):
         raw = (

@@ -112,7 +112,7 @@ fn authored_line_is_editable_from_the_receipt_tag_without_a_read() {
         &session,
         dir.path(),
         Some(&tag_of(&receipt)),
-        json!([{"op": "replace_text", "old": "WRITTEN-TEXT", "new": "again"}]),
+        json!([{"op": "replace", "start": 100, "end": 100, "content": "again"}]),
     )
     .expect("authored line needs no read");
     assert!(second.contains("applied"), "{second}");
@@ -134,7 +134,7 @@ fn unshown_neighbour_is_refused_from_the_receipt_tag() {
         &session,
         dir.path(),
         Some(&tag_of(&receipt)),
-        json!([{"op": "replace_text", "old": "row-101", "new": "X"}]),
+        json!([{"op": "replace", "start": 101, "end": 101, "content": "X"}]),
     )
     .expect_err("the neighbour was never displayed in this version");
     assert!(err.contains("never displayed"), "{err}");
@@ -156,7 +156,7 @@ fn pure_deletion_reports_the_deletion_point_and_marks_nothing_seen() {
         &session,
         dir.path(),
         Some(&tag_of(&receipt)),
-        json!([{"op": "replace_text", "old": "row-101", "new": "X"}]),
+        json!([{"op": "replace", "start": 100, "end": 100, "content": "X"}]),
     )
     .expect_err("the line at the deletion point was not shown");
     assert!(err.contains("never displayed"), "{err}");
@@ -178,7 +178,7 @@ fn lines_read_before_the_write_stay_editable_at_their_new_number() {
         &session,
         dir.path(),
         Some(&new_tag),
-        json!([{"op": "replace_text", "old": "row-050", "new": "moved-050"}]),
+        json!([{"op": "replace", "start": 52, "end": 52, "content": "moved-050"}]),
     )
     .expect("old line 50 (now 52) was read and is unchanged");
     assert!(second.contains("applied"), "{second}");
@@ -198,9 +198,9 @@ fn lines_never_shown_before_the_write_stay_refused() {
         &session,
         dir.path(),
         Some(&tag_of(&receipt)),
-        json!([{"op": "replace_text", "old": "row-150", "new": "X"}]),
+        json!([{"op": "replace", "start": 152, "end": 152, "content": "X"}]),
     )
-    .expect_err("row-150 was never displayed");
+    .expect_err("row-150 (now line 152) was never displayed");
     assert!(err.contains("never displayed"), "{err}");
 }
 
@@ -219,26 +219,76 @@ fn lines_after_a_deletion_shift_up_and_stay_editable() {
         &session,
         dir.path(),
         Some(&tag_of(&receipt)),
-        json!([{"op": "replace_text", "old": "row-040", "new": "X"}]),
+        json!([{"op": "replace", "start": 38, "end": 38, "content": "X"}]),
     )
     .expect("row-040 (now line 38) was read and is unchanged");
     assert!(second.contains("applied"), "{second}");
 }
 
 #[test]
-fn missing_tag_error_states_the_current_tag_when_the_file_was_displayed() {
-    let (dir, session, tag) = fixture(100);
+fn tagless_text_swap_takes_the_live_tag_when_the_file_was_displayed() {
+    let (dir, session, _tag) = fixture_shown(100, 60);
+    let receipt = write(
+        &session,
+        dir.path(),
+        None,
+        json!([{"op": "replace_text", "old": "row-050", "new": "ROW-050"}]),
+    )
+    .expect("the session displayed the live content, so the tag is known");
+    assert!(receipt.contains("changed 50"), "{receipt}");
+    let text = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
+    assert_eq!(text, rows(100).replace("row-050", "ROW-050"));
+    let second = write(
+        &session,
+        dir.path(),
+        Some(&tag_of(&receipt)),
+        json!([{"op": "replace", "start": 10, "end": 10, "content": "X"}]),
+    )
+    .expect("lines read before a filled-tag write stay editable");
+    assert!(second.contains("applied"), "{second}");
+    let err = write(
+        &session,
+        dir.path(),
+        Some(&tag_of(&second)),
+        json!([{"op": "replace", "start": 70, "end": 70, "content": "X"}]),
+    )
+    .expect_err("line 70 was never displayed");
+    assert!(err.contains("never displayed"), "{err}");
+}
+
+#[test]
+fn tagless_text_swap_keeps_the_gate_for_an_unshown_line_op() {
+    let (dir, session, _tag) = fixture_shown(100, 60);
+    let err = write(
+        &session,
+        dir.path(),
+        None,
+        json!([
+            {"op": "replace_text", "old": "row-010", "new": "ROW-010"},
+            {"op": "replace", "start": 70, "end": 70, "content": "X"},
+        ]),
+    )
+    .expect_err("the filled tag keeps the gate for line ops");
+    assert!(err.contains("never displayed"), "{err}");
+    let text = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
+    assert_eq!(text, rows(100), "a rejected edit must not write");
+}
+
+#[test]
+fn tagless_text_swap_stays_rejected_after_the_file_drifted() {
+    let (dir, session, _tag) = fixture(100);
+    let drifted = format!("top\n{}", rows(100));
+    std::fs::write(dir.path().join("f.txt"), &drifted).unwrap();
     let err = write(
         &session,
         dir.path(),
         None,
         json!([{"op": "replace_text", "old": "row-050", "new": "ROW-050"}]),
     )
-    .expect_err("tagless text swap is rejected");
-    assert!(err.contains(&format!("tag \"{tag}\"")), "{err}");
-    assert!(err.contains("1-100"), "names the displayed lines: {err}");
+    .expect_err("no snapshot holds the live content");
+    assert!(err.contains("requires the [path#TAG]"), "{err}");
     let text = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
-    assert_eq!(text, rows(100), "a rejected edit must not write");
+    assert_eq!(text, drifted, "a rejected edit must not write");
 }
 
 #[test]
@@ -407,4 +457,29 @@ fn duplicate_insert_marks_its_own_line_not_an_unseen_twin() {
         json!([{"op": "replace", "start": 1, "end": 1, "content": "Y"}]),
     )
     .expect("the authored line stays editable");
+}
+
+#[test]
+fn exact_unique_replace_text_applies_on_a_line_never_displayed() {
+    let (dir, session, tag) = fixture_shown(100, 5);
+    let receipt = write(
+        &session,
+        dir.path(),
+        Some(&tag),
+        json!([{"op": "replace_text", "old": "row-040", "new": "ROW-040"}]),
+    )
+    .expect("an exact unique match proves the agent holds the text");
+    assert!(receipt.contains("changed 40"), "{receipt}");
+    let new_tag = tag_of(&receipt);
+    assert_ne!(new_tag, tag, "new content, new tag");
+    let text = std::fs::read_to_string(dir.path().join("f.txt")).unwrap();
+    assert_eq!(text, rows(100).replace("row-040", "ROW-040"));
+    let err = write(
+        &session,
+        dir.path(),
+        Some(&new_tag),
+        json!([{"op": "replace", "start": 41, "end": 41, "content": "X"}]),
+    )
+    .expect_err("the exemption marks only the written line seen");
+    assert!(err.contains("never displayed"), "{err}");
 }
