@@ -212,7 +212,7 @@ Session 2026-08-02; spec at the durable corpus
 - **Decision:** This is a guard change. The user approved it on 2026-11-04.
   1. `src/edit/seen_store.rs` saves one entry per file version: the normalized path key, the whole-file tag, a 64-bit xxHash of the content, and the displayed ranges. It never saves file text.
   2. The scope is the checkout: the first ancestor of the call's `cwd` with a `.git` entry, else the `cwd`. The file is `$XDG_STATE_HOME/tilth/seen/<xxh64 of root>.json` (default `~/.local/state`), outside the repository.
-  3. `dispatch_tool` saves the seen lines that each call recorded: reads, searches, and write receipts. A save is atomic (a 0600 temp file, then a rename; the directory is 0700).
+  3. `run_tool_with_timeout` saves the seen lines that each delivered call recorded: reads, searches, and write receipts. The call's worker drains its records after the tool runs, and the dispatcher saves them only when the response arrives before the timeout. A save is atomic (a 0600 temp file, then a rename; the directory is 0700).
   4. `resolve_edit` adds saved lines to the gate only when the live tag equals the section tag and the live content digest equals the saved digest. This applies with or without a session snapshot for the tag. `carried_seen_lines` carries the saved lines to the edited version.
   5. Bounds: 256 entries per checkout, 4 versions per path, 256 ranges per entry, and 128 state files. The least recently saved drop first. A missing, corrupt, oversized, or unwritable state file reads as empty, and the tool call continues.
 - **Alternatives:**
@@ -221,9 +221,10 @@ Session 2026-08-02; spec at the durable corpus
   3. Save file text, so that 3-way recovery also works across processes. Rejected: it puts source text on disk outside the repository.
 - **Consequences:**
   - Two agents in one checkout share the record. An agent can edit lines that only the other agent displayed, when the content is identical. Runs that reuse one checkout path share it too. Give each benchmark run its own `XDG_STATE_HOME` for clean attribution.
+  - A timed-out call saves nothing: its worker drains its own records, and the records leave with the dropped result. Residual: one session drains a shared queue, so a call that runs while a timed-out worker still records can drain and save that worker's partial records. The in-process gate already trusts a timed-out call's snapshot the same way.
   - The drift path (`recover_edit`) does not use saved lines, because a 3-way merge needs base text.
   - The unchanged-reread stub does not use saved lines, so a resumed re-read still returns text.
   - Unit tests get a disabled store (`SeenStore::from_env` under `cfg(test)`). The `tests/mcp_v2` harness and the BDD session set a throwaway `XDG_STATE_HOME`.
 - **Verification:** `tests/mcp_v2/test_seen_persist.py` fails on `aec0efd4` (4 failures, 1 error) and passes with the change. Unit tests are in `src/edit/seen_store.rs`, `src/edit/snapshots.rs`, and `src/mcp/tools/write.rs`.[^seen-persist]
 
-[^seen-persist]: `src/edit/seen_store.rs`; `src/session.rs` (`persist_seen`, `persisted_seen`); `src/mcp/mod.rs` (`dispatch_tool`); `src/mcp/tools/write.rs` (`resolve_edit`, `carried_seen_lines`). Decision: November 4, 2026, from the stock A/B trajectory diagnosis, cause 3.
+[^seen-persist]: `src/edit/seen_store.rs`; `src/session.rs` (`take_unsaved_seen`, `save_seen`, `persisted_seen`); `src/mcp/mod.rs` (`run_tool_with_timeout`); `src/mcp/tools/write.rs` (`resolve_edit`, `carried_seen_lines`). Decision: November 4, 2026, from the stock A/B trajectory diagnosis, cause 3.

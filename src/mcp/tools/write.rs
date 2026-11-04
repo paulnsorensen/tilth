@@ -2095,7 +2095,7 @@ mod tests {
         std::fs::write(&p, original).unwrap();
         let first = Session::with_seen_dir(state.clone());
         let tag = first.record_snapshot(&p, original, [2, 3]).unwrap();
-        first.persist_seen(&root);
+        first.save_seen(&root, first.take_unsaved_seen());
 
         let second = Session::with_seen_dir(state);
         let swap = |line: u32| Section {

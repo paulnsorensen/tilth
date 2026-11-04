@@ -6,7 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde_json::Value;
 
-use crate::edit::seen_store::SeenStore;
+use crate::edit::seen_store::{SeenRecord, SeenStore};
 use crate::edit::snapshots::SnapshotStore;
 
 const BATCH_NUDGE_LIMIT: u8 = 2;
@@ -203,10 +203,14 @@ impl Session {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Save the seen lines recorded since the last call to the state file of
-    /// the checkout that holds `cwd`.
-    pub fn persist_seen(&self, cwd: &Path) {
-        let records = self.snapshots().take_unsaved_seen();
+    /// Drain the seen lines recorded since the last drain, without saving them.
+    pub(crate) fn take_unsaved_seen(&self) -> Vec<SeenRecord> {
+        self.snapshots().take_unsaved_seen()
+    }
+
+    /// Save drained seen lines to the state file of the checkout that holds
+    /// `cwd`.
+    pub(crate) fn save_seen(&self, cwd: &Path, records: Vec<SeenRecord>) {
         if records.is_empty() {
             return;
         }

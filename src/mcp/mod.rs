@@ -343,16 +343,6 @@ fn dispatch_tool(tool: &str, args: &Value, services: &Services) -> Result<String
         "tilth_write" => tool_write(args, services.session(), services.bloom(), services.cache()),
         _ => Err(format!("unknown tool: {tool}")),
     };
-    // Save the seen lines this call recorded, so a resumed agent session (a
-    // new tilth process) can still edit them.
-    if let Some(cwd) = args
-        .get("cwd")
-        .and_then(Value::as_str)
-        .map(Path::new)
-        .filter(|cwd| cwd.is_absolute())
-    {
-        services.session().persist_seen(cwd);
-    }
     // Observe every dispatch — an errored call still advances/resets the
     // batch streak — but only successful responses can carry a tip.
     // `tilth_search` is exempt: its response is pure JSON and drops any tip,
@@ -413,11 +403,27 @@ fn run_tool_with_timeout(
     let args_owned = args.clone();
 
     let outcome = spawn_with_timeout(services.tracker(), timeout, move || {
-        dispatch_tool(&tool_name_owned, &args_owned, &services_worker)
+        let result = dispatch_tool(&tool_name_owned, &args_owned, &services_worker);
+        // Drain this call's seen lines in its own worker. A timed-out call's
+        // records then leave with its dropped result and are never saved.
+        let seen = services_worker.session().take_unsaved_seen();
+        (result, seen)
     });
 
     match outcome {
-        Ok(inner) => inner,
+        Ok((inner, seen)) => {
+            // Save only the seen lines of a delivered response, so a resumed
+            // agent session (a new tilth process) can still edit them.
+            if let Some(cwd) = args
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(Path::new)
+                .filter(|cwd| cwd.is_absolute())
+            {
+                services.session().save_seen(cwd, seen);
+            }
+            inner
+        }
         Err(SpawnFailure::Timeout) => {
             eprintln!(
                 "tilth: tool '{tool_name}' timed out after {}s",
@@ -491,6 +497,57 @@ mod tests {
             a["cwd"] = serde_json::json!("/");
         }
         a
+    }
+
+    /// A read that times out never reaches the agent, so a later tilth process
+    /// must not trust its seen lines. A delivered read's lines are saved.
+    #[test]
+    fn only_a_delivered_read_saves_its_seen_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let text = "fn a() {}\n";
+        std::fs::write(root.join("a.rs"), text).unwrap();
+        std::fs::write(root.join("b.rs"), text).unwrap();
+        let state = dir.path().join("state");
+        let mut services = Services::new();
+        services.session = Arc::new(Session::with_seen_dir(state.clone()));
+        let read = |name: &str| serde_json::json!({"cwd": root, "paths": [name]});
+
+        let timed_out = run_tool_with_timeout(
+            &services,
+            "tilth_read",
+            &read("a.rs"),
+            std::time::Duration::ZERO,
+        );
+        assert!(timed_out.unwrap_err().contains("timed out"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while services.tracker().current() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker never finished"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let delivered = run_tool_with_timeout(
+            &services,
+            "tilth_read",
+            &read("b.rs"),
+            std::time::Duration::from_secs(30),
+        );
+        assert!(delivered.is_ok(), "{delivered:?}");
+
+        let resumed = Session::with_seen_dir(state);
+        let tag = crate::edit::tag::compute_file_hash(text);
+        let seen = |name: &str| {
+            let key = crate::edit::normalize_path_key(&root.join(name));
+            resumed.persisted_seen(&root, &key, tag, text)
+        };
+        assert!(seen("a.rs").is_empty(), "the timed-out read was saved");
+        assert!(
+            seen("b.rs").contains(&1),
+            "the delivered read was not saved"
+        );
     }
 
     /// The nudge must ride the REAL dispatch path: two consecutive
