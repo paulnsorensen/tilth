@@ -401,12 +401,26 @@ fn run_tool_with_timeout(
     let services_worker = services.clone();
     let tool_name_owned = tool_name.to_string();
     let args_owned = args.clone();
+    run_saving_delivered_seen(services, tool_name, args, timeout, move || {
+        dispatch_tool(&tool_name_owned, &args_owned, &services_worker)
+    })
+}
 
+/// Run `work` under `timeout`, and save the seen lines it recorded only when
+/// its response arrives in time.
+fn run_saving_delivered_seen(
+    services: &Services,
+    tool_name: &str,
+    args: &Value,
+    timeout: std::time::Duration,
+    work: impl FnOnce() -> Result<String, String> + Send + 'static,
+) -> Result<String, String> {
+    let session = Arc::clone(&services.session);
     let outcome = spawn_with_timeout(services.tracker(), timeout, move || {
-        let result = dispatch_tool(&tool_name_owned, &args_owned, &services_worker);
+        let result = work();
         // Drain this call's seen lines in its own worker. A timed-out call's
         // records then leave with its dropped result and are never saved.
-        let seen = services_worker.session().take_unsaved_seen();
+        let seen = session.take_unsaved_seen();
         (result, seen)
     });
 
@@ -514,13 +528,24 @@ mod tests {
         services.session = Arc::new(Session::with_seen_dir(state.clone()));
         let read = |name: &str| serde_json::json!({"cwd": root, "paths": [name]});
 
-        let timed_out = run_tool_with_timeout(
+        // Hold the worker until the call has timed out, so the timeout always
+        // wins the race against a fast read.
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let worker = services.clone();
+        let args = read("a.rs");
+        let timed_out = run_saving_delivered_seen(
             &services,
             "tilth_read",
             &read("a.rs"),
-            std::time::Duration::ZERO,
+            std::time::Duration::from_millis(20),
+            move || {
+                let out = dispatch_tool("tilth_read", &args, &worker);
+                let _ = held.recv();
+                out
+            },
         );
         assert!(timed_out.unwrap_err().contains("timed out"));
+        release.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         while services.tracker().current() > 0 {
             assert!(
@@ -529,6 +554,11 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        let held_read = services.session().snapshots().head(root.join("a.rs"));
+        assert!(
+            held_read.is_some_and(|snap| snap.seen_lines.contains(&1)),
+            "the timed-out read must record line 1, or the check below proves nothing"
+        );
         let delivered = run_tool_with_timeout(
             &services,
             "tilth_read",
