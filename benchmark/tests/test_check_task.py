@@ -354,7 +354,7 @@ _TEST_PATCH = (
     "+    from arithmetic import add\n"
     "+    assert add(2, 3) == 5\n"
 )
-_TEST_COMMAND = ["python3", "-m", "pytest", "test_arithmetic.py", "-q"]
+_TEST_COMMAND = [sys.executable, "-m", "pytest", "test_arithmetic.py", "-q"]
 
 
 def _build_local_mined_repo(tmp_path):
