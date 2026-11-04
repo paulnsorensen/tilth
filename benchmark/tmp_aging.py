@@ -25,8 +25,13 @@ def excludes(config_text: str, path: PurePosixPath) -> bool:
     or an ancestor covers ``path``. ``X`` excludes a directory but not its contents, so it does not
     count. An ``x!`` line applies only at boot, so it does not count. Patterns match one path
     component at a time, as fnmatch(3) does with FNM_PATHNAME.
+
+    An ``x`` line counts only when every other active line for the same path is also ``x``.
+    systemd-tmpfiles applies the first line for a path and drops a later conflicting line
+    (tmpfiles.d(5)), and a same-path line with an age cleans the contents even next to an ``x`` line.
     """
     parts = PurePosixPath(path).parts
+    types: dict[tuple[str, ...], set[str]] = {}
     for line in config_text.splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
@@ -35,12 +40,13 @@ def excludes(config_text: str, path: PurePosixPath) -> bool:
             fields = shlex.split(line)
         except ValueError:
             continue
-        if len(fields) < 2 or not fields[0].startswith("x") or "!" in fields[0]:
+        if len(fields) < 2 or "!" in fields[0]:
             continue
-        pattern = PurePosixPath(fields[1]).parts
-        if len(pattern) <= len(parts) and all(map(fnmatch.fnmatchcase, parts, pattern)):
-            return True
-    return False
+        types.setdefault(PurePosixPath(fields[1]).parts, set()).add(fields[0][:1])
+    return any(
+        kinds == {"x"} and len(pattern) <= len(parts) and all(map(fnmatch.fnmatchcase, parts, pattern))
+        for pattern, kinds in types.items()
+    )
 
 
 def _cat_config() -> str | None:
@@ -72,6 +78,7 @@ def require_exclusion(bench_root: PurePosixPath) -> None:
         return
     raise TmpAgingError(
         f"systemd-tmpfiles can delete files older than its /tmp age limit under {root}, "
-        f"which breaks cached builds and repo clones; no tmpfiles.d 'x' rule covers it. "
+        f"which breaks cached builds and repo clones; no tmpfiles.d 'x' rule covers it "
+        f"(an 'x' rule does not count when a rule of another type names the same path). "
         f"Install the exclusion once: echo 'x {root}' | sudo tee /etc/tmpfiles.d/tilth-bench.conf"
     )

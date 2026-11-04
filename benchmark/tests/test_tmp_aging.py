@@ -47,6 +47,24 @@ def test_stock_config_does_not_exclude_the_bench_tree() -> None:
     assert tmp_aging.excludes(STOCK, BENCH) is False
 
 
+# systemd-tmpfiles keeps the first line for a path and drops a later conflicting one, and a same-path rule with
+# an age cleans the contents even when an `x` line names the path too. Both cases lose benchmark files.
+@pytest.mark.parametrize(("rules", "covered"), [
+    (["X /tmp/tilth_bench", "x /tmp/tilth_bench"], False),
+    (["X /tmp/tilth_bench - - - 10d", "x /tmp/tilth_bench"], False),
+    (["X /tmp/tilth_bench/", "x /tmp/tilth_bench"], False),
+    (["X /tmp/tilth_bench*", "x /tmp/tilth_bench*"], False),
+    (["x /tmp/tilth_bench", "d /tmp/tilth_bench 0755 - - 10d"], False),
+    (["x /tmp/tilth_bench", "x /tmp/tilth_bench"], True),
+    (["X! /tmp/tilth_bench", "x /tmp/tilth_bench"], True),
+])
+def test_excludes_counts_an_x_rule_only_when_no_other_active_rule_names_its_path(
+        rules: list[str], covered: bool) -> None:
+    files = "".join(f"# /etc/tmpfiles.d/{n}-bench.conf\n{rule}\n" for n, rule in enumerate(rules))
+
+    assert tmp_aging.excludes(f"{STOCK}{files}", BENCH) is covered
+
+
 def fake_tmpfiles(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str) -> None:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
