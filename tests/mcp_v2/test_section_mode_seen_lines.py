@@ -44,24 +44,25 @@ class SectionModeSeenLines(unittest.TestCase):
         text = harness.tool_result_text(result.response_by_id(2))
         return re.search(r"\[a\.rs#([0-9A-F]{4})\]", text).group(1)
 
-    def read_then_write(self, read, old, new):
-        edit = {"cwd": self.cwd, "edits": [{"path": "a.rs", "tag": self.tag(), "ops": [
-            {"op": "replace_text", "old": old, "new": new}]}]}
+    def read_then_write(self, read, op):
+        edit = {"cwd": self.cwd, "edits": [{"path": "a.rs", "tag": self.tag(), "ops": [op]}]}
         write = harness.tools_call_request(3, "tilth_write", edit)
         result = harness.run_mcp([], [harness.initialize_request(), read, write])
         return result.response_by_id(2), result.response_by_id(3)
 
     def assert_section_edit_applies(self, read):
-        shown, written = self.read_then_write(
-            read, "let value_15 = 15;", "let value_15 = 0;")
+        shown, written = self.read_then_write(read, {
+            "op": "replace_text", "old": "let value_15 = 15;", "new": "let value_15 = 0;"})
         text = harness.tool_result_text(shown)
         self.assertRegex(text, r"\[a\.rs#[0-9A-F]{4}\]")
         self.assertIn("15:let value_15 = 15;", text, "the section shows numbered lines")
         self.assertFalse(harness.tool_is_error(written), harness.tool_result_text(written))
         self.assertEqual(self.small.read_text(), EDITED)
 
-    def assert_edit_refused(self, read, old, new):
-        _, written = self.read_then_write(read, old, new)
+    def assert_edit_refused(self, read, line):
+        # A line op: an exact `replace_text` match is exempt from the gate.
+        op = {"op": "replace", "start": line, "end": line, "content": f"let value_{line} = 0;"}
+        _, written = self.read_then_write(read, op)
         self.assertTrue(harness.tool_is_error(written), harness.tool_result_text(written))
         self.assertEqual(self.small.read_text(), SMALL, "a refused edit must not write")
 
@@ -78,16 +79,13 @@ class SectionModeSeenLines(unittest.TestCase):
         self.assert_section_edit_applies(self.read(["a.rs#10-20", "b.rs#1-5"], "stripped"))
 
     def test_signature_section_does_not_mark_lines_outside_it(self):
-        self.assert_edit_refused(
-            self.read(["a.rs#10-20"], "signature"), "let value_31 = 31;", "let value_31 = 0;")
+        self.assert_edit_refused(self.read(["a.rs#10-20"], "signature"), 31)
 
     def test_whole_file_signature_marks_nothing_seen(self):
-        self.assert_edit_refused(
-            self.read(["a.rs"], "signature"), "let value_15 = 15;", "let value_15 = 0;")
+        self.assert_edit_refused(self.read(["a.rs"], "signature"), 15)
 
     def test_whole_file_signature_in_a_batch_marks_nothing_seen(self):
-        self.assert_edit_refused(
-            self.read(["a.rs", "b.rs"], "signature"), "let value_15 = 15;", "let value_15 = 0;")
+        self.assert_edit_refused(self.read(["a.rs", "b.rs"], "signature"), 15)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,20 @@
 """Stdio JSON-RPC test harness for the tilth --mcp binary (search-v2 oracle)."""
+import atexit
 import json
+import os
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 BIN = REPO_ROOT / "target" / "debug" / "tilth"
+
+# tilth saves seen lines under $XDG_STATE_HOME. Every server these tests start
+# inherits this throwaway directory, so the suite never writes to the real home.
+_STATE_HOME = tempfile.mkdtemp(prefix="tilth-test-state-")
+atexit.register(shutil.rmtree, _STATE_HOME, ignore_errors=True)
+os.environ["XDG_STATE_HOME"] = _STATE_HOME
 
 WITNESS = {
     "AC-3": "Mixed per-query paths reorder/drop results or invalid batch accepted",

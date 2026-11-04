@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -6,6 +6,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde_json::Value;
 
+use crate::edit::seen_store::{SeenRecord, SeenStore};
 use crate::edit::snapshots::SnapshotStore;
 
 const BATCH_NUDGE_LIMIT: u8 = 2;
@@ -119,6 +120,9 @@ pub struct Session {
     /// so a follow-up edit can verify its tag and, on drift, 3-way-merge
     /// recover. Keyed by canonical realpath.
     snapshots: Mutex<SnapshotStore>,
+    /// The seen lines of `snapshots`, saved per checkout so that a resumed
+    /// agent session (a new tilth process) keeps them.
+    seen_store: Mutex<SeenStore>,
     /// Cumulative token estimates: sum of full-file baseline tokens and
     /// tokens actually returned across all reads in this session.
     baseline_tokens: AtomicU64,
@@ -143,6 +147,7 @@ impl Session {
             dir_hits: Mutex::new(HashMap::new()),
             expanded: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(SnapshotStore::new()),
+            seen_store: Mutex::new(SeenStore::from_env()),
             baseline_tokens: AtomicU64::new(0),
             saved_tokens: AtomicU64::new(0),
             batch_nudges: Mutex::new(BatchNudgeState::default()),
@@ -181,6 +186,49 @@ impl Session {
         seen_lines: impl IntoIterator<Item = u32>,
     ) -> Option<u16> {
         self.snapshots().record_by_write(path, text, seen_lines)
+    }
+
+    /// A session whose seen store saves under `dir` (`from_env` disables it in
+    /// unit tests).
+    #[cfg(test)]
+    pub(crate) fn with_seen_dir(dir: std::path::PathBuf) -> Self {
+        let session = Self::new();
+        *session.seen_store() = SeenStore::new(Some(dir));
+        session
+    }
+
+    fn seen_store(&self) -> MutexGuard<'_, SeenStore> {
+        self.seen_store
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Drain the seen lines recorded since the last drain, without saving them.
+    pub(crate) fn take_unsaved_seen(&self) -> Vec<SeenRecord> {
+        self.snapshots().take_unsaved_seen()
+    }
+
+    /// Save drained seen lines to the state file of the checkout that holds
+    /// `cwd`.
+    pub(crate) fn save_seen(&self, cwd: &Path, records: Vec<SeenRecord>) {
+        if records.is_empty() {
+            return;
+        }
+        self.seen_store().save(cwd, records);
+    }
+
+    /// The lines that a tilth process in the checkout of `cwd` displayed for
+    /// exactly `text` at `key` under `tag`, clamped to the lines of `text`.
+    pub fn persisted_seen(&self, cwd: &Path, key: &str, tag: u16, text: &str) -> HashSet<u32> {
+        let ranges = self.seen_store().lookup(cwd, key, tag, text);
+        if ranges.is_empty() {
+            return HashSet::new();
+        }
+        let n = u32::try_from(text.split('\n').count()).unwrap_or(u32::MAX);
+        ranges
+            .into_iter()
+            .flat_map(|(lo, hi)| lo..=hi.min(n))
+            .collect()
     }
 
     /// Drop the snapshot history for `path` (a removed file).
