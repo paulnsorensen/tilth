@@ -91,6 +91,8 @@ The report is in the corpus at [Seed API-call gap: tilth versus built-in tools](
 
 After the fixes, tilth makes fewer calls than baseline on 7 of 10 dev tasks; for example, the fastapi chain fell from 44 to 31 calls.
 
+This diagnosis is for the seed `4c56a06`. At `aec0efd4` the API-call gap is 2–8%, and larger conversation content is the main cause; see [Stock A/B trajectory diagnosis](stock-ab-trajectory-diagnosis.md).
+
 ## What evolve found
 
 Across r1-r6, evolve's best winner was a prompt edit, not a source patch.
@@ -148,12 +150,14 @@ The arms are in `benchmark/results/stock-ab/modes.json`:
 - `tilth_steer`: `tilth_stock` with the preamble appended (`append_preamble`).
 - `tilth_pre`: the preamble replaces the system prompt (`preamble`), as in `tilth claude`.
 
-| arm | correct | $/cell | $/correct | turns/cell | tool calls/cell | context tokens/cell |
+| arm | correct | $/cell | $/correct | API calls/cell | tool calls/cell | context tokens/cell |
 |---|---|---|---|---|---|---|
-| baseline_stock | 54/54 | 0.547 | 0.547 | 58.3 | 56.3 | 791,654 |
-| tilth_stock | 52/54 | 0.605 | 0.628 | 23.5 | 21.6 | 994,020 |
-| tilth_steer | 53/54 | 0.621 | 0.633 | 23.9 | 21.9 | 1,044,164 |
-| tilth_pre | 53/54 | 0.599 | 0.611 | 24.6 | 22.6 | 1,042,344 |
+| baseline_stock | 54/54 | 0.547 | 0.547 | 18.5 | 56.3 | 791,654 |
+| tilth_stock | 52/54 | 0.605 | 0.628 | 18.9 | 21.6 | 994,020 |
+| tilth_steer | 53/54 | 0.621 | 0.633 | 19.3 | 21.9 | 1,044,164 |
+| tilth_pre | 53/54 | 0.599 | 0.611 | 20.1 | 22.6 | 1,042,344 |
+
+API calls are distinct assistant `message.id` values in `rows_streams/`, counted once per cell (see the dedup rules in [Stock A/B trajectory diagnosis](stock-ab-trajectory-diagnosis.md)). The row field `num_turns` (58.3 against 23.5–24.6) follows the tool-call count, not API calls, because baseline sends many parallel `Edit` calls in one response. Do not read `num_turns` as round trips.
 
 The paired deltas come from `benchmark/paired.py`. The task is the sampling unit (18 tasks), with a 95% task bootstrap CI.
 
@@ -169,8 +173,17 @@ The paired deltas come from `benchmark/paired.py`. The task is the sampling unit
 - Against the stock prompt, every tilth arm costs more per correct answer. All three cost CIs exclude 0. All accuracy CIs include 0.
 - The preamble has no detectable effect inside the tilth arms, as an appended text or as the replacement prompt.
 - Power: 18 tasks × 3 reps give paired cost CIs 17–25 points wide. A difference below about 10% between tilth arms stays inside these CIs, so this A/B cannot rank the preamble placements.
-- The tilth arms make about 60% fewer turns and tool calls, but they carry 26–32% more context tokens per cell. Nearly all of the extra context is cache reads.
-  This A/B does not split that context between the fixed MCP prefix ([MCP cost model](mcp-cost-model-sonnet5.md)) and larger tool results.
+- The tilth arms make about 60% fewer tool calls and 2–8% more API calls. Each call carries more context: a mean of 49–52k tokens against 40k. Nearly all of the extra context is cache reads.
+- Split of the extra cache reads against baseline (prefix: first-call context delta × API calls; extra calls: delta calls × baseline mean context; content: the rest):
+
+  | arm | larger fixed prefix | extra API calls | larger conversation content |
+  |---|---|---|---|
+  | tilth_stock | 18% | 8% | 74% |
+  | tilth_steer | 23% | 12% | 65% |
+  | tilth_pre | 10% | 26% | 64% |
+
+- Single tasks cost the same ($0.27 per cell for baseline and tilth_stock). The whole gap is in the four chains ($1.48 against $1.76 per cell). The causes are in [Stock A/B trajectory diagnosis](stock-ab-trajectory-diagnosis.md).
+- Fixed prefix per call against baseline: tilth_stock +1.9k tokens, tilth_steer +2.95k, tilth_pre +1.25k. Under `--bare` the stock prompt is 4.5k characters and the preamble 3.0k, so the replace arm saves about 0.7k tokens per call. About half of the preamble's Tools section repeats `prompts/mcp.md`. The `tilth_write` schema (5.2k characters) is the largest tool schema; `Edit` is 1.0k.
 - The largest per-task gaps are `chain:rg-edit-6` (+22–30% per cell) and `chain:express-edit-6` (+13–23%).
 - `benchmark/analyze.py` stops with `no pricing entry for model 'claude-sonnet-5-5'`. The tables come from `jq` over `rows.jsonl` and from `paired.py`.
 - The run resumed after four stops: a CLI version change, a full disk, the first $130 cap, and 12 `chain:rg-edit-6` cells that a corrupt grader cache failed. See [Benchmark harness gotchas](benchmark-harness-gotchas.md).
@@ -184,11 +197,10 @@ The finish reserve is about $40 whenever the seed commit changes, because `git_s
 
 ## Ideas to push cost per correct lower
 
-These ideas cut dependent turns, the measured cause of tilth's extra cost.
-They are untested; the call savings are the deep-diagnosis estimates for the main seed (`4c56a06`), and the ranges overlap, so do not add them.
-The recommended order is ideas 1, 2 and 4 by hand, then one higher-rep test-split measurement, rather than more evolve rounds.
+Ideas 1–7 cut dependent turns, the cause measured on the seed `4c56a06` before #404–#416.
+They are untested; the call savings are the deep-diagnosis estimates for that seed, and the ranges overlap, so do not add them.
 
-> ⚠️ Conflicts with the [stock-prompt A/B](#november-2026-stock-prompt-ab): there the tilth arms made about 60% fewer turns than baseline and still cost 12–16% more per correct answer, with 26–32% more context tokens per cell. The dependent-turn cause was measured on the `replace` arms. Needs human resolution.
+The stock-prompt A/B at `aec0efd4` changes the priority. There tilth made only 2–8% more API calls than baseline, and larger conversation content was 64–74% of the extra context. Extra dependent turns are now the minor cause. The ranked levers for that finding are in [Stock A/B trajectory diagnosis](stock-ab-trajectory-diagnosis.md#levers-to-beat-the-stock-arm); do them before ideas 1–7.
 
 1. Explicit search modes (literal, regex, symbol), so auto-resolution stops narrowing or changing the agent's intent. This is the largest remaining cause, about 0.45 calls per cell.
 2. Edit from search: let `tilth_write` edit lines that a search hit displayed, now that #404 tags test hits, to skip a read turn.
@@ -199,8 +211,8 @@ The recommended order is ideas 1, 2 and 4 by hand, then one higher-rep test-spli
 4. Coalesce adjacent read sections and return complete enclosing constructs, to cut fragmented reads (about 0.30 calls per cell).
 5. Prevent malformed `tilth_write` JSON: the seed had 5 rejected write calls against none for baseline. Smaller structural payloads or a schema-first example would help (about 0.17 calls per cell).
 6. Batch independent discovery: baseline searches two entry points in its first turn, while tilth spends two turns (about 0.13 calls per cell).
-7. Smaller tool schemas and instructions, since they ride every API call; [MCP cost model](mcp-cost-model-sonnet5.md) found the fixed MCP prefix, not per-call output, is where cost went. This is unmeasured on this panel.
+7. Smaller tool schemas and instructions, since they ride every API call; [MCP cost model](mcp-cost-model-sonnet5.md) found the fixed MCP prefix, not per-call output, is where cost went. In the stock-prompt A/B the prefix was 10–23% of the extra context.
 - A per-cell `TMPDIR` for scratch isolation, which does not change run keys.
 - Measurement: more reps or more test tasks, so evolve can see 5% effects; about $100 or more per comparison.
 
-_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412; PR #413 review fixes (r2 note, call-count labels, call-gap source copy); panel-health pass over r1-r6, gepa-v3-baselines and preamble-r1 with `benchmark/panel_health.py`; preamble-r1 and preamble-r2 run logs (`benchmark/results/evolve/preamble-r{1,2}/log.txt`); stock-prompt A/B rows (`benchmark/results/stock-ab/rows.jsonl`, budget `stock-ab-1`) · Updated: 2026-11-02 · Supersedes: none; the Ideas section keeps its dependent-turn claim with a conflict note_
+_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412; PR #413 review fixes (r2 note, call-count labels, call-gap source copy); panel-health pass over r1-r6, gepa-v3-baselines and preamble-r1 with `benchmark/panel_health.py`; preamble-r1 and preamble-r2 run logs (`benchmark/results/evolve/preamble-r{1,2}/log.txt`); stock-prompt A/B rows and streams (`benchmark/results/stock-ab/`, budget `stock-ab-1`) · Updated: 2026-11-04 · Supersedes: the 2026-11-02 A/B note that read `num_turns` as API calls and its conflict note on the Ideas section_

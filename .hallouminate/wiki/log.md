@@ -122,3 +122,5 @@
 
 - 2026-11-02 · stock-ab-2026-11-02 · merged · benchmark-gepa-v3-evolve.md · Stock-prompt A/B results (4 arms, 18 tasks, 3 reps), spend, and a conflict note on the dependent-turn cost claim. Written directly; the hallouminate server was unavailable, so no ground probes ran.
 - 2026-11-02 · stock-ab-2026-11-02 · merged · benchmark-harness-gotchas.md · `mise prune` deletes an ad-hoc pinned Claude CLI; `/tmp` aging corrupts the rg-flow grader cache. Written directly; no ground probes ran.
+- 2026-11-04 · stock-ab-diagnosis-2026-11-04 · merged · benchmark-gepa-v3-evolve.md · Replace `num_turns` with deduplicated API calls (18.5 against 18.9–20.1), add the context split, and resolve the conflict note: dependent turns are now the minor cause.
+- 2026-11-04 · stock-ab-diagnosis-2026-11-04 · created · stock-ab-trajectory-diagnosis.md; index.md · Chain-only gap, six trajectory causes, ranked levers, stream dedup rules. Written through hallouminate `add_markdown`.
