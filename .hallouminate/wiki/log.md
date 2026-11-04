@@ -127,3 +127,4 @@
 - 2026-11-04 · stock-ab-diagnosis-2026-11-04 · merged · benchmark-gepa-v3-evolve.md · Replace `num_turns` with deduplicated API calls (18.5 against 18.9–20.1), add the context split, and resolve the conflict note: dependent turns are now the minor cause.
 - 2026-11-04 · stock-ab-diagnosis-2026-11-04 · created · stock-ab-trajectory-diagnosis.md; index.md · Chain-only gap, six trajectory causes, ranked levers, stream dedup rules. Written through hallouminate `add_markdown`.
 - 2026-11-04 · pr-395-cure · merged · benchmark-task-inventory.md · Merge main into #395. Re-check the registry at 863464bb: it is the same as at 50f3e46. State that the 61-task snapshot includes the three migration tasks.
+- 2026-11-04 · litmus-rg-edit-6 · merged · stock-ab-trajectory-diagnosis.md · Litmus re-run after #433–#436: `chain:rg-edit-6` tilth_stock $3.19 to $2.62 per cell (baseline $2.46); batching is the remaining gap; benchmark arms likely load the user CLAUDE.md.

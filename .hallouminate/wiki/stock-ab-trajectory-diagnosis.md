@@ -96,4 +96,26 @@ Ordered by evidence. Prompt steering cannot remove causes 1–5, 7 or 8, so the 
 - **Minimal repro tasks.** Use `rg_trait_implementors` for cause 1 and the edit sub-task of `chain:rg-edit-6` for causes 3–5.
 - **Paid check.** Run `chain:rg-edit-6` and `chain:express-edit-6`, `tilth_stock` against `baseline_stock`, with more reps. The chains carry the whole gap.
 
-_Source: stream analysis of `benchmark/results/stock-ab/rows_streams/` (budget `stock-ab-1`), request captures of the four arms' first API call, `chain:rg-edit-6` rep 0 trajectories · Updated: 2026-11-04 · Supersedes: none_
+## Litmus re-run after the fixes (2026-11-04)
+
+#433, #434, #435 and #436 fix causes 2, 3, 4, 5 and 8, and narrow cause 1. A paid re-run of `chain:rg-edit-6`, `tilth_stock`, 3 reps, at main `a9ab01f4` cut the cell cost by 18%. The gap to `baseline_stock` fell from +30% to +7%.
+
+| Per cell, 3 reps | baseline_stock (Nov 2) | tilth_stock before | tilth_stock after |
+|---|---|---|---|
+| Correct | 3/3 | 3/3 | 3/3 |
+| Cost (range) | $2.46 ($2.16–2.80) | $3.19 ($2.82–3.54) | $2.62 ($2.53–2.76) |
+| Context tokens | 4.47M | 6.28M | 5.95M |
+| API calls | 51.7 | 56.7 | 60.7 |
+| `tilth_write` errors | n/a | 3.00 | 0.33 |
+| Seen-line rejections | n/a | 2.67 | 0.33 |
+| `mode=full` reads | n/a | 7.67 | 0 |
+| Batches killed by a bad pattern | n/a | 2 (total) | 0 |
+| Read result chars | 190k | 209k | 157k |
+
+- **Remaining gap: batching.** Session analytics (`model_turns.tool_calls`) shows about 1.1 tool calls per API call for tilth and about 3.6 for baseline, which sends parallel `Read`/`Edit` calls. Tilth needs more API calls although each result is smaller.
+- **Cause 1 is smaller, not gone.** Ambiguous search results fell from 3.67 to 3.00 per cell.
+- **Bash grew from 7.7 to 13.3 calls per cell**, almost all `eatmydata cargo test`. No repo or task file names `eatmydata`, so the arms very likely load the user's `~/.claude/CLAUDE.md`. Run paid A/Bs with `--bare` to remove it.
+- **Setup gotchas.** `run.py` keeps only an allowlist of environment keys, so `XDG_STATE_HOME` does not reach tilth. The seen store then writes to `~/.local/state/tilth/seen`, one file per cell checkout. The CLI pin 2.1.310 had to be reinstalled with `mise install aqua:anthropics/claude-code@2.1.310` and passed through `TILTH_BENCH_CLAUDE`.
+- **Limits.** n=3. The baseline rows come from November 2, not from the same day. The run started before #432, so the `/tmp` aging guard did not apply. Spend: $7.87, budget `litmus-rg-edit-6`.
+
+_Source: stream analysis of `benchmark/results/stock-ab/rows_streams/` (budget `stock-ab-1`), request captures of the four arms' first API call, `chain:rg-edit-6` rep 0 trajectories, the 2026-11-04 litmus streams and session-analytics `model_turns` · Updated: 2026-11-04 · Supersedes: none_
