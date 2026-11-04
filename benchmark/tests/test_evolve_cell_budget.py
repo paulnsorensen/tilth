@@ -145,7 +145,8 @@ def test_estimate_and_finish_reserve_follow_a_larger_budget(world_factory) -> No
     # test_a x (reruns 1 + 1) reps x (candidate + unstored baseline) cells, each at the $3 fallback.
     assert evo.finalist_test_cost() == pytest.approx(len(TEST) * 2 * 2 * 3.0)
     assert evo.preflight() is None
-    assert evo.ledger.reserve == pytest.approx(2 * len(TEST) * 2 * 2 * 3.0)
+    # Winner, unstored seed, and unstored baseline cells: test_a x 2 reps each, at the $3 fallback.
+    assert evo.ledger.reserve == pytest.approx(3 * len(TEST) * 2 * 3.0)
 
 
 def test_explicit_estimate_still_wins_over_the_budget(world_factory) -> None:

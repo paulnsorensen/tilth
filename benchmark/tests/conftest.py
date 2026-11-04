@@ -121,6 +121,13 @@ def hermetic_version_probes(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def hermetic_claude_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Spawn plain ``claude`` and skip the pin check; tests of the pin restore the real functions."""
+    monkeypatch.setattr(run, "resolve_claude_binary", lambda: "claude")
+    monkeypatch.setattr(run, "require_pinned_cli", lambda *, allow_drift=False: "claude CLI: stub")
+
+
+@pytest.fixture(autouse=True)
 def hermetic_claude_auth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Run the real auth guard offline: an OAuth token, empty config and managed roots, a fake status probe.
 
@@ -133,7 +140,8 @@ def hermetic_claude_auth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
     monkeypatch.setattr(auth, "_PASSED_STATUS", set())
     monkeypatch.setattr(
         auth, "_run_status",
-        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, '{"authMethod": "oauth_token"}', ""),
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv, 0, '{"authMethod": "oauth_token", "apiProvider": "firstParty"}', ""),
     )
 
 

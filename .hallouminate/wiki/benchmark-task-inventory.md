@@ -6,7 +6,7 @@ Keep the local suite as a tool regression suite. Strengthen its graders before t
 
 The built-in registry holds **61 tasks** at `50f3e46e109c60eda785cd71ca78c998275799c8` (main after #392).[^1]
 The opening inventory held **57 tasks** at `18b7534eecde023cb4a70e5d13d7de29178073de`. #280 added `gin_edit_render_context`. #313 to #319 added no task.
-Three migration tasks then raised the count to 61: `express_edit_example_start` (#369), `fastapi_edit_security_raise_on_missing` (#370), and `rg_edit_flow_migration` (#371).
+The 61-task snapshot includes three migration tasks: `express_edit_example_start` (#369), `fastapi_edit_security_raise_on_missing` (#370), and `rg_edit_flow_migration` (#371). These three PRs are the only registry changes between the 58-task snapshot at `1cbebb3` and `50f3e46`.
 `CLAUDE.md` still states 58 tasks, so it lags the registry. Trust the registry.
 FeatureBench and SWE-bench Multilingual instances are external tasks. They are not in this registry (see [FeatureBench integration](featurebench-integration.md)).
 
@@ -128,7 +128,7 @@ The `analyze.py` power readout is informational only; it gates nothing.
 This inventory does not approve execution.
 See [benchmark selection and rigor](benchmark-selection-and-rigor.md) and [Gin render-context benchmark](benchmark-gin-render-context.md).
 
-[^1]: Registry introspection of `benchmark/tasks/__init__.py` at `50f3e46e109c60eda785cd71ca78c998275799c8`: 61 tasks; task types edit 26, read 20, navigate 15; repositories gin 18, synthetic 11, fastapi 11, ripgrep 11, express 10. PR #280 added the 58th task. PRs #369, #370, and #371 added the last three.
+[^1]: Registry introspection of `benchmark/tasks/__init__.py` at `50f3e46e109c60eda785cd71ca78c998275799c8`: 61 tasks; task types edit 26, read 20, navigate 15; repositories gin 18, synthetic 11, fastapi 11, ripgrep 11, express 10. PR #280 added the 58th task. PRs #369, #370, and #371 added the last three. The registry and `base.py` are the same at `863464bb` (main after #430).
 [^2]: `Task.check_correctness` in `benchmark/tasks/base.py`. The test route needs task type `edit`, mutations, and a test command, so `gin_diff_comprehension` (type `read`) uses response strings.
 [^3]: `benchmark/tasks/gin_render_context_tasks.py`. The three migration tasks grade in `express_example_start_tasks.py`, `fastapi_security_migration_tasks.py`, and `rg_flow_migration_tasks.py` under `benchmark/tasks/`.
 

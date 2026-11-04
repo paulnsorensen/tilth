@@ -37,6 +37,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import auth
 import baselines
+import chains
 import erosion
 import external
 import external.contamination
@@ -64,6 +65,7 @@ from config import (
     ModeConfig,
 )
 from fixtures.reset import ensure_repo_clean, reset_repo
+from jsonl import tolerant_jsonl
 from parse import (
     detect_quota_rejection,
     extract_stream_error,
@@ -210,7 +212,7 @@ _RUNTIME_ENV_KEYS = frozenset(
     }
 )
 # No runner bills Anthropic through the API or needs an ANTHROPIC_* setting:
-# Claude cells use CLAUDE_CODE_OAUTH_TOKEN, and a variable such as
+# Claude cells use the subscription (CLAUDE_CODE_OAUTH_TOKEN or /login), and a variable such as
 # ANTHROPIC_BASE_URL or ANTHROPIC_MODEL would redirect a cell outside its run key.
 _PROVIDER_AUTH_PREFIXES = ("OPENAI_", "OPENROUTER_")
 _PROVIDER_AUTH_KEYS = frozenset({"CODEX_API_KEY"})
@@ -251,11 +253,38 @@ def _isolated_config_dir() -> str:
     return path
 
 
+@contextmanager
+def isolated_claude_config(env: dict[str, str], prefix: str):
+    """Point ``env`` at an empty temp CLAUDE_CONFIG_DIR for one evolve or judge call when it uses the token.
+
+    A ``/login`` session keeps its credentials in the host config dir, so without the token the call keeps
+    the host dir. ``--setting-sources ""`` and ``--strict-mcp-config`` still keep its settings and MCP
+    servers out.
+    """
+    if not env.get(auth.OAUTH_TOKEN_KEY):
+        yield
+        return
+    with tempfile.TemporaryDirectory(prefix=prefix) as config_dir:
+        env["CLAUDE_CONFIG_DIR"] = config_dir
+        yield
+
+
 def isolated_call_target() -> auth.AuthTarget:
-    """The auth target of an evolve or judge call: temp cwd, temp CLAUDE_CONFIG_DIR, no settings sources."""
+    """The auth target of an evolve or judge call: temp cwd, no settings sources, and a temp
+    CLAUDE_CONFIG_DIR under the token (see ``isolated_claude_config``)."""
     env = dict(build_runner_env("claude", tilth_bin=None))
-    env["CLAUDE_CONFIG_DIR"] = _isolated_config_dir()
+    if env.get(auth.OAUTH_TOKEN_KEY):
+        env["CLAUDE_CONFIG_DIR"] = _isolated_config_dir()
     return auth.AuthTarget(cwd=Path(tempfile.gettempdir()), env=env, loads_user_settings=False)
+
+
+def budget_capped(stream: str) -> bool:
+    """True when a claude stream's last result event is ``error_max_budget_usd``: the agent spent its own cap.
+
+    Such a cell is a completed, incorrect attempt (``baselines.is_completed``), not an infra fault.
+    """
+    results = [event for event in tolerant_jsonl(stream) if event.get("type") == "result"]
+    return bool(results) and results[-1].get("subtype") == "error_max_budget_usd"
 
 
 def failed_cell_cost(stream: str, runner: str, estimate: float, model: str | None) -> tuple[float, str]:
@@ -266,12 +295,9 @@ def failed_cell_cost(stream: str, runner: str, estimate: float, model: str | Non
 
 
 def _agent_venv(task: object, workdir: Path) -> Path | None:
-    """The workdir's venv for an external Python task; never the separate grading venv."""
-    if isinstance(task, external.ExternalTask) and task.language == "python":
-        venv = workdir / ".venv"
-        if (venv / "bin").is_dir():
-            return venv
-    return None
+    """The workdir's venv when the task prepared one; never the separate grading venv."""
+    venv = workdir / ".venv"
+    return venv if (venv / "bin").is_dir() else None
 
 
 def _host_runner_argv(cmd: list[str], env: Mapping[str, str], agent_venv: Path | None) -> list[str]:
@@ -525,7 +551,7 @@ class SkillUnavailableError(ArmUnavailableError):
 
 def _uses_claude_session_features(mode: ModeConfig) -> bool:
     """Skill arms and appended-prompt arms need Claude's session init, which other runners lack."""
-    return _is_skill_arm(mode) or mode.prompt_mode != "replace"
+    return _is_skill_arm(mode) or mode.prompt_mode == "append"
 
 
 def _expected_plugin_skills(plugin_dir: str) -> list[str]:
@@ -866,7 +892,60 @@ def cli_version(runner: str, *, fresh: bool = False) -> str | None:
     ``fresh`` bypasses the per-run cache; the scheduler re-probes before each paid
     cell so a mid-run CLI update cannot mix versions under one planned key.
     """
-    return (_run_probe if fresh else _probe_version)((runner, "--version"))
+    binary = resolve_claude_binary() if runner == "claude" else runner
+    return (_run_probe if fresh else _probe_version)((binary, "--version"))
+
+
+CLAUDE_PIN_FILE = BENCHMARK_DIR / "claude-cli.version"
+CLAUDE_BINARY_ENV = "TILTH_BENCH_CLAUDE"
+MISE_CLAUDE_ROOT = Path.home() / ".local" / "share" / "mise" / "installs" / "aqua-anthropics-claude-code"
+
+
+class CliPinError(ValueError):
+    """The Claude CLI a run would use is not the pinned version."""
+
+
+def claude_cli_pin() -> str:
+    return CLAUDE_PIN_FILE.read_text().strip()
+
+
+def resolve_claude_binary() -> str:
+    """The Claude CLI a run spawns: $TILTH_BENCH_CLAUDE, else the pinned mise install, else ``claude`` on PATH.
+
+    A path-form override is made absolute, because a cell runs from a disposable workspace. mise names version
+    directories with or without a ``v`` prefix, so both are tried.
+    """
+    override = os.environ.get(CLAUDE_BINARY_ENV)
+    if override:
+        return str(Path(override).resolve()) if os.sep in override else override
+    pin = claude_cli_pin()
+    for name in (f"v{pin}", pin):
+        pinned = MISE_CLAUDE_ROOT / name / "claude"
+        if pinned.is_file():
+            return str(pinned)
+    return "claude"
+
+
+def require_pinned_cli(*, allow_drift: bool = False) -> str:
+    """Refuse to plan a paid cell when the resolved Claude CLI is not the pinned version; return its description.
+
+    ``--version`` needs no model call. The version is part of every cell's run key, so a drifted CLI would buy
+    every stored cell again.
+    """
+    pin = claude_cli_pin()
+    binary = resolve_claude_binary()
+    found = cli_version("claude")
+    match = re.match(r"\d+\.\d+\.\d+", found or "")
+    version = match.group() if match else None
+    line = f"claude CLI: {binary} -> {found!r} (pin {pin})"
+    if version == pin:
+        return line
+    if allow_drift:
+        return f"{line}; --allow-cli-drift: the run keys do not match the stored cells"
+    raise CliPinError(
+        f"{binary} reports {found!r}, but benchmark/claude-cli.version pins {pin}, so every stored cell's run key "
+        f"would drift. Install {pin} (mise install aqua:anthropics/claude-code@{pin}), point {CLAUDE_BINARY_ENV} at "
+        f"that binary, or pass --allow-cli-drift to run anyway and buy the cells again.")
 
 
 _file_sha256 = baselines.file_sha256
@@ -963,9 +1042,15 @@ def _task_source_files(task: object) -> dict[str, str]:
     These hold the grader (`check_correctness`, `required_matches`, module
     helpers), so a grading edit changes the task digest. Keys are relative to the
     benchmark directory, or a bare file name outside it, so they match across hosts.
+
+    ``chains.ChainTask`` is skipped: ``chains.py`` holds every chain definition, so
+    hashing it would move each chain's key when another chain changes. A chain keys
+    on its members' digests and ``chains.CHAIN_PROTOCOL`` instead.
     """
     sources = {}
     for cls in type(task).__mro__:
+        if cls is chains.ChainTask:
+            continue
         try:
             source_file = inspect.getsourcefile(cls)
         except TypeError:
@@ -999,6 +1084,8 @@ def _cell_task_digest(task: object) -> str:
 _REPO_PLACEHOLDER = Path("<repo>")
 _TILTH_BIN_PLACEHOLDER = "<tilth-bin>"
 _BUDGET_PLACEHOLDER = "<max-budget>"
+_PREAMBLE_KEY = "model_instructions_file="
+_PREAMBLE_PLACEHOLDER = _PREAMBLE_KEY + "<preamble-file>"
 
 
 def _command_template(
@@ -1034,7 +1121,10 @@ def _command_template(
         # The cell fails when it runs; key it by the reason it cannot be built.
         return [f"unbuildable: {error}"]
     # The digest records max_budget_usd on its own; the budget format must not change the key.
-    return [_BUDGET_PLACEHOLDER if cmd[i - 1] == "--max-budget-usd" else part for i, part in enumerate(cmd)]
+    # The system prompt keys the preamble text, so its content-addressed file path does not.
+    return [_BUDGET_PLACEHOLDER if cmd[i - 1] == "--max-budget-usd"
+            else _PREAMBLE_PLACEHOLDER if part.startswith(_PREAMBLE_KEY)
+            else part for i, part in enumerate(cmd)]
 
 
 def cell_identity(
@@ -1067,7 +1157,7 @@ def cell_identity(
         tools = list(mode.tools)
     identity = {
         "harness_digest": baselines.harness_digest(
-            system_prompt=SYSTEM_PROMPT + ("\n" + _STRICT_SYSTEM_GUIDANCE if strict_file_tools else ""),
+            system_prompt=_base_prompt(mode) + ("\n" + _STRICT_SYSTEM_GUIDANCE if strict_file_tools else ""),
             tools=tools,
             strict_file_tools=strict_file_tools,
             bare=bare,
@@ -1085,6 +1175,8 @@ def cell_identity(
         "timeout_s": _task_timeout(task),
         **({"git_sha": mode.git_sha, "binary_sha256": mode.binary_sha256} if _is_tilth_arm(mode) else {}),
         **({"plugin_sha256": mode.plugin_sha256} if mode.plugin_dir else {}),
+        **({"preamble_sha256": hashlib.sha256(_base_prompt(mode).encode("utf-8")).hexdigest()}
+           if mode.prompt_mode == "preamble" else {}),
     }
     key_inputs = {
         **identity, "task": task_name, "model": MODELS[model_name], "mode": mode_name,
@@ -1139,6 +1231,12 @@ def run_single(
 ) -> dict:
     """Run one benchmark cell in the task's configured agent workspace."""
     task = TASKS[task_name]
+    if isinstance(task, chains.ChainTask):
+        return _run_chain(
+            task, mode_name, model_name, repetition, verbose=verbose, stream_log_path=stream_log_path,
+            bare=bare, reasoning_effort=reasoning_effort, max_budget_usd=max_budget_usd,
+            strict_file_tools=strict_file_tools, hook_sha=hook_sha, hook_repo=hook_repo,
+        )
     workspace = (
         _built_workdir() if task.fixture_path is None
         else _agent_repo(get_repo_path(task.repo), task.hide_git)
@@ -1163,6 +1261,88 @@ def run_single(
                 claude_config_dir=config_dir,
                 baseline=baseline,
             )
+
+
+def _chain_turn_argv(cmd: list[str], resume_session: str | None) -> list[str]:
+    """Keep the session of a chain turn on disk, and resume the earlier turn's session."""
+    argv = [part for part in cmd if part != "--no-session-persistence"]
+    if resume_session is not None:
+        at = argv.index("-p") + 1
+        argv[at:at] = ["--resume", resume_session]
+    return argv
+
+
+def _append_turn_log(stream_log_path: Path | None, turn_log: Path | None) -> None:
+    """Add one turn's stream to the chain's stream file, so failure costing reads the whole chain."""
+    if stream_log_path is None or turn_log is None or not turn_log.is_file():
+        return
+    with stream_log_path.open("a") as out:
+        out.write(turn_log.read_text())
+
+
+def _run_chain(
+    task: chains.ChainTask,
+    mode_name: str,
+    model_name: str,
+    repetition: int,
+    *,
+    verbose: bool = False,
+    stream_log_path: Optional[Path] = None,
+    bare: bool = False,
+    reasoning_effort: str | None = None,
+    max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
+    strict_file_tools: bool = False,
+    hook_sha: str | None = None,
+    hook_repo: Path | None = None,
+) -> dict:
+    """Run a chain's tasks as turns of one claude session in one workspace.
+
+    ``max_budget_usd`` is the budget of one member; the chain may spend the sum, and each turn is
+    capped at what the earlier turns left. Each member is prepared and graded with its own
+    methods, right after its turn. A wrong sub-task does not stop the next turn; an exception does.
+    """
+    if RUNNERS[model_name] != "claude":
+        raise ValueError("a chained cell needs a Claude model: only claude -p resumes a session")
+    chain_budget = max_budget_usd * task.size
+    identity = cell_identity(
+        task.name, mode_name, model_name, repetition,
+        bare=bare, reasoning_effort=reasoning_effort,
+        max_budget_usd=max_budget_usd, strict_file_tools=strict_file_tools,
+        hook_sha=hook_sha, hook_repo=hook_repo,
+    )
+    workspace = (
+        _built_workdir() if task.fixture_path is None
+        else _agent_repo(get_repo_path(task.repo), task.hide_git)
+    )
+    rows: list[dict] = []
+    spent = 0.0
+    session_id: str | None = None
+    with workspace as repo_path, _cell_claude_config(model_name, MODES[mode_name]) as config_dir:
+        for turn, member in enumerate(task.members, start=1):
+            remaining = chain_budget - spent
+            if remaining <= 0:
+                raise RuntimeError(f"chain {task.name} spent its ${chain_budget:.4f} before {member.name}")
+            member.prepare(repo_path)
+            turn_log = (
+                stream_log_path.with_name(f"{stream_log_path.stem}.turn{turn}.jsonl")
+                if stream_log_path is not None else None
+            )
+            with erosion.snapshot(repo_path) as baseline:
+                try:
+                    row = _run_single_in_repo(
+                        member.name, mode_name, model_name, repetition, repo_path,
+                        verbose=verbose, stream_log_path=turn_log, bare=bare,
+                        reasoning_effort=reasoning_effort, max_budget_usd=remaining,
+                        strict_file_tools=strict_file_tools, hook_sha=hook_sha, hook_repo=hook_repo,
+                        claude_config_dir=config_dir, baseline=baseline,
+                        chain_turn=True, resume_session=session_id,
+                    )
+                finally:
+                    _append_turn_log(stream_log_path, turn_log)
+            rows.append(row)
+            spent += row["total_cost_usd"]
+            session_id = row.get("session_id") or session_id
+    return chains.chain_row(task, rows, identity=identity, chain_budget=chain_budget)
 
 
 _CODEX_GUIDANCE = (
@@ -1202,7 +1382,13 @@ def _codex_command(
         f'{{path={json.dumps(path)},enabled=false}}' for path in skill_paths
     )
     cmd += ["-c", f"skills.config=[{skills_config}]"]
-    instructions = f"{SYSTEM_PROMPT}\nYour current working directory is: {repo_path}\n{_CODEX_GUIDANCE}"
+    if mode.prompt_mode == "preamble":
+        # As `tilth codex` does: the preamble replaces Codex's model instructions, not the developer message.
+        cmd += ["-c", f"{_PREAMBLE_KEY}{json.dumps(str(_preamble_file(_base_prompt(mode))))}"]
+        lead = ""
+    else:
+        lead = f"{SYSTEM_PROMPT}\n"
+    instructions = f"{lead}Your current working directory is: {repo_path}\n{_CODEX_GUIDANCE}"
     if mode.mcp_config_path:
         instructions += _CODEX_TILTH_GUIDANCE
     cmd += ["-c", f"developer_instructions={json.dumps(instructions)}"]
@@ -1310,7 +1496,8 @@ def _claude_command(
         # Keep claude's own system prompt (and its native skill handling); add only the cwd line.
         cmd += ["--append-system-prompt", cwd_prompt]
     else:
-        cmd += ["--system-prompt", SYSTEM_PROMPT + "\n" + cwd_prompt]
+        # A preamble arm replaces the system prompt with the preamble, as `tilth claude` does.
+        cmd += ["--system-prompt", _base_prompt(mode) + "\n" + cwd_prompt]
 
     # --setting-sources "" loads no user/project/local settings (hooks, env,
     # user MCP servers) while retaining OAuth/keychain auth and honoring
@@ -1396,11 +1583,15 @@ def _run_single_in_repo(
     hook_repo: Path | None = None,
     claude_config_dir: Path | None = None,
     baseline: Path | None = None,
+    chain_turn: bool = False,
+    resume_session: str | None = None,
 ) -> dict:
     """Execute and grade one benchmark cell.
 
     ``baseline`` is the workspace snapshot taken before the agent ran; without one the
     workspace diff is not measured.
+    ``chain_turn`` keeps the claude session on disk and adds ``session_id`` to the row;
+    ``resume_session`` resumes the session of the chain's earlier turn.
     """
     task = TASKS[task_name]
     mode = MODES[mode_name]
@@ -1428,6 +1619,11 @@ def _run_single_in_repo(
         strict_file_tools=strict_file_tools, skill_paths=skill_paths, strict_hook_binary=hook_binary,
     )
 
+    if chain_turn:
+        if runner != "claude":
+            raise ValueError("a chained cell needs a Claude model: only claude -p resumes a session")
+        cmd = _chain_turn_argv(cmd, resume_session)
+
     if verbose:
         print(f"    Running: {' '.join(cmd)}")
 
@@ -1442,6 +1638,8 @@ def _run_single_in_repo(
         language=task.language,
         agent_venv=agent_venv,
     )
+    if runner == "claude":
+        cmd = [resolve_claude_binary(), *cmd[1:]]
     cmd = _host_runner_argv(cmd, env, agent_venv)
     if claude_config_dir is not None:
         env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
@@ -1692,6 +1890,7 @@ def _run_single_in_repo(
         "lint_ok": lint_ok,
         "lint_reason": lint_reason,
         "reused": False,
+        **({"session_id": run_result.session_id} if chain_turn else {}),
         **identity,
     }
 
@@ -1740,9 +1939,13 @@ def select_tasks(value: str) -> list[str]:
     registered in ``TASKS`` so planning, identity, and the runners find it.
     """
     if value.lower() == "all":
-        return [name for name, task in TASKS.items() if not isinstance(task, external.ExternalTask)]
+        return [name for name, task in TASKS.items()
+                if not isinstance(task, (external.ExternalTask, chains.ChainTask))]
     for name in (item.strip() for item in value.split(",")):
         if not name or name in TASKS:
+            continue
+        if name.startswith(chains.PREFIX):
+            chains.register(TASKS, name, digest=_cell_task_digest)
             continue
         resolved, verdict = external.resolve_task(name)
         if resolved is not None:
@@ -1965,6 +2168,48 @@ def candidate_mode(mode: ModeConfig, build: CandidateBuild) -> ModeConfig:
                    binary_sha256=build.binary_sha256)
 
 
+PREAMBLE_FILE = "prompts/preamble.md"
+
+
+def read_preamble(sha: str | None = None, *, repo: Path | None = None) -> str:
+    """The launcher preamble of the tree under test: ``prompts/preamble.md`` at the commit ``sha`` of ``repo``,
+    or in the ``repo`` checkout when ``sha`` is None (default repo: this checkout).
+
+    Raises ``OSError`` or ``subprocess.CalledProcessError`` when the file is absent.
+    """
+    repo = Path(repo or REPO_ROOT)
+    if sha is None:
+        return (repo / PREAMBLE_FILE).read_text(encoding="utf-8")
+    return subprocess.run(["git", "show", f"{sha}:{PREAMBLE_FILE}"], cwd=repo, check=True,
+                          capture_output=True).stdout.decode("utf-8")
+
+
+def preamble_mode(mode: ModeConfig, text: str) -> ModeConfig:
+    """``mode`` with ``text`` as its whole system prompt, in place of ``SYSTEM_PROMPT``."""
+    return replace(mode, prompt_mode="preamble", preamble=text)
+
+
+def _base_prompt(mode: ModeConfig) -> str:
+    """The system prompt text of an arm: its preamble for a preamble arm, else ``SYSTEM_PROMPT``."""
+    if mode.prompt_mode != "preamble":
+        return SYSTEM_PROMPT
+    if mode.preamble is None:
+        raise ValueError(f"mode '{mode.name}' is a preamble arm with no preamble text")
+    return mode.preamble
+
+
+def _preamble_file(text: str) -> Path:
+    """A content-addressed copy of ``text`` under the results dir, for Codex's ``model_instructions_file``."""
+    data = text.encode("utf-8")
+    path = RESULTS_DIR / "configs" / "preambles" / f"preamble-{hashlib.sha256(data).hexdigest()}.md"
+    if not path.is_file() or path.read_bytes() != data:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        partial = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        partial.write_bytes(data)
+        partial.replace(path)
+    return path
+
+
 def planned_identity(cell: CellSpec, *, max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
                      strict_file_tools: bool = False, hook_sha: str | None = None,
                      hook_repo: Path | None = None) -> dict:
@@ -1993,14 +2238,23 @@ def _refuse_baseline_drift(pending: list[tuple[CellSpec, dict]], history: list[d
                             "pass --refreeze-baselines to re-run them")
 
 
+def _register_chains(task_names) -> None:
+    """Register each ``chain:<id>`` name in ``TASKS``; other names are left to their own loaders."""
+    for name in task_names:
+        if name.startswith(chains.PREFIX):
+            chains.register(TASKS, name, digest=_cell_task_digest)
+
+
 def check_baseline_drift(cells, *, panel: panels.Panel, max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
                          strict_file_tools: bool = False, hook_sha: str | None = None,
                          hook_repo: Path | None = None) -> None:
     """Raise ``BaselineDrift`` when a stock-arm cell of ``cells`` that the store cannot answer drifted; runs nothing."""
     panel.register(TASKS)
+    specs = [CellSpec(*cell) for cell in cells]
+    _register_chains(cell.task for cell in specs)
     planned = [(cell, planned_identity(cell, max_budget_usd=max_budget_usd, strict_file_tools=strict_file_tools,
                                        hook_sha=hook_sha, hook_repo=hook_repo))
-               for cell in (CellSpec(*cell) for cell in cells)]
+               for cell in specs]
     history = baselines.load_rows(RESULTS_DIR / baselines.STORE_FILENAME)
     reusable = baselines.completed_by_key(history)
     _refuse_baseline_drift([(cell, identity) for cell, identity in planned if identity["run_key"] not in reusable],
@@ -2021,6 +2275,7 @@ def run_plan(
     repo: Path | None = None,
     strict_file_tools: bool = False,
     hook_sha: str | None = None,
+    preamble: bool = False,
 ) -> list[dict]:
     """Run ``cells`` for one panel, answering each from the result store when it can.
 
@@ -2033,9 +2288,11 @@ def run_plan(
     Every row returned is also appended to ``output``.
     ``strict_file_tools`` runs every cell with Bash guarded by the hook: a tilth arm runs its own binary's hook,
     the baseline runs the hook built at ``hook_sha`` (a commit of ``repo``), and that hook replays every Bash call.
+    ``preamble`` gives every tilth arm ``prompts/preamble.md`` as its system prompt, read at ``candidate_sha``
+    (or from the ``repo`` checkout when ``candidate_sha`` is None).
 
-    Raises ``CandidateBuildFailed`` when ``candidate_sha`` or ``hook_sha`` does not build, or ``hook_sha`` has no
-    ``src/hook``; its subclass ``HookProbeFailed`` when a strict hook binary fails the allow/deny probe.
+    Raises ``CandidateBuildFailed`` when ``candidate_sha`` or ``hook_sha`` does not build, ``hook_sha`` has no
+    ``src/hook``, or ``preamble`` finds no preamble file; its subclass ``HookProbeFailed`` when a strict hook binary fails the allow/deny probe.
     Raises ``ValueError`` when ``strict_file_tools`` meets a non-Claude cell or a Claude CLI older than the
     minimum for exec-form hooks.
     Raises ``BaselineDrift`` before any cell when a stock-arm cell drifted without ``refreeze_baselines``.
@@ -2043,6 +2300,7 @@ def run_plan(
     """
     panel.register(TASKS)
     cells = [CellSpec(*cell) for cell in cells]
+    _register_chains(cell.task for cell in cells)
     if strict_file_tools:
         if hook_sha is None:
             raise ValueError("strict_file_tools requires hook_sha")
@@ -2057,14 +2315,25 @@ def run_plan(
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
             raise CandidateBuildFailed(build_failure_detail(error)) from error
     saved: dict[str, ModeConfig] = {}
+    build = None
     if candidate_sha is not None:
         try:
             build = build_candidate(candidate_sha, repo=repo)
         except (RuntimeError, OSError, subprocess.SubprocessError) as error:
             raise CandidateBuildFailed(build_failure_detail(error)) from error
+    text = None
+    if preamble:
+        try:
+            text = read_preamble(build.git_sha if build else None, repo=repo)
+        except (OSError, subprocess.SubprocessError, UnicodeDecodeError) as error:
+            raise CandidateBuildFailed(f"cannot read {PREAMBLE_FILE}: {error}") from error
+    if build is not None or text is not None:
         for name in {cell.mode for cell in cells if _is_tilth_arm(MODES[cell.mode])}:
             saved[name] = MODES[name]
-            MODES[name] = candidate_mode(MODES[name], build)
+            if build is not None:
+                MODES[name] = candidate_mode(MODES[name], build)
+            if text is not None:
+                MODES[name] = preamble_mode(MODES[name], text)
     try:
         if strict_file_tools and not store_only:
             probe_strict_hooks({cell.mode for cell in cells}, hook_binary)
@@ -2130,8 +2399,9 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         if store_only:
             continue
         cell_id = f"{cell.task}/{cell.mode}/{cell.model}/rep{cell.repetition}"
+        size = getattr(task, "size", 1)
         estimate = estimate_cell_cost(history, task=cell.task, mode=cell.mode, model=MODELS[cell.model],
-                                      run_max_cost=run_max_cost, fallback=cell_estimate_usd)
+                                      run_max_cost=run_max_cost, fallback=cell_estimate_usd * size)
         try:
             crossing = ledger.would_cross(estimate)
         except ValueError as error:
@@ -2147,8 +2417,8 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
                               else f"{runner} was {identity['cli_version']!r} when planned, now {current_cli!r}", rows)
         # A per-attempt suffix: a retried cell has the same key and must not overwrite its earlier sidecar.
         attempt = datetime.now().strftime("%Y%m%dT%H%M%S%f")
-        stream_log_path = stream_dir / (f"{identity['run_key'][:16]}_{cell.task}_{cell.mode}_rep{cell.repetition}"
-                                        f"_{attempt}.jsonl")
+        stream_log_path = stream_dir / (f"{identity['run_key'][:16]}_{cell.task.replace(':', '_')}_{cell.mode}"
+                                        f"_rep{cell.repetition}_{attempt}.jsonl")
         # Any runner stops without unreserved headroom. The run key pins the run's budget; a claude cell's
         # --max-budget-usd cap shrinks to the headroom, so an overrunning cell cannot spend the finish reserve.
         try:
@@ -2161,7 +2431,7 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
                                          f"budget for {cell_id} under ${ledger.max_usd}", rows)
         cell_cap = max_budget_usd
         if runner == "claude" and headroom is not None:
-            cell_cap = min(max_budget_usd, headroom)
+            cell_cap = min(max_budget_usd, headroom / size)
         applied_cap = {"applied_max_budget_usd": cell_cap} if runner == "claude" else {}
         metadata = {
             "task": cell.task, "mode": cell.mode, "model": MODELS[cell.model], "model_alias": cell.model,
@@ -2206,8 +2476,11 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
             if quota:
                 fail({"infra": "quota", "error": f"infra:quota: {quota}", "correctness_reason": f"Usage limit: {quota}"})
                 raise PlanStopped("quota", quota, rows) from error
-            fail({"error": str(error), "correctness_reason": f"Exception: {error}"})
-            if cell_cap < max_budget_usd and "error_max_budget_usd" in str(error):
+            capped = runner == "claude" and budget_capped(_read_stream(stream_log_path))
+            # Only a cap at the run key's budget is the agent's own; a cap shrunk to the headroom is the ledger's.
+            fail({"error": str(error), "correctness_reason": f"Exception: {error}",
+                  **({"budget_capped": True} if capped and cell_cap >= max_budget_usd else {})})
+            if cell_cap < max_budget_usd and (capped or "error_max_budget_usd" in str(error)):
                 raise PlanStopped("ceiling", f"{cell_id} hit its ${cell_cap:.4f} cap at the unreserved headroom",
                                   rows) from error
         else:
@@ -2362,6 +2635,22 @@ def _select_arms(args: argparse.Namespace, models: list[str], timestamp: str) ->
     return modes, experiment
 
 
+def _apply_preamble(modes: list[str], models: list[str], experiment: object, candidate_sha: str | None) -> None:
+    """Make every selected tilth arm a preamble arm, with the preamble at ``candidate_sha`` or in this checkout."""
+    if experiment is not None:
+        raise ValueError("a pinned experiment manifest owns its arms; it cannot be combined with --preamble")
+    if any(RUNNERS[model] not in ("claude", "codex") for model in models):
+        raise ValueError("the preamble arm runs on Claude and Codex models only")
+    tilth_modes = [name for name in modes if _is_tilth_arm(MODES[name])]
+    if not tilth_modes:
+        raise ValueError("no selected arm serves tilth")
+    if appended := [name for name in tilth_modes if MODES[name].prompt_mode != "replace"]:
+        raise ValueError(f"arm(s) {appended} already set prompt_mode")
+    text = read_preamble(candidate_sha)
+    for name in tilth_modes:
+        MODES[name] = preamble_mode(MODES[name], text)
+
+
 def _verify_mcp_servers(modes: list[str], runner: Optional[str]) -> None:
     """Verify the exact MCP command that each selected runner will launch."""
     for mode_name in modes:
@@ -2488,6 +2777,15 @@ Examples:
         help="Abort before model calls when the expanded schedule exceeds this count",
     )
     parser.add_argument(
+        "--allow-cli-drift", action="store_true",
+        help="Run with a Claude CLI that is not the version in benchmark/claude-cli.version; every stored cell's "
+             "run key then drifts and is bought again",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help="Print the planned cells and which would call a model, then exit; no model call, no --max-usd needed",
+    )
+    parser.add_argument(
         "--max-usd", type=float,
         help="Run-wide spend ceiling in USD; required when any cell is not answered from the result store",
     )
@@ -2540,6 +2838,12 @@ Examples:
     parser.add_argument(
         "--candidate-sha",
         help="Serve tilth arms from a binary built with cargo build --release --locked at this local commit",
+    )
+    parser.add_argument(
+        "--preamble",
+        action="store_true",
+        help="Give every tilth arm prompts/preamble.md as its whole system prompt, as `tilth claude` and "
+             "`tilth codex` do; read at --candidate-sha, else from this checkout. Claude and Codex models only",
     )
     arm_group = parser.add_mutually_exclusive_group()
     arm_group.add_argument(
@@ -2638,6 +2942,17 @@ Examples:
         for mode_name in modes:
             if _is_tilth_arm(MODES[mode_name]):
                 MODES[mode_name] = candidate_mode(MODES[mode_name], build)
+    if args.preamble:
+        try:
+            _apply_preamble(modes, models, experiment, args.candidate_sha)
+        except (ValueError, OSError, subprocess.SubprocessError) as error:
+            parser.error(f"--preamble: {error}")
+
+    if any(RUNNERS[name] == "claude" for name in models):
+        try:
+            print(require_pinned_cli(allow_drift=args.allow_cli_drift))
+        except CliPinError as error:
+            parser.error(str(error))
 
     # Ad hoc, the baseline hook and the replay audit use this checkout's HEAD (the seed hook), even with
     # --candidate-sha: a candidate hook is audited against the seed hook, never against itself.
@@ -2731,6 +3046,18 @@ Examples:
     history = baselines.load_rows(store_path)
     reusable = baselines.completed_by_key(history)
     pending = [cell for cell in cells if cell.run_key not in reusable]
+    if args.dry_run:
+        for cell in cells:
+            members = getattr(TASKS[cell.task_name], "members", ())
+            detail = (
+                f" | {len(members)} tasks in one session: {', '.join(member.name for member in members)}"
+                f" | budget ${args.max_budget_usd * len(members):.2f} (${args.max_budget_usd:.2f} each)"
+            ) if members else ""
+            state = "reuse" if cell.run_key in reusable else "run"
+            print(f"{cell.run_key[:12]} {state:5} {cell.task_name} {cell.mode_name} {cell.model_name} "
+                  f"rep{cell.repetition}{detail}")
+        print(f"dry run: {len(cells)} cells planned, {len(pending)} would call a model; nothing ran")
+        return
     if pending:
         if args.max_usd is None:
             parser.error(
@@ -2906,7 +3233,7 @@ Examples:
 
             estimate = estimate_cell_cost(
                 history, task=task_name, mode=mode_name, model=MODELS[model_name],
-                run_max_cost=run_max_cost, fallback=fallback_estimate,
+                run_max_cost=run_max_cost, fallback=fallback_estimate * getattr(task, "size", 1),
             )
             try:
                 exhausted = ledger.exhausted()
@@ -2936,7 +3263,7 @@ Examples:
                 )
                 break
 
-            cell_slug = f"{current_run:02d}_{task_name}_{mode_name}_{model_name}_rep{rep}"
+            cell_slug = f"{current_run:02d}_{task_name.replace(':', '_')}_{mode_name}_{model_name}_rep{rep}"
             stream_log_path = stream_log_dir / f"{cell_slug}.jsonl"
             mode = MODES[mode_name]
             record_metadata = {
@@ -3068,6 +3395,8 @@ Examples:
                     "error": str(error),
                     "correct": False,
                     "correctness_reason": f"Exception: {error}",
+                    **({"budget_capped": True}
+                       if runner == "claude" and budget_capped(_read_stream(stream_log_path)) else {}),
                 }, stream_log_path, runner, estimate)
 
             else:

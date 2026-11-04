@@ -13,6 +13,10 @@ from .materialize import PHRASE_PIN_EXEMPT_ENV
 REPIN_NOTE = (f"Phrase pins were exempt during the search: each candidate's `just check` set {PHRASE_PIN_EXEMPT_ENV}=1, "
               "so the Rust tests skipped their exact-phrase asserts on prompts/ text. CI does not set it. "
               "Re-pin those asserts to this PR's prompt text before it lands.")
+TEST_REVIEW_NOTE = ("The tests below are new, or a repair updated them because the intended behavior change made "
+                    "their old asserts obsolete. Check that each new test checks the new behavior and that no test "
+                    "is deleted or weakened. The integrity check cannot see production code that detects a test run "
+                    "at run time (for example through `std::env::current_exe()`); read the production diff for one.")
 ALLOWED_WINNER_PREFIXES = ("src/", "prompts/")
 ALLOWED_WINNER_FILES = ("AGENTS.md",)
 _GITHUB_URL = re.compile(r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)(?P<owner>[^/]+)/(?P<name>[^/]+?)(?:\.git)?/?")
@@ -26,6 +30,16 @@ class PRClient(Protocol):
 
 def outside_allowlist(paths: list[str]) -> list[str]:
     return [path for path in paths if not path.startswith(ALLOWED_WINNER_PREFIXES) and path not in ALLOWED_WINNER_FILES]
+
+
+def changed_tests_section(changes: dict[str, str]) -> list[str]:
+    """PR body lines for the tests the winner changes, each with its diff; nothing when it changes none."""
+    if not changes:
+        return []
+    lines = ["## Test changes for review", TEST_REVIEW_NOTE, ""]
+    for name, diff in sorted(changes.items()):
+        lines += [f"### `{name}`", "```diff", diff, "```", ""]
+    return lines
 
 
 class GitHubPRClient:

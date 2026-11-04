@@ -150,6 +150,8 @@ fn run_search_v2(
         ));
     }
     let mut follows: Vec<Option<Follow>> = Vec::with_capacity(entries.len());
+    // A pattern that does not compile fails only its own entry.
+    let mut pattern_errors: Vec<Option<String>> = Vec::with_capacity(entries.len());
     let mut structural = crate::search::StructuralPatterns::default();
     for entry in entries {
         let object = entry
@@ -176,8 +178,9 @@ fn run_search_v2(
             follows.push(Some(
                 Follow::parse_shape(hint).map_err(|e| SearchFailure::new(e, "bad_follow"))?,
             ));
+            pattern_errors.push(None);
         } else if object.contains_key("pattern") {
-            parse_structural_entry(object, cwd, &mut structural)?;
+            pattern_errors.push(parse_structural_entry(object, cwd, &mut structural)?);
             follows.push(None);
         } else {
             if object.keys().any(|k| k != "query" && k != "glob") {
@@ -194,6 +197,7 @@ fn run_search_v2(
             }
             validate_entry_glob(object, cwd, "bad_query_entry")?;
             follows.push(None);
+            pattern_errors.push(None);
         }
     }
     let mut results: Vec<(Value, Option<FileCounts>)> = Vec::with_capacity(entries.len());
@@ -202,9 +206,9 @@ fn run_search_v2(
     let mut routes_tried = Vec::with_capacity(entries.len());
     let mut normalizations = Vec::new();
     let mut failed = 0;
-    let mut first_failure: Option<String> = None;
+    let mut first_failure: Option<SearchFailure> = None;
     let entry_budget = budget / entries.len().max(1) as u64;
-    for (entry, follow) in entries.iter().zip(&follows) {
+    for ((entry, follow), pattern_error) in entries.iter().zip(&follows).zip(&pattern_errors) {
         let mut counts = None;
         let (mut result, route, mut entry_hints, diagnostic) = if let Some(follow) = follow {
             session.record_follow();
@@ -215,25 +219,33 @@ fn run_search_v2(
                     result["error"] = json!(message);
                     result["completeness"] = json!("partial");
                     failed += 1;
-                    first_failure.get_or_insert(message);
+                    first_failure.get_or_insert(SearchFailure::new(message, "route_error"));
                     (result, "error".to_string(), Vec::new(), None)
                 }
             }
         } else if let Some(pattern) = entry.get("pattern").and_then(Value::as_str) {
             let language = entry["language"].as_str().unwrap();
             session.record_structural_search();
-            let (result, route, file_counts, failure) = execute_structural_entry(
-                &structural,
-                language,
-                pattern,
-                cwd,
-                entry.get("glob").and_then(Value::as_str).or(top_glob),
-                cache,
-            );
+            let (result, route, file_counts, failure) = match pattern_error {
+                Some(message) => structural_error(pattern, message.clone()),
+                None => execute_structural_entry(
+                    &structural,
+                    language,
+                    pattern,
+                    cwd,
+                    entry.get("glob").and_then(Value::as_str).or(top_glob),
+                    cache,
+                ),
+            };
             counts = file_counts;
             if let Some(message) = failure {
                 failed += 1;
-                first_failure.get_or_insert(message);
+                let class = if pattern_error.is_some() {
+                    "bad_structural"
+                } else {
+                    "route_error"
+                };
+                first_failure.get_or_insert(SearchFailure::new(message, class));
             }
             (result, route, Vec::new(), None)
         } else {
@@ -253,7 +265,7 @@ fn run_search_v2(
                     result["error"] = json!(message);
                     result["completeness"] = json!("partial");
                     failed += 1;
-                    first_failure.get_or_insert(message);
+                    first_failure.get_or_insert(SearchFailure::new(message, "route_error"));
                     (result, "error".to_string(), Vec::new(), None)
                 }
             }
@@ -267,10 +279,7 @@ fn run_search_v2(
         }
     }
     if failed == entries.len() {
-        return Err(SearchFailure::new(
-            first_failure.unwrap_or_default(),
-            "route_error",
-        ));
+        return Err(first_failure.unwrap_or_else(|| SearchFailure::new("", "route_error")));
     }
     let partial = results.iter().any(|(r, _)| r["completeness"] == "partial");
     let route = if routes_tried.len() > 1 {
@@ -319,11 +328,13 @@ fn validate_entry_glob(
 }
 
 /// Validate one structural entry and compile its pattern into `structural`.
+/// A malformed entry fails the request; a pattern or language that does not
+/// compile returns its message so only that entry fails.
 fn parse_structural_entry(
     object: &serde_json::Map<String, Value>,
     cwd: &Path,
     structural: &mut crate::search::StructuralPatterns,
-) -> Result<(), SearchFailure> {
+) -> Result<Option<String>, SearchFailure> {
     if object
         .keys()
         .any(|key| !matches!(key.as_str(), "pattern" | "language" | "glob"))
@@ -350,9 +361,7 @@ fn parse_structural_entry(
             )
         })?;
     validate_entry_glob(object, cwd, "bad_structural")?;
-    structural
-        .prepare(language, pattern)
-        .map_err(|error| SearchFailure::new(error, "bad_structural"))
+    Ok(structural.prepare(language, pattern).err())
 }
 
 /// Build the result record for one structural scan, returning it with the
@@ -403,14 +412,19 @@ fn execute_structural_entry(
             let (result, counts) = structural_result(scan, pattern, language);
             (result, "structural".into(), Some(counts), None)
         }
-        Err(error) => {
-            let message = error.to_string();
-            let mut result = base_result(pattern, "error", "error");
-            result["error"] = json!(&message);
-            result["completeness"] = json!("partial");
-            (result, "error".into(), None, Some(message))
-        }
+        Err(error) => structural_error(pattern, error.to_string()),
     }
+}
+
+/// The error record for one structural entry that cannot run.
+fn structural_error(
+    pattern: &str,
+    message: String,
+) -> (Value, String, Option<FileCounts>, Option<String>) {
+    let mut result = base_result(pattern, "error", "error");
+    result["error"] = json!(&message);
+    result["completeness"] = json!("partial");
+    (result, "error".into(), None, Some(message))
 }
 
 /// Mark a result incomplete. Only an `ok` status degrades to `partial`; an
@@ -486,11 +500,12 @@ fn reduce_response(
                     && counts[index].as_ref().is_some_and(|c| !c.is_empty())
             });
 
-    for (index, owner, field, size) in plain {
+    for (index, owner, field, _) in plain {
         if crate::types::estimate_tokens(len as u64) <= budget {
             break;
         }
         let result = &mut response["results"][index];
+        let before = result.to_string().len();
         let removed = match owner {
             None => result.as_object_mut().and_then(|o| o.remove(field)),
             Some(key) => result[key].as_object_mut().and_then(|o| o.remove(field)),
@@ -498,10 +513,14 @@ fn reduce_response(
         if removed.is_none() {
             continue;
         }
-        len -= size;
-        // The trim markers below add bytes back; measure the record around them
-        // so `len` stays exact and the final serialization needs no re-check.
-        let before = result.to_string().len();
+        // `continue` and `core_end` point past the dropped lines; without
+        // `core` they would hide the lines before them.
+        if owner.is_none() && field == "core" {
+            if let Some(object) = result.as_object_mut() {
+                object.remove("continue");
+                object.remove("core_end");
+            }
+        }
         if let Some(key) = owner {
             result[key]["coverage"] = json!("partial");
         }
@@ -818,6 +837,7 @@ fn route_query(
                     glob,
                     cache,
                     session,
+                    budget,
                 )?;
                 result["query"] = json!(query);
                 return Ok((result, "path".to_string(), hints, None));
@@ -830,11 +850,42 @@ fn route_query(
         return Ok((result, "path".to_string(), Vec::new(), None));
     }
 
+    // 1b. Go declaration signature — `func (r *T) Name(...)` carries `(`, `*`
+    // and `)`, which would route to regex and miss. Resolve it to the symbol
+    // and report the rewrite in the diagnostics.
+    // A receiver narrows the symbol to that type's methods; when it leaves
+    // none, the signature text is searched literally instead.
+    if let Some(signature) = go_signature(query) {
+        let receiver_scope = signature
+            .receiver
+            .map(|receiver| (go_receiver_type(receiver), query));
+        let (mut result, route, hints) = route_identifier(
+            signature.name,
+            receiver_scope,
+            None,
+            glob,
+            cwd,
+            cache,
+            session,
+            budget,
+        )?;
+        result["query"] = json!(query);
+        let mut diag = json!({
+            "query": query,
+            "normalized_to": signature.name,
+            "stripped_keyword": "func",
+        });
+        if let Some(receiver) = signature.receiver {
+            diag["receiver"] = json!(receiver);
+        }
+        return Ok((result, route, hints, Some(diag)));
+    }
+
     // 2. regex — contains a regex metacharacter (`.` and `/` don't count).
     // A glob naming one exact existing file is single-file-bounded by
     // `search::exact_glob_target` inside the walker — no separate short-circuit needed here.
     if query.chars().any(|c| REGEX_METACHARS.contains(&c)) {
-        let search_result = crate::search::search_regex_raw(query, cwd, glob)?;
+        let search_result = crate::search::search_regex_raw_budgeted(query, cwd, glob, budget)?;
         let mut result = raw_result(query, "regex", &search_result);
         set_preview(
             &mut result,
@@ -845,11 +896,12 @@ fn route_query(
 
     // 3. signature-prefix normalization — strip a leading declaration keyword
     // (`fn foo` -> `foo`) before identifier/path routing, so a pasted
-    // signature-shaped phrase still hits the underlying symbol.
+    // signature-shaped phrase still hits the underlying symbol. The keyword
+    // narrows the definitions to that kind.
     if let Some((kw, ident)) = strip_signature_prefix(query) {
         if is_identifier(ident) {
             let (mut result, route, hints) =
-                route_identifier(ident, glob, cwd, cache, session, budget)?;
+                route_identifier(ident, None, Some(kw), glob, cwd, cache, session, budget)?;
             result["query"] = json!(query);
             let diag = json!({
                 "query": query,
@@ -885,7 +937,8 @@ fn route_query(
     // 5. symbol / ambiguous — bare identifier: prefer definitions, then reuse
     // usage matches or search literal content when no symbols were found.
     if is_identifier(query) {
-        let (result, route, hints) = route_identifier(query, glob, cwd, cache, session, budget)?;
+        let (result, route, hints) =
+            route_identifier(query, None, None, glob, cwd, cache, session, budget)?;
         return Ok((result, route, hints, None));
     }
 
@@ -897,16 +950,36 @@ fn route_query(
 /// Route a bare identifier through the definitions-first symbol cascade:
 /// unique code definition -> ambiguous multi-definition -> usage/literal
 /// fallback -> miss. Shared by the plain identifier route and the
-/// signature-prefix-normalized route.
+/// signature-prefix-normalized route. `receiver_scope` is a Go receiver type
+/// plus the full signature text: only that type's methods count as
+/// definitions; with none left the signature text is searched literally.
+/// `keyword` is a stripped declaration keyword: definitions of that kind win
+/// when at least one exists. A trait or interface implementation counts as a
+/// definition only for the `impl` keyword.
 fn route_identifier(
     query: &str,
+    receiver_scope: Option<(&str, &str)>,
+    keyword: Option<&str>,
     glob: Option<&str>,
     cwd: &Path,
     cache: &OutlineCache,
     session: &Session,
     budget: u64,
 ) -> Result<(Value, String, Vec<Value>), crate::error::TilthError> {
-    let sym_result = crate::search::search_symbol_raw_cached(query, cwd, glob, cache)?;
+    // The receiver filter runs inside the walk, so the hit cap counts only the
+    // scoped methods. A file defining the method on that receiver names the
+    // receiver type, so files without it are never parsed.
+    let sym_result = match receiver_scope {
+        Some((receiver_type, _)) => {
+            let keep = |m: &Match| is_method_on(m, receiver_type);
+            let filter = crate::search::DefinitionFilter {
+                required_text: receiver_type,
+                keep: &keep,
+            };
+            crate::search::search_symbol_raw_filtered(query, cwd, glob, cache, budget, &filter)?
+        }
+        None => crate::search::search_symbol_raw_for_budget(query, cwd, glob, cache, budget)?,
+    };
     let discovery_partial = sym_result.files_unreadable > 0
         || sym_result.definitions
             > sym_result
@@ -914,7 +987,7 @@ fn route_identifier(
                 .iter()
                 .filter(|m| m.is_definition)
                 .count();
-    let mut code_defs: Vec<Match> = sym_result
+    let all_code_defs: Vec<&Match> = sym_result
         .matches
         .iter()
         .filter(|m| {
@@ -924,8 +997,17 @@ fn route_identifier(
                     crate::types::FileType::Code(_)
                 )
         })
-        .cloned()
         .collect();
+    let mut code_defs: Vec<Match> = keyword
+        .map(|keyword| declared_as(&all_code_defs, keyword))
+        .filter(|kept| !kept.is_empty())
+        .unwrap_or_else(|| {
+            all_code_defs
+                .iter()
+                .filter(|m| m.impl_target.is_none())
+                .map(|m| (*m).clone())
+                .collect()
+        });
     code_defs.sort_by(|a, b| {
         a.path
             .cmp(&b.path)
@@ -948,6 +1030,16 @@ fn route_identifier(
             false
         }
     });
+    if let Some((_, signature_text)) = receiver_scope {
+        if code_defs.is_empty() {
+            let (mut result, route) =
+                content_route(signature_text, glob, cwd, cache, session, None, budget)?;
+            if discovery_partial {
+                mark_partial(&mut result);
+            }
+            return Ok((result, route, Vec::new()));
+        }
+    }
     if code_defs.len() == 1 {
         let target = &code_defs[0];
         let (mut result, hints) = unique_hit(
@@ -961,6 +1053,7 @@ fn route_identifier(
             glob,
             cache,
             session,
+            budget,
         )?;
         if discovery_partial {
             mark_partial(&mut result);
@@ -968,20 +1061,12 @@ fn route_identifier(
         return Ok((result, "symbol".to_string(), hints));
     }
     if code_defs.len() > 1 {
-        let content_result = crate::search::search_content_raw(query, cwd, glob)?;
+        // The candidates are the answer. A content search of the bare name
+        // would preview unrelated lines and skew completeness.
         let mut result = base_result(query, "ambiguous", "ambiguous");
-        if discovery_partial
-            || content_result.files_unreadable > 0
-            || content_result.total_found > content_result.matches.len()
-        {
-            mark_partial(&mut result);
-        }
         result["candidates"] = json!(candidates(&code_defs, cwd));
-        if content_result.total_found > 0 {
-            set_preview(
-                &mut result,
-                crate::search::format_raw_result_deferred(&content_result, cache, session, budget)?,
-            );
+        if discovery_partial {
+            mark_partial(&mut result);
         }
         return Ok((result, "ambiguous".to_string(), Vec::new()));
     }
@@ -1013,7 +1098,7 @@ fn content_route(
     route_name: Option<&str>,
     budget: u64,
 ) -> Result<(Value, String), crate::error::TilthError> {
-    let content_result = crate::search::search_content_raw(query, cwd, glob)?;
+    let content_result = crate::search::search_content_raw_budgeted(query, cwd, glob, budget)?;
     let route = route_name.unwrap_or(if content_result.total_found > 0 {
         "literal"
     } else {
@@ -1029,13 +1114,38 @@ fn content_route(
     Ok((result, route.to_string()))
 }
 
+/// The definitions a stripped declaration keyword names. `impl` keeps trait
+/// and interface implementations. Any other keyword keeps the definitions
+/// whose declaration line holds that word; a function keyword accepts every
+/// language's function keyword.
+fn declared_as(defs: &[&Match], keyword: &str) -> Vec<Match> {
+    const FUNCTION_WORDS: &[&str] = &["fn", "function", "def", "defp", "fun", "func"];
+    let words = if FUNCTION_WORDS.contains(&keyword) {
+        FUNCTION_WORDS
+    } else {
+        std::slice::from_ref(&keyword)
+    };
+    let keep = |m: &Match| {
+        if keyword == "impl" {
+            return m.impl_target.is_some();
+        }
+        m.impl_target.is_none()
+            && m.text
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .any(|word| words.contains(&word))
+    };
+    defs.iter()
+        .filter(|m| keep(m))
+        .map(|m| (*m).clone())
+        .collect()
+}
+
 /// Split `query` into `(keyword, identifier)` when it is exactly a
 /// declaration keyword followed by a single identifier token (e.g.
 /// `"fn detect_file_type"` -> `("fn", "detect_file_type")`).
 fn strip_signature_prefix(query: &str) -> Option<(&str, &str)> {
     const KEYWORDS: &[&str] = &[
         "fn",
-        "func",
         "function",
         "def",
         "class",
@@ -1057,6 +1167,213 @@ fn strip_signature_prefix(query: &str) -> Option<(&str, &str)> {
     } else {
         None
     }
+}
+
+struct GoSignature<'a> {
+    receiver: Option<&'a str>,
+    name: &'a str,
+}
+
+/// Parse a pasted Go declaration: `func Name`, `func Name(args) ret`,
+/// `func (T) Name` or `func (m *T) Name(args) ret`. Anything with regex
+/// escapes or wildcards in the receiver or parameter list stays a regex.
+fn go_signature(query: &str) -> Option<GoSignature<'_>> {
+    let (receiver, rest) = go_func_head(query)?;
+    let name_end = rest
+        .find(|c: char| c != '_' && !c.is_ascii_alphanumeric())
+        .unwrap_or(rest.len());
+    let (name, tail) = rest.split_at(name_end);
+    if !is_identifier(name) {
+        return None;
+    }
+    if !is_go_signature_tail(tail) {
+        return None;
+    }
+    Some(GoSignature { receiver, name })
+}
+
+/// Split `func`, an optional receiver, and the rest of a Go declaration.
+fn go_func_head(query: &str) -> Option<(Option<&str>, &str)> {
+    let rest = query.trim().strip_prefix("func")?;
+    let rest = rest.strip_prefix(char::is_whitespace)?.trim_start();
+    match rest.strip_prefix('(') {
+        Some(inner) => {
+            let close = matching_close(inner, '(', ')')?;
+            let receiver = inner[..close].trim();
+            if !is_go_receiver(receiver) {
+                return None;
+            }
+            Some((Some(receiver), inner[close + 1..].trim_start()))
+        }
+        None => Some((None, rest)),
+    }
+}
+
+/// What follows the declared name: nothing, a parameter list, or a type
+/// parameter list (`[T any]`). Regex operators or a character class mean the
+/// query is a pattern. A final `{` is the body opener of a pasted declaration.
+fn is_go_signature_tail(tail: &str) -> bool {
+    let tail = tail.trim_end();
+    let tail = match tail.strip_suffix('{') {
+        Some(before) => before.trim_end(),
+        None => tail,
+    };
+    if tail.is_empty() {
+        return true;
+    }
+    let probe = without_type_braces(tail);
+    for marker in ['\\', '?', '+', '^', '$', '{'] {
+        if probe.contains(marker) {
+            return false;
+        }
+    }
+    // `...` is variadic, so `...*T` is not a wildcard.
+    if tail.replace("...", "").contains(".*") {
+        return false;
+    }
+    // `|` joins constraint terms in a type parameter list; elsewhere it is alternation.
+    match tail.strip_prefix('[') {
+        Some(inner) => {
+            let Some(close) = matching_close(inner, '[', ']') else {
+                return false;
+            };
+            let after = inner[close + 1..].trim_start();
+            is_go_type_params(&inner[..close])
+                && (after.is_empty() || after.starts_with('('))
+                && !without_type_braces(after).contains('|')
+        }
+        None => tail.starts_with('(') && !probe.contains('|'),
+    }
+}
+
+/// A Go method declaration whose receiver type is `receiver_type`.
+fn is_method_on(m: &Match, receiver_type: &str) -> bool {
+    let Some((Some(receiver), _)) = go_func_head(m.text.trim()) else {
+        return false;
+    };
+    go_receiver_type(receiver) == receiver_type
+}
+
+/// Index of the delimiter that closes a group whose opener precedes `s`.
+fn matching_close(s: &str, open: char, close: char) -> Option<usize> {
+    let mut depth = 1usize;
+    for (index, c) in s.char_indices() {
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
+/// Drop balanced `{...}` groups, which are struct or interface types. A group
+/// holding only digits and commas is a regex repetition (`a{2,3}`) and stays.
+fn without_type_braces(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let inner = &rest[open + 1..];
+        let Some(close) = matching_close(inner, '{', '}') else {
+            out.push_str(&rest[open..]);
+            return out;
+        };
+        let body = &inner[..close];
+        if !body.is_empty() && body.chars().all(|c| c.is_ascii_digit() || c == ',') {
+            out.push_str(&rest[open..open + close + 2]);
+        }
+        rest = &inner[close + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `T any`, `K comparable, V any`, `K, V any`: each part starts with an
+/// identifier, and the last part carries the constraint.
+fn is_go_type_params(params: &str) -> bool {
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut parts = Vec::new();
+    for (index, c) in params.char_indices() {
+        match c {
+            '[' | '(' | '{' => depth += 1,
+            ']' | ')' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&params[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&params[start..]);
+    let last = parts.len() - 1;
+    for (index, part) in parts.into_iter().enumerate() {
+        let mut tokens = part.split_whitespace();
+        let Some(name) = tokens.next() else {
+            return false;
+        };
+        if !is_identifier(name) {
+            return false;
+        }
+        if index == last && tokens.next().is_none() {
+            return false;
+        }
+    }
+    true
+}
+
+/// A receiver without its trailing type-parameter list: `m *Map[K, V]` -> `m *Map`.
+fn strip_type_params(receiver: &str) -> Option<&str> {
+    let Some(body) = receiver.strip_suffix(']') else {
+        return Some(receiver);
+    };
+    let mut depth = 1usize;
+    for (index, c) in body.char_indices().rev() {
+        if c == ']' {
+            depth += 1;
+        } else if c == '[' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(body[..index].trim_end());
+            }
+        }
+    }
+    None
+}
+
+/// The type name of a Go receiver: `m *T[K]` -> `T`.
+fn go_receiver_type(receiver: &str) -> &str {
+    let head = strip_type_params(receiver).unwrap_or(receiver);
+    let type_token = head.split_whitespace().last().unwrap_or(head);
+    type_token.trim_start_matches('*')
+}
+
+/// `T`, `*T`, `m T`, `m *T`, optionally with type parameters (`T[K]`, `Map[K, V]`).
+fn is_go_receiver(receiver: &str) -> bool {
+    let Some(head) = strip_type_params(receiver) else {
+        return false;
+    };
+    let mut tokens = head.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let type_token = match tokens.next() {
+        Some(second) => {
+            if !is_identifier(first) {
+                return false;
+            }
+            second
+        }
+        None => first,
+    };
+    if tokens.next().is_some() {
+        return false;
+    }
+    is_identifier(type_token.trim_start_matches('*'))
 }
 
 fn raw_result(query: &str, route: &str, raw: &crate::types::SearchResult) -> Value {
@@ -1125,62 +1442,72 @@ fn unique_hit(
     glob: Option<&str>,
     cache: &OutlineCache,
     session: &Session,
+    budget: u64,
 ) -> Result<(Value, Vec<Value>), crate::error::TilthError> {
-    let (source_path, line, name, body, core_partial, shown, content) = if resolved_as == "path" {
-        let content = std::fs::read_to_string(target_path).map_err(|source| {
-            crate::error::TilthError::IoError {
-                path: target_path.to_path_buf(),
-                source,
-            }
-        })?;
-        let body = content.lines().take(60).collect::<Vec<_>>().join("\n");
-        let core_partial = content.lines().count() > 60;
-        let shown_count = u32::try_from(content.lines().take(60).count()).unwrap_or(60);
-        (
-            target_path.to_path_buf(),
-            None,
-            None,
-            body,
-            core_partial,
-            (1, shown_count),
-            content,
-        )
-    } else {
-        let (target, content, _) = match occurrence {
-            Some(occurrence) => crate::search::target::resolve_candidate_with_source_exact(
-                target_path,
-                target_line,
-                semantic_end,
-                query,
-                occurrence,
-                cache,
-            )?,
-            None => crate::search::target::resolve_candidate_with_source(
-                target_path,
-                target_line,
-                semantic_end,
-                query,
-                cache,
-            )?,
+    let (source_path, line, name, body, core_partial, shown, content, construct_end) =
+        if resolved_as == "path" {
+            let content = std::fs::read_to_string(target_path).map_err(|source| {
+                crate::error::TilthError::IoError {
+                    path: target_path.to_path_buf(),
+                    source,
+                }
+            })?;
+            let body = content.lines().take(60).collect::<Vec<_>>().join("\n");
+            let total_lines = u32::try_from(content.lines().count()).unwrap_or(u32::MAX);
+            let core_partial = total_lines > 60;
+            let shown_count = u32::try_from(content.lines().take(60).count()).unwrap_or(60);
+            (
+                target_path.to_path_buf(),
+                None,
+                None,
+                body,
+                core_partial,
+                (1, shown_count),
+                content,
+                total_lines,
+            )
+        } else {
+            let (target, content, _) = match occurrence {
+                Some(occurrence) => crate::search::target::resolve_candidate_with_source_exact(
+                    target_path,
+                    target_line,
+                    semantic_end,
+                    query,
+                    occurrence,
+                    cache,
+                )?,
+                None => crate::search::target::resolve_candidate_with_source(
+                    target_path,
+                    target_line,
+                    semantic_end,
+                    query,
+                    cache,
+                )?,
+            };
+            let span_start = target.span_start_line;
+            let end = target.end_line;
+            let shown_lines = if target.kind == crate::types::OutlineKind::Function {
+                construct_line_cap(&content, span_start, end, budget)
+            } else {
+                MIN_CORE_LINES.min(end - span_start + 1)
+            };
+            let body = content
+                .lines()
+                .skip(span_start.saturating_sub(1) as usize)
+                .take(shown_lines as usize)
+                .collect::<Vec<_>>()
+                .join("\n");
+            (
+                target.path,
+                Some(target.start_line),
+                Some(target.name),
+                body,
+                end - span_start + 1 > shown_lines,
+                (span_start, span_start + shown_lines.saturating_sub(1)),
+                content.to_string(),
+                end,
+            )
         };
-        let span_start = target.span_start_line;
-        let end = target.end_line;
-        let body = content
-            .lines()
-            .skip(span_start.saturating_sub(1) as usize)
-            .take((end - span_start + 1).min(60) as usize)
-            .collect::<Vec<_>>()
-            .join("\n");
-        (
-            target.path,
-            Some(target.start_line),
-            Some(target.name),
-            body,
-            end - span_start + 1 > 60,
-            (span_start, span_start + (end - span_start).min(59)),
-            content.to_string(),
-        )
-    };
     let target = Target {
         path: display_rel(&source_path, cwd),
         line,
@@ -1203,9 +1530,38 @@ fn unique_hit(
     }
     if core_partial {
         mark_partial(&mut result);
+        result["core_end"] = json!(construct_end);
+        result["continue"] = json!(format!("{}#{}-{}", target.path, shown.1 + 1, construct_end));
     }
     let hints = target.hints();
     Ok((result, hints))
+}
+
+/// Lines of a function or method printed even when the budget is tiny; every
+/// other kind (class, struct, module, interface, ...) is cut here with a
+/// continuation, so a container query never returns a whole file.
+const MIN_CORE_LINES: u32 = 60;
+
+/// Lines of a `span_start..=end` function to print: all of them when it fits
+/// half the response budget, else the longest prefix that fits. Never fewer
+/// than `MIN_CORE_LINES`, so a tiny budget keeps the old preview.
+fn construct_line_cap(content: &str, span_start: u32, end: u32, budget: u64) -> u32 {
+    let allowed_bytes = budget.saturating_mul(2);
+    let total = end - span_start + 1;
+    let mut used: u64 = 0;
+    let mut fitting: u32 = 0;
+    for line in content
+        .lines()
+        .skip(span_start.saturating_sub(1) as usize)
+        .take(total as usize)
+    {
+        used += line.len() as u64 + 1;
+        if used > allowed_bytes {
+            break;
+        }
+        fitting += 1;
+    }
+    fitting.max(MIN_CORE_LINES).min(total)
 }
 
 fn is_identifier(query: &str) -> bool {
@@ -1409,8 +1765,17 @@ mod tests {
         std::fs::write(tmp.path().join("a.rs"), "fn root() {}\n").unwrap();
         std::fs::write(tmp.path().join("unreadable.rs"), [0xff, 0xfe]).unwrap();
         let (cache, session, _bloom) = components();
-        let (result, route, hints) =
-            route_identifier("root", None, tmp.path(), &cache, &session, 24_000).unwrap();
+        let (result, route, hints) = route_identifier(
+            "root",
+            None,
+            None,
+            None,
+            tmp.path(),
+            &cache,
+            &session,
+            24_000,
+        )
+        .unwrap();
         assert_eq!(route, "symbol");
         assert_eq!(result["status"], "partial");
         assert_eq!(result["completeness"], "partial");
@@ -1435,6 +1800,7 @@ mod tests {
             None,
             &OutlineCache::new(),
             &Session::new(),
+            crate::budget::DEFAULT_BUDGET,
         )
         .expect("fresh symbol resolution must replace the stale candidate line");
 
@@ -1462,8 +1828,10 @@ mod tests {
     }
 
     #[test]
-    fn capped_ambiguous_candidates_and_preview_report_partial() {
-        for (definitions, references) in [(20, 0), (2, 30)] {
+    fn capped_ambiguous_candidates_report_partial() {
+        // Only the candidate cap makes an ambiguous result partial; references
+        // elsewhere are not part of the answer.
+        for (definitions, references, partial) in [(200, 0, true), (2, 400, false)] {
             let tmp = tempfile::tempdir().unwrap();
             for index in 0..definitions {
                 std::fs::write(
@@ -1482,10 +1850,17 @@ mod tests {
                     .unwrap();
             assert_eq!(result["results"][0]["resolved_as"], "ambiguous");
             assert_eq!(result["results"][0]["status"], "ambiguous");
-            assert_eq!(result["results"][0]["completeness"], "partial");
             assert_eq!(
-                result["results"][0]["candidates"].as_array().unwrap().len(),
-                definitions.min(10)
+                result["results"][0]["completeness"],
+                if partial { "partial" } else { "complete" }
+            );
+            assert!(result["results"][0].get("preview").is_none());
+            let shown = result["results"][0]["candidates"].as_array().unwrap().len();
+            assert_eq!(
+                shown,
+                definitions.min(crate::search::content::match_cap_for_budget(
+                    crate::budget::DEFAULT_BUDGET
+                ))
             );
             let record: Value = serde_json::from_str(
                 std::fs::read_to_string(telemetry_dir.path().join("current.jsonl"))
@@ -1493,7 +1868,7 @@ mod tests {
                     .trim(),
             )
             .unwrap();
-            assert_eq!(record["partial"], true);
+            assert_eq!(record["partial"], partial);
         }
     }
 
@@ -1886,7 +2261,7 @@ mod tests {
         let outcome = h.write(
             dir.path(),
             json!({"path": "n.txt", "tag": tag, "ops": [
-                {"op": "replace_text", "old": "delta", "new": "omega"}]}),
+                {"op": "replace", "start": 74, "end": 74, "content": "omega"}]}),
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         let message = outcome.unwrap_or_else(|e| e);
@@ -2000,7 +2375,7 @@ mod tests {
     fn budget_trimmed_preview_marks_no_lines_seen() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("n.txt");
-        let source = (1..=40)
+        let source = (1..=10)
             .map(|i| format!("needle line {i}"))
             .collect::<Vec<_>>()
             .join("\n")
@@ -2016,7 +2391,7 @@ mod tests {
         let outcome = h.write(
             dir.path(),
             json!({"path": "n.txt", "tag": tag, "ops": [
-                {"op": "replace_text", "old": "needle line 1\n", "new": "edited\n"}]}),
+                {"op": "replace", "start": 1, "end": 1, "content": "edited"}]}),
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         let message = outcome.unwrap_or_else(|e| e);
@@ -2030,7 +2405,7 @@ mod tests {
         h.write(
             dir.path(),
             json!({"path": "n.txt", "tag": tag, "ops": [
-                {"op": "replace_text", "old": "needle line 1\n", "new": "edited\n"}]}),
+                {"op": "replace", "start": 1, "end": 1, "content": "edited"}]}),
         )
         .expect("untrimmed preview lines stay editable");
     }
@@ -2053,7 +2428,7 @@ mod tests {
         let outcome = h.write(
             dir.path(),
             json!({"path": "a.rs", "tag": tag, "ops": [
-                {"op": "replace_text", "old": "let v1 = 1;", "new": "let v1 = 9;"}]}),
+                {"op": "replace", "start": 3, "end": 3, "content": "    let v1 = 9;"}]}),
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         assert!(outcome.is_err() || outcome.unwrap().contains("seen"));
@@ -2188,12 +2563,13 @@ mod tests {
         let h = Harness::new();
         let found = h.search(dir.path(), json!({"query": "marker_call"}));
         let preview = found["results"][0]["preview"].as_str().unwrap();
-        // host() starts at line 2401; its two marker_call lines are 2402-2403.
+        // host() spans 2401-2404 and fits the construct bound, so the hits print it whole.
         let tag = u16::from_str_radix(&header_tag(preview, "big.rs"), 16).unwrap();
-        assert!(preview.contains("marker_call();"), "{preview}");
+        assert!(preview.contains("\n2404:}"), "{preview}");
         let snapshot = h.session.snapshots().by_tag(&path, tag).expect("snapshot");
-        assert_eq!(snapshot.first_unseen_anchor([2402, 2403]), None);
-        assert_eq!(snapshot.first_unseen_anchor([2404]), Some(2404));
+        assert_eq!(snapshot.first_unseen_anchor([2401, 2402, 2403, 2404]), None);
+        assert_eq!(snapshot.first_unseen_anchor([2400]), Some(2400));
+        assert_eq!(snapshot.first_unseen_anchor([2405]), Some(2405));
     }
 
     #[test]
@@ -2206,7 +2582,7 @@ mod tests {
     fn route_non_code_path_reports_bounded_content_results() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("notes.json"), "{}\n").unwrap();
-        for index in 0..11 {
+        for index in 0..120 {
             std::fs::write(
                 tmp.path().join(format!("reference-{index}.txt")),
                 "load notes.json\n",
@@ -2223,7 +2599,12 @@ mod tests {
         assert_eq!(result["resolved_as"], "path");
         assert_eq!(result["status"], "partial");
         assert_eq!(result["completeness"], "partial");
-        assert!(result["total_found"].as_u64().unwrap() > 10);
+        let preview = result["preview"].as_str().unwrap();
+        let shown = (0..120)
+            .filter(|index| preview.contains(&format!("reference-{index}.txt")))
+            .count();
+        assert!(shown > 0, "{preview}");
+        assert!(result["total_found"].as_u64().unwrap() > shown as u64);
     }
 
     #[test]
@@ -2517,7 +2898,7 @@ mod tests {
     }
 
     #[test]
-    fn two_code_definitions_and_content_hits_yield_ambiguous_with_preview() {
+    fn two_code_definitions_yield_ambiguous_candidates_without_a_preview() {
         let tmp = tempfile::tempdir().expect("tempdir");
         std::fs::write(tmp.path().join("a.rs"), "fn tilth_probe_dupe() {}\n").expect("write a.rs");
         std::fs::write(tmp.path().join("b.rs"), "fn tilth_probe_dupe() {}\n").expect("write b.rs");
@@ -2533,8 +2914,120 @@ mod tests {
         assert_eq!(result["resolved_as"], "ambiguous");
         let candidates = result["candidates"].as_array().expect("candidates array");
         assert_eq!(candidates.len(), 2, "candidates: {candidates:?}");
-        let preview = result["preview"].as_str().expect("preview must be present");
-        assert!(!preview.is_empty(), "preview must not be empty");
+        assert_eq!(result["completeness"], "complete");
+        assert!(result.get("preview").is_none(), "{result}");
+    }
+
+    fn trait_fixture() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("matcher.rs"),
+            "pub trait Matcher {\n    fn is_match(&self) -> bool;\n}\n",
+        )
+        .unwrap();
+        for name in ["Regex", "Literal", "Glob"] {
+            std::fs::write(
+                tmp.path().join(format!("{}.rs", name.to_lowercase())),
+                format!(
+                    "pub struct {name};\n\nimpl Matcher for {name} {{\n    \
+                     fn is_match(&self) -> bool {{\n        true\n    }}\n}}\n"
+                ),
+            )
+            .unwrap();
+        }
+        tmp
+    }
+
+    #[test]
+    fn trait_resolves_uniquely_past_its_impl_blocks() {
+        let tmp = trait_fixture();
+        // `struct Matcher` names no definition, so the keyword falls back to the bare name.
+        for query in ["trait Matcher", "Matcher", "struct Matcher"] {
+            let response =
+                call(&json!({"cwd": tmp.path(), "queries": [{"query": query}]})).unwrap();
+            let result = &response["results"][0];
+            assert_eq!(result["resolved_as"], "symbol", "{query}: {result}");
+            assert_eq!(result["status"], "ok", "{query}: {result}");
+            assert_eq!(result["target"]["path"], "matcher.rs", "{query}");
+            assert!(
+                result["core"]
+                    .as_str()
+                    .unwrap()
+                    .contains("pub trait Matcher"),
+                "{query}: {result}"
+            );
+        }
+    }
+
+    #[test]
+    fn impl_keyword_lists_the_impl_blocks_as_candidates() {
+        let tmp = trait_fixture();
+        let response =
+            call(&json!({"cwd": tmp.path(), "queries": [{"query": "impl Matcher"}]})).unwrap();
+        let result = &response["results"][0];
+        assert_eq!(result["resolved_as"], "ambiguous", "{result}");
+        assert_eq!(result["status"], "ambiguous");
+        assert_eq!(result["completeness"], "complete");
+        assert!(result.get("preview").is_none(), "{result}");
+        let mut paths: Vec<&str> = result["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate["path"].as_str().unwrap())
+            .collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["glob.rs", "literal.rs", "regex.rs"]);
+    }
+
+    #[test]
+    fn inherent_impl_does_not_compete_with_its_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("widget.rs"),
+            "pub struct Widget;\n\nimpl Widget {\n    pub fn new() -> Self {\n        Widget\n    }\n}\n",
+        )
+        .unwrap();
+        for query in ["Widget", "struct Widget", "impl Widget"] {
+            let response =
+                call(&json!({"cwd": tmp.path(), "queries": [{"query": query}]})).unwrap();
+            let result = &response["results"][0];
+            assert_eq!(result["resolved_as"], "symbol", "{query}: {result}");
+            assert_eq!(result["target"]["line"], 1, "{query}: {result}");
+        }
+    }
+
+    #[test]
+    fn kind_keyword_selects_one_of_mixed_definitions() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("options.ts"),
+            "export interface Options {\n  verbose: boolean;\n}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("build.py"),
+            "def Options():\n    return {}\n",
+        )
+        .unwrap();
+        let resolve = |query: &str| {
+            let response =
+                call(&json!({"cwd": tmp.path(), "queries": [{"query": query}]})).unwrap();
+            response["results"][0].clone()
+        };
+        // `fn` also accepts Python's `def`; `class` names no definition and falls back.
+        for (query, path) in [
+            ("interface Options", "options.ts"),
+            ("fn Options", "build.py"),
+        ] {
+            let result = resolve(query);
+            assert_eq!(result["resolved_as"], "symbol", "{query}: {result}");
+            assert_eq!(result["target"]["path"], path, "{query}: {result}");
+        }
+        for query in ["Options", "class Options"] {
+            let result = resolve(query);
+            assert_eq!(result["resolved_as"], "ambiguous", "{query}: {result}");
+            assert_eq!(result["candidates"].as_array().unwrap().len(), 2, "{query}");
+        }
     }
 
     #[test]
@@ -2797,7 +3290,7 @@ mod tests {
     #[test]
     fn budget_never_claims_complete() {
         let tmp = tempfile::tempdir().unwrap();
-        let body = "    let _value = 1;\n".repeat(300);
+        let body = "    let _value = 1;\n".repeat(3000);
         std::fs::write(
             tmp.path().join("root.rs"),
             format!("fn root() {{\n{body}}}\n"),
@@ -2808,10 +3301,67 @@ mod tests {
         assert_eq!(response["results"][0]["status"], "partial");
         let mut small_args = args.clone();
         small_args["budget"] = json!(450);
-        let small = call(&small_args);
-        if let Ok(small) = small {
-            assert!(crate::types::estimate_tokens(small.to_string().len() as u64) <= 450);
-            assert_eq!(small["results"][0]["status"], "partial");
+        let small = call(&small_args).unwrap();
+        assert!(crate::types::estimate_tokens(small.to_string().len() as u64) <= 450);
+        assert_eq!(small["results"][0]["status"], "partial");
+        assert!(small["results"][0].get("core").is_none());
+        assert!(small["results"][0].get("continue").is_none());
+        assert!(small["results"][0].get("core_end").is_none());
+    }
+
+    #[test]
+    fn dropping_core_drops_its_continuation_hints() {
+        let response = json!({"results": [{
+            "query": "root", "resolved_as": "symbol", "status": "partial",
+            "completeness": "partial", "core": "let _value = 1;\n".repeat(400),
+            "core_end": 3002, "continue": "root.rs#61-3002",
+        }], "hints": [], "diagnostics": {}});
+        let (output, limited) = reduce(&response, 100).unwrap();
+        let parsed: Value = serde_json::from_str(&output).unwrap();
+        assert!(limited);
+        let result = &parsed["results"][0];
+        assert!(result.get("core").is_none());
+        assert!(result.get("continue").is_none(), "{result}");
+        assert!(result.get("core_end").is_none(), "{result}");
+    }
+
+    #[test]
+    fn go_signature_tail_rejects_regex_operators() {
+        for query in [
+            "func Get(User|Order)",
+            "func New[A-Z]",
+            "func New[A-Z](x int)",
+            "func Get(a)?",
+            "func Get(a+)",
+            "func Get(^a)",
+            "func Get(a$)",
+            "func Get(a{2})",
+        ] {
+            assert!(go_signature(query).is_none(), "{query}");
+        }
+        for query in [
+            "func Get(a int) int",
+            "func Map[T any, U any](a T) U",
+            "func (m *M) Name(d *D) error {",
+            "func Do(a interface{}) {",
+            "func Name",
+        ] {
+            assert!(go_signature(query).is_some(), "{query}");
+        }
+    }
+
+    #[test]
+    fn go_regex_lookalike_queries_stay_regex() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("a.go"),
+            "package a\n\nfunc NewA() {}\nfunc GetUser() {}\n",
+        )
+        .unwrap();
+        for query in ["func New[A-Z]", "func Get(User|Order)"] {
+            let response =
+                call(&json!({"cwd": tmp.path(), "queries": [{"query": query}]})).unwrap();
+            assert_eq!(response["results"][0]["resolved_as"], "regex", "{query}");
         }
     }
 
@@ -2933,6 +3483,12 @@ mod tests {
                 json!({"cwd": root, "queries": [{"query": "invalid_utf8.rs"}]}),
                 "UTF-8",
                 "route_error",
+            ),
+            (
+                "invalid pattern",
+                json!({"cwd": root, "queries": [{"pattern": "fn broken( {", "language": "rust"}]}),
+                "invalid structural pattern",
+                "bad_structural",
             ),
         ];
 
@@ -3100,6 +3656,34 @@ mod tests {
         assert!(result["error"].as_str().unwrap().contains("invalid glob"));
         assert!(counts.is_none());
         assert!(failure.is_some());
+    }
+
+    #[test]
+    fn invalid_structural_pattern_fails_only_its_entry() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("lib.rs"),
+            "pub fn alive() {}\n\nfn caller() {\n    alive();\n}\n",
+        )
+        .unwrap();
+        let response = call(&json!({"cwd": tmp.path(), "queries": [
+            {"query": "alive"},
+            {"pattern": "fn broken( {", "language": "rust"},
+            {"pattern": "alive()", "language": "rust"},
+        ]}))
+        .expect("one bad pattern must not abort the batch");
+        let results = response["results"].as_array().unwrap();
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["resolved_as"], "symbol", "{}", results[0]);
+        assert_eq!(results[0]["status"], "ok");
+        assert_eq!(results[1]["status"], "error");
+        assert_eq!(results[1]["query"], "fn broken( {");
+        assert!(results[1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("invalid structural pattern"));
+        assert_eq!(results[2]["resolved_as"], "structural", "{}", results[2]);
+        assert_eq!(results[2]["total_matches"], 1);
     }
 
     #[test]

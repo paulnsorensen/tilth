@@ -2,6 +2,7 @@
 
 tilth — code intelligence MCP server. Replaces grep, cat, and host edit tools.
 DO NOT use shell for repo content reads (cat/head/tail/sed/grep/rg) and DO NOT use host Edit/Write; use tilth tools. Shell is for directory browsing (ls/find), Git review/history, tests, builds, and non-file operations.
+Shell BLOCKS cat/head/tail/sed/awk/wc/grep/rg/git grep on repo files, `>` redirects to files, heredocs, and inline interpreters (`python -c`, `node -e`). Instead: tilth_read/tilth_search for content; tilth_write to create a script or fixture, then run that file with Bash. Use a unique scratch dir (`mktemp -d`), never a fixed /tmp name.
 
 DO NOT omit `cwd`: set it to the absolute checkout directory on every call. Relative paths anchor there (`..` refused); absolute paths pass through. The server cannot see your shell cwd.
 
@@ -9,7 +10,10 @@ BATCH related work; array parameters never accept singular values:
 
 - `queries: [{query: "foo"}, {query: "bar", glob: "*.rs"}]` or `[{follow: hint}]`
 - `paths: ["src/a.rs#12-40", "src/b.rs#parse"]`
-- `edits: [{path: "src/a.rs", tag: "1A2B", ops: [...]}, {path: "src/b.rs", tag: "3C4D", ops: [...]}]`
+
+Multi-file edit pattern (2 calls, no re-read; the receipt returns new tags):
+`tilth_search(queries:[{query:"foo"},{query:"bar"},{query:"baz"}], cwd)`
+`tilth_write(edits:[{path:"a.rs",tag:"1A2B",ops:[...]},{path:"b.rs",tag:"3C4D",ops:[...]},{path:"c.rs",tag:"5E6F",ops:[...]}], cwd)`
 
 DO NOT use `mode: full` to edit; read the section you change. Read structural ranges before `rewrite`.
 

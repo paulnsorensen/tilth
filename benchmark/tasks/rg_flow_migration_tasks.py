@@ -189,6 +189,11 @@ class RgFlowMigrationTask(Task):
         return "edit"
 
     @property
+    def timeout_s(self) -> int:
+        # The slowest stored cell took 307 s alone and 400 s as a chain turn; 900 s keeps 2x for a loaded host.
+        return 900
+
+    @property
     def ground_truth(self) -> GroundTruth:
         return GroundTruth()
 

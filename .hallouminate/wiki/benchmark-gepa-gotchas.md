@@ -38,6 +38,22 @@ These items come from the external-tasks spec (`9e84659:.cheese/specs/bench-exte
 - Tests that grade fixture projects still point `CARGO_HOME` and `GOMODCACHE` at empty directories (`empty_dependency_caches`, `benchmark/tests/external_support.py:67`), because the Rust index copy still costs time. Do not make it autouse: `test_evolve` runs a real `cargo check --locked` on tilth, which needs the real registry.
 - `check_correctness` turns SIGTERM into `SystemExit(143)` (`unwind_on_sigterm`, `benchmark/external/proc.py`), so a terminated grade removes its `tilth-external-grade-*` scratch and kills its test process group. SIGKILL still leaks the scratch. A slow `rmtree` of a multi-GB copied cache was a likely kill window: one leaked dir kept only `checkout-caches/gomodcache`.
 
+## gepa-v3 evolve rounds
+
+The gepa-v3 rounds (October 2026, runs gepa-v3-r1 to r6) hit these failures; each names its fix or workaround. The campaign state is on [gepa-v3 evolve campaign state](benchmark-gepa-v3-evolve.md).
+
+- A Claude Code auto-update (2.1.310 to 2.1.311) changed `cli_version` in every run key, so every stored cell drifted. The run re-bought baselines and its finish reserve doubled to $78. Fix: the CLI pin in `benchmark/claude-cli.version` (#411).
+- Hint text in `src/hook/hints.rs` is part of the hook source key, so a prompt-only hook-hint edit (#403) drifted every strict baseline cell (about $28 to re-buy).
+- A chain's digest once hashed all of `chains.py`, so editing one chain drifted every chain's baselines (#400 fixed it).
+- Changing a panel's split after rows exist trips the split lock; register the changed split under a new panel name (gepa-v3-long-2, #401).
+- `setsid nohup wrapper.sh &` returns the wrapper's pid, not the evolve python's. `pgrep -f '<pattern>'` also matches the shell that runs the check. Find the evolve process by `/proc/<pid>/exe`, or watch the run's `log.txt`.
+- The candidates share one cargo target dir. A newer dep-info file from another worktree let cargo reuse the seed's binary and run the wrong tests. The integrity stage and `default_just_check` now touch `*.rs` sources before each cargo call (#412).
+- A new seed commit changes `git_sha` in every tilth cell's key, so the finish reserve is about $40 even when baselines are reused. Size `--max-usd` above reserve plus seed rescore plus candidates.
+- The evolve `src_patch` proposer has no Bash, so it cannot see clippy or rustfmt output; a one-lint failure used up a directive until repair (#408) and auto-format (#410).
+- bat's pty integration test hangs the agent's full `cargo test`; abandoned `grep | head` pipes then leak until killed.
+- A fastapi local task had no agent venv, so the agent fought missing pytest and argon2 until the 600 s timeout, and one incomplete seed cell stopped the run (#407).
+- Text rules cannot guard test integrity. Reviews broke them with a macro on the attribute line, `fn r#name`, `#[cfg(any())]` above the test module, and fn-body and macro wrapping. Use the behavioral integrity stage (#412).
+
 ## Symptoms and first checks
 
 Use this list to route a failure to the right section above.
@@ -51,5 +67,8 @@ Use this list to route a failure to the right section above.
 - A FeatureBench task fails to apply `test_patch`. Check whether the mask `patch` edits a FAIL_TO_PASS file.
 - A GPU task passes admission on a CPU host. Do not trust `cuda_visible_devices`; use the curated CPU list.
 - Rows from older stores never match. Expect one `--refreeze-baselines`.
+- Every stored cell drifts at once. Check `cli_version` against `benchmark/claude-cli.version` first, then the hook source key.
+- An evolve run stops at its ceiling with no candidate scored. Check whether the finish reserve plus the seed rescore exceeds `--max-usd`.
+- A wait loop reports the evolve run exited while it still runs. Check the python pid, not the wrapper pid or a `pgrep -f` self-match.
 
-_Source: PR #312 session archive (closed unmerged; work lands as #313-#319); gepa and data gotchas from specs at `9e84659` (`refs/pull/312/head`); code verified at the layer 6 head of PR #319 after the PR #318 cure · Updated: 2026-10-14_
+_Source: PR #312 session archive (closed unmerged; work lands as #313-#319); gepa and data gotchas from specs at `9e84659` (`refs/pull/312/head`); code verified at the layer 6 head of PR #319 after the PR #318 cure; gepa-v3 section from runs gepa-v3-r1 to r6 and PRs #396-#412 · Updated: 2026-10-29_

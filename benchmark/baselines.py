@@ -184,8 +184,14 @@ def run_key(cell: Mapping[str, Any]) -> str:
 
 
 def is_completed(row: Mapping[str, Any]) -> bool:
-    """A completed row has no error, no infra failure, and no timeout."""
-    return not row.get("error") and row.get("infra") is None and not row.get("timed_out")
+    """A completed row has no infra failure, no timeout, and no error unless the agent hit its own budget cap.
+
+    A ``budget_capped`` row (Claude stopped on ``error_max_budget_usd`` at the run key's cap) is a completed,
+    incorrect attempt: re-running it under the same key buys the same outcome.
+    """
+    if row.get("infra") is not None or row.get("timed_out"):
+        return False
+    return not row.get("error") or row.get("budget_capped") is True
 
 
 def load_rows(path: Path) -> list[dict]:

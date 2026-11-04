@@ -64,8 +64,8 @@ def test_live_code_beside_cfg_test_items_is_editable(tilth, tmp_path: Path) -> N
 
     sha = materializer.materialize({**base, "src_patch": live})
     assert "trim_end().to_owned()" in git("show", f"{sha}:src/mcp/mod.rs", cwd=repo)
-    with pytest.raises(Exception, match=r"cfg\(test\)"):
-        materializer.materialize({**base, "src_patch": guarded})
+    # A non-test line inside plain #[cfg(test)] code passes here; the integrity stage restores the seed's version.
+    assert materializer.materialize({**base, "src_patch": guarded})
 
 
 def test_byte_lock_literal_edits_are_rewritten_not_refused(tilth, tmp_path: Path) -> None:

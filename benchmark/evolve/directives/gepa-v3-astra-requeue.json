@@ -1,0 +1,14 @@
+[
+  {
+    "id": "search-sparse-hit-context",
+    "component": "src_patch",
+    "brief": "format_raw_result_deferred in src/search/mod.rs passes expand 0 to format_search_result_seen, so a content hit that is one line inside a long function shows only that line, and the agent then issues one or two tilth_read calls for the surrounding code. When a content search has few hits (a sparse result), include bounded enclosing context for each hit: the enclosing definition when it fits in about 40 lines, else a window of lines around the hit with its start and end line numbers. Cap the total extra output by the requested budget, add nothing for dense result sets, and keep every shown line editable with the file tag.",
+    "hypothesis": {"metric": "calls_per_cell", "scope": "tilth_read", "direction": "decrease", "tolerance": 0.1, "invariants": ["accuracy does not drop"]}
+  },
+  {
+    "id": "read-impl-block-selector",
+    "component": "src_patch",
+    "brief": "In src/mcp/path_suffix.rs, declaration_name leaves `impl` out of its keyword list on purpose, so a tilth_read path such as `src/lib.rs#impl Foo` or `src/lib.rs#impl Trait for Foo` is parsed as no symbol and the call fails with a not-found error; the agent then retries with another form. Make `path#impl X` resolve to the impl block of X, and `path#impl Trait for X` to the block of that trait impl for X (including generic parameters such as `impl<T> Trait for X<T>`), using the existing outline and symbol lookup. When several blocks match, read the first and list the others. Keep the behavior of every other declaration prefix.",
+    "hypothesis": {"metric": "error_rate", "scope": "tilth_read", "direction": "decrease", "tolerance": 0.1, "invariants": ["accuracy does not drop"]}
+  }
+]

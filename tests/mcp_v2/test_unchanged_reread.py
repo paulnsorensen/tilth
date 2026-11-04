@@ -109,11 +109,19 @@ class UnchangedReread(unittest.TestCase):
         big.write_text("".join(f"let value_{i} = {i};\n" for i in range(2500)))
         first, second = self.reads(
             {"paths": ["big.rs"], "mode": "full", "budget": 100000},
-            {"paths": ["big.rs#10-20"]})
-        self.assertGreater(len(first), 40000)
-        self.assertNotIn("truncated", first[:200])
-        self.assertIn("value_10 = 10", second)
+            {"paths": ["big.rs#2400-2410"]})
+        self.assertLessEqual(len(json.dumps(first)) - 2, 40000)
+        self.assertRegex(first, r'Next: tilth_read\(paths: \["big\.rs#\d+"\]\)')
+        self.assertIn("value_2400 = 2400", second)
         self.assertNotIn("unchanged since", second)
+
+    def test_lines_shown_before_the_cut_stay_a_stub(self):
+        big = Path(self.cwd) / "big.rs"
+        big.write_text("".join(f"let value_{i} = {i};\n" for i in range(2500)))
+        _, second = self.reads(
+            {"paths": ["big.rs"], "mode": "full", "budget": 100000},
+            {"paths": ["big.rs#10-20"]})
+        self.assertIn("unchanged since", second)
 
 
 class ClippedSearchThenRead(unittest.TestCase):

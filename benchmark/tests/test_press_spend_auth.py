@@ -16,7 +16,7 @@ from auth import AuthTarget, ClaudeAuthError, InitGate, check_captured, prefligh
 from spend import SpendLedger, settle_failed
 
 GOOD_ENV = {"CLAUDE_CODE_OAUTH_TOKEN": "oauth-fixture"}
-OK = '{"authMethod": "oauth_token"}'
+OK = '{"authMethod": "oauth_token", "apiProvider": "firstParty"}'
 
 
 def _spawn(argv, **kwargs):

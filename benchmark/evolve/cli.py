@@ -2,7 +2,8 @@
 """Evolve tilth: a GEPA search over instruction texts and ``src/**`` patches, scored by cost per correct.
 
     python3 benchmark/evolve/cli.py --panel benchmark/panels/gepa-v1.json --seed-sha SHA \\
-        --max-usd 200 --max-metric-calls 60 [--base-branch main] [--model haiku] [--replay-diagnostic N]
+        --max-usd 200 --max-metric-calls 60 [--base-branch main] [--model haiku] [--replay-diagnostic N] \\
+        [--preamble]
 
 Every candidate is a local commit on the seed; the winner, when it is not the
 seed, is pushed as one branch and opened as one draft PR. Nothing is merged.
@@ -29,10 +30,12 @@ import baselines  # noqa: E402
 import panels  # noqa: E402
 import run  # noqa: E402
 from config import REPO_ROOT  # noqa: E402
+from evolve import deepdiag, diagnosis, directives  # noqa: E402
 from evolve.candidate import SeedError, read_seed  # noqa: E402
 from evolve.finish import GitHubPRClient, PRClient  # noqa: E402
 from evolve.gitops import GitError, git  # noqa: E402
-from evolve.loop import Evolution, EvolveError, Settings  # noqa: E402
+from evolve.integrity import InfrastructureFailure, touch_sources  # noqa: E402
+from evolve.loop import Evolution, EvolveError, Settings, forbidden_terms  # noqa: E402
 from evolve.materialize import PHRASE_PIN_EXEMPT_ENV  # noqa: E402
 from judge import core as judge  # noqa: E402
 from spend import SpendLedger  # noqa: E402
@@ -40,11 +43,11 @@ from spend import SpendLedger  # noqa: E402
 JUST_CHECK_TIMEOUT_S = 1800
 
 
-def default_just_check(worktree: Path) -> tuple[bool, str]:
-    """Run ``just check`` in an allowlisted env, with ``<worktree>/target`` linked to the shared candidate target dir.
+def _run_in_tree(command: list[str], worktree: Path, env: dict[str, str], timeout_s: int, *,
+                 timeout_raises: bool = False) -> tuple[bool, str]:
+    """Run ``command`` in ``worktree`` with ``<worktree>/target`` linked to the shared candidate target dir.
 
-    The env sets ``PHRASE_PIN_EXEMPT_ENV``, so the Rust tests skip their prompt phrase pins and a candidate can
-    reword ``prompts/``. CI does not set it, so the winner PR must re-pin them (``finish.REPIN_NOTE``).
+    A timeout returns ``(False, message)``, or raises ``InfrastructureFailure`` when ``timeout_raises``.
 
     A symlink, not CARGO_TARGET_DIR: tests/mcp_v2 reads ``<repo>/target/debug/tilth``, and the root .gitignore
     ``/target`` matches a symlink.
@@ -55,16 +58,39 @@ def default_just_check(worktree: Path) -> tuple[bool, str]:
         shared.mkdir(parents=True, exist_ok=True)
         target.symlink_to(shared, target_is_directory=True)
     # A new session lets a timeout kill cargo and the test binaries too, not only ``just``.
-    process = subprocess.Popen(["just", "check"], cwd=worktree, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                               text=True, env={**run.build_tool_env(), PHRASE_PIN_EXEMPT_ENV: "1"},
-                               start_new_session=True)
+    process = subprocess.Popen(command, cwd=worktree, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, env=env, start_new_session=True)
     try:
-        stdout, stderr = process.communicate(timeout=JUST_CHECK_TIMEOUT_S)
-    except subprocess.TimeoutExpired:
+        stdout, stderr = process.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired as error:
         os.killpg(process.pid, signal.SIGKILL)
         process.communicate()
-        return False, f"just check timed out after {JUST_CHECK_TIMEOUT_S} s"
+        message = f"{' '.join(command[:2])} timed out after {timeout_s} s"
+        if timeout_raises:
+            raise InfrastructureFailure(message) from error
+        return False, message
     return process.returncode == 0, stdout + stderr
+
+
+def default_just_check(worktree: Path) -> tuple[bool, str]:
+    """Run ``just check`` in an allowlisted env.
+
+    The env sets ``PHRASE_PIN_EXEMPT_ENV``, so the Rust tests skip their prompt phrase pins and a candidate can
+    reword ``prompts/``. CI does not set it, so the winner PR must re-pin them (``finish.REPIN_NOTE``).
+    """
+    touch_sources(worktree)
+    return _run_in_tree(["just", "check"], worktree, {**run.build_tool_env(), PHRASE_PIN_EXEMPT_ENV: "1"},
+                        JUST_CHECK_TIMEOUT_S)
+
+
+def default_cargo(worktree: Path, args: list[str]) -> tuple[bool, str]:
+    """Run ``cargo <args>`` for the integrity stage, in the same env and target dir as ``default_just_check``."""
+    return _run_in_tree(["cargo", *args], worktree, {**run.build_tool_env(), PHRASE_PIN_EXEMPT_ENV: "1"},
+                        JUST_CHECK_TIMEOUT_S, timeout_raises=True)
+
+
+# A hard bound on --cell-retries: a cell that fails this often is not flaky, and each attempt can cost a full cell.
+MAX_CELL_RETRIES = 5
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -81,6 +107,9 @@ def _parser() -> argparse.ArgumentParser:
     claude_models = sorted(name for name in run.MODELS if run.RUNNERS[name] == "claude")
     parser.add_argument("--model", default="haiku", choices=claude_models, help="agent model for every cell")
     parser.add_argument("--reruns", type=int, default=3, help="re-runs R before a candidate is accepted (default 3)")
+    parser.add_argument("--cell-retries", type=int, default=2, metavar="N",
+                        help="re-run a cell that did not complete (crash, infra, timeout) up to N more times per "
+                             "plan; each attempt is charged (default 2; a budget-capped cell is a completed failure)")
     parser.add_argument("--plateau", type=int, default=5,
                         help="stop after P paid-tier candidates leave the best dev mean unimproved (default 5)")
     parser.add_argument("--cell-budget-usd", type=float, default=run.DEFAULT_MAX_BUDGET_USD,
@@ -97,7 +126,40 @@ def _parser() -> argparse.ArgumentParser:
                         help="for a candidate that changes src_patch, replay N seed dev cells against the seed and "
                              "candidate binaries and show the diff to later reflection (no model call; never "
                              "rejects; default 0 = off)")
+    parser.add_argument("--directives", type=Path, metavar="PATH",
+                        help="JSON list of {id, component, brief, hypothesis?}: seeded proposals, tried in order "
+                             "before the selector picks a component itself (default: none)")
+    parser.add_argument("--preamble", action="store_true",
+                        help="run the candidate arm with prompts/preamble.md as its whole system prompt, as `tilth "
+                             "claude` does, and evolve that file as a text component (default: off)")
+    parser.add_argument("--no-repair", dest="repair", action="store_false",
+                        help="do not re-call the proposer once when its src_patch child fails apply or just check "
+                             "(repair is the default)")
+    parser.add_argument("--deep-diagnosis", action="store_true",
+                        help="before each proposal, run Codex once per parent over its dev trajectories and show "
+                             "its ranked causes to the proposer (off by default; Codex spend is not on the ledger)")
+    parser.add_argument("--deep-diagnosis-model", default=deepdiag.DEFAULT_MODEL,
+                        help=f"Codex model (default {deepdiag.DEFAULT_MODEL})")
+    parser.add_argument("--deep-diagnosis-effort", default=deepdiag.DEFAULT_EFFORT,
+                        help=f"Codex reasoning effort (default {deepdiag.DEFAULT_EFFORT})")
+    parser.add_argument("--deep-diagnosis-max", type=int, default=deepdiag.DEFAULT_MAX_RUNS,
+                        help=f"Codex runs per evolve run (default {deepdiag.DEFAULT_MAX_RUNS})")
+    parser.add_argument("--deep-diagnosis-timeout", type=float, default=deepdiag.DEFAULT_TIMEOUT_S,
+                        help=f"seconds before a Codex run is killed (default {deepdiag.DEFAULT_TIMEOUT_S})")
+    parser.add_argument("--allow-cli-drift", action="store_true",
+                        help="run with a Claude CLI that is not the version in benchmark/claude-cli.version; "
+                             "every stored cell's run key then drifts and is bought again")
     parser.add_argument("--budget-id", help="share one persistent spend file across runs under this name")
+    parser.add_argument("--finish-reserve-usd", type=float, metavar="USD",
+                        help="hold this finish reserve instead of the computed one; refused below the winner's "
+                             "test-split cost, which finish buys in any case (default: computed from the test "
+                             "cells that no stored row answers)")
+    parser.add_argument("--max-unselected", type=int, default=diagnosis.MAX_UNSELECTED, metavar="N",
+                        help="no component waits more than N proposals in a row; at least the component count "
+                             f"minus 1 (default {diagnosis.MAX_UNSELECTED})")
+    parser.add_argument("--src-patch-by", type=int, default=diagnosis.SRC_PATCH_BY_PROPOSAL, metavar="N",
+                        help="the selector picks src_patch within the first N proposals "
+                             f"(default {diagnosis.SRC_PATCH_BY_PROPOSAL})")
     parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d-%H%M%S"))
     parser.add_argument("--repo", type=Path, default=REPO_ROOT, help=argparse.SUPPRESS)
     return parser
@@ -122,7 +184,9 @@ def _base_ref(repo: Path, branch: str) -> str:
 def build(argv: list[str] | None = None, *,
           judge_factory: Callable[[SpendLedger, float], judge.Judge] | None = None,
           pr_client: PRClient | None = None, just_check: Callable[[Path], tuple[bool, str]] | None = None,
-          spawn: Callable | None = None, auth_spawn: Callable | None = None) -> Evolution | int:
+          spawn: Callable | None = None, auth_spawn: Callable | None = None,
+          deep_runner: deepdiag.Runner | None = None,
+          cargo: Callable[[Path, list[str]], tuple[bool, str]] | None = None) -> Evolution | int:
     """Validate the flags and build the run, or return an exit code; no model call happens here."""
     args = _parser().parse_args(argv)
     if args.max_usd is None:
@@ -133,17 +197,25 @@ def build(argv: list[str] | None = None, *,
                         ("--cell-estimate-usd", args.cell_estimate_usd)):
         if not math.isfinite(value) or value <= 0:
             return _error(f"{flag} must be a positive finite number")
-    if args.max_metric_calls < 1 or args.reruns < 0 or args.plateau < 1 or args.replay_diagnostic < 0:
+    if (args.max_metric_calls < 1 or args.reruns < 0 or args.plateau < 1 or args.replay_diagnostic < 0
+            or not 0 <= args.cell_retries <= MAX_CELL_RETRIES):
         return _error("--max-metric-calls and --plateau must be at least 1, --reruns and --replay-diagnostic "
-                      "at least 0")
+                      f"at least 0, --cell-retries from 0 to {MAX_CELL_RETRIES}")
     try:
         auth.refuse_env(os.environ)
     except auth.ClaudeAuthError as error:
         return _error(str(error))
+    try:
+        print(run.require_pinned_cli(allow_drift=args.allow_cli_drift))
+    except run.CliPinError as error:
+        return _error(str(error))
+    if args.deep_diagnosis_max < 0 or not math.isfinite(args.deep_diagnosis_timeout) \
+            or args.deep_diagnosis_timeout <= 0:
+        return _error("--deep-diagnosis-max must be at least 0 and --deep-diagnosis-timeout positive")
     repo = args.repo.resolve()
     try:
         seed_sha = git("rev-parse", "--verify", f"{args.seed_sha}^{{commit}}", cwd=repo).strip()
-        seed = read_seed(repo, seed_sha)
+        seed = read_seed(repo, seed_sha, preamble=args.preamble)
     except (GitError, SeedError) as error:
         return _error(str(error))
     base_ref = _base_ref(repo, args.base_branch)
@@ -156,6 +228,20 @@ def build(argv: list[str] | None = None, *,
         panel.register(run.TASKS)
     except panels.PanelError as error:
         return _error(str(error))
+    if args.finish_reserve_usd is not None and (not math.isfinite(args.finish_reserve_usd)
+                                                or args.finish_reserve_usd < 0):
+        return _error("--finish-reserve-usd must be a finite number of at least 0")
+    if args.max_unselected < len(seed) - 1:
+        return _error(f"--max-unselected must be at least {len(seed) - 1}, one less than the {len(seed)} "
+                      "components, or a component can wait past its bound")
+    if not 1 <= args.src_patch_by <= args.max_unselected + 1:
+        return _error("--src-patch-by must be between 1 and --max-unselected + 1")
+    queue: list[directives.Directive] = []
+    if args.directives is not None:
+        try:
+            queue = directives.load(args.directives, seed, forbidden_terms(args.panel))
+        except directives.DirectiveError as error:
+            return _error(str(error))
     cells = [(task, "baseline", args.model) for task in [*panel.cheap, *panel.dev, *panel.test]]
     try:
         auth.preflight_claude_auth([run.isolated_call_target(), *run.claude_auth_targets(cells, bare=True)],
@@ -165,22 +251,37 @@ def build(argv: list[str] | None = None, *,
     except (auth.ClaudeAuthError, ValueError) as error:
         return _error(str(error))
     factory = judge_factory or (lambda shared, floor: judge.Judge(shared, cell_estimate_usd=floor))
+    # A custom just_check no longer turns the integrity stage off by itself: pass `cargo` to run it.
+    cargo = cargo or (default_cargo if just_check is None else None)
     settings = Settings(
         run_id=args.run_id, repo=repo, seed_sha=seed_sha, base_branch=args.base_branch, model=args.model,
         reruns=args.reruns, plateau=args.plateau, max_usd=args.max_usd, max_metric_calls=args.max_metric_calls,
         cell_estimate_usd=args.cell_estimate_usd, cell_budget_usd=args.cell_budget_usd,
         refreeze_baselines=args.refreeze_baselines, panel_path=args.panel,
         strict_file_tools=args.strict_file_tools, replay_diagnostic=args.replay_diagnostic,
+        directives=tuple(queue), repair=args.repair, preamble=args.preamble, cell_retries=args.cell_retries,
+        deep_diagnosis=args.deep_diagnosis,
+        deep_diagnosis_model=args.deep_diagnosis_model, deep_diagnosis_effort=args.deep_diagnosis_effort,
+        deep_diagnosis_max=args.deep_diagnosis_max, deep_diagnosis_timeout=args.deep_diagnosis_timeout,
+        finish_reserve_usd=args.finish_reserve_usd, max_unselected=args.max_unselected,
+        src_patch_by=args.src_patch_by,
     )
     return Evolution(settings, panel=panel, ledger=ledger, judge_=factory(ledger, args.cell_estimate_usd), seed=seed,
                      pr_client=pr_client or GitHubPRClient(repo), just_check=just_check or default_just_check,
-                     spawn=spawn or subprocess.run)
+                     spawn=spawn or subprocess.run, deep_runner=deep_runner,
+                     cargo=cargo)
+
+
+INTEGRITY_OFF = ("WARNING: the integrity stage is OFF: a custom just_check was injected without a cargo runner, so the "
+                 "seed's tests are not re-run against candidate code.")
 
 
 def main(argv: list[str] | None = None, **deps) -> int:
     evolution = build(argv, **deps)
     if isinstance(evolution, int):
         return evolution
+    if evolution.integrity is None:
+        print(INTEGRITY_OFF, file=sys.stderr)
     try:
         return evolution.run()
     except (EvolveError, auth.ClaudeAuthError) as error:

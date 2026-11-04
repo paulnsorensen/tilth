@@ -84,7 +84,10 @@ class ModeConfig:
     plugin_version: Optional[str] = None
     plugin_git_sha: Optional[str] = None
     plugin_sha256: Optional[str] = None
-    prompt_mode: Literal["replace", "append"] = "replace"
+    # "preamble" replaces the system prompt with the launcher preamble (``tilth claude``, ``tilth codex``).
+    # Only the harness sets it (``--preamble``), with ``preamble`` read from the tree under test.
+    prompt_mode: Literal["replace", "append", "preamble"] = "replace"
+    preamble: Optional[str] = None
 
 
 REPO_ROOT = Path(__file__).parent.parent

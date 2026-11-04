@@ -9,6 +9,7 @@ only confirms one pre-chosen candidate against the seed and never selects among 
 
 import json
 import math
+import re
 import subprocess
 import sys
 import tempfile
@@ -30,10 +31,12 @@ from judge import store as judge_store
 from spend import SpendLedger
 
 from . import attribution as cost_attribution
-from . import diagnosis, engine, hookgate, replay
+from . import deepdiag, diagnosis, directives, engine, hookgate, replay, rust
 from .calls import PaidCalls, StopState
+from .directives import Directive
 from .candidate import SRC_PATCH, content_id
-from .finish import REPIN_NOTE, PRClient, outside_allowlist
+from .integrity import INFRASTRUCTURE_HEADLINE, InfrastructureFailure, Integrity
+from .finish import REPIN_NOTE, PRClient, outside_allowlist, changed_tests_section
 from .gitops import GitError, git
 from .materialize import ApplyRejected, Materializer
 from .proposer import Proposer
@@ -42,6 +45,9 @@ from .proposer import Proposer
 CANDIDATE_MODE = "tilth_forced"
 BASELINE_MODE = "baseline"
 TAIL_LINES = 40
+TAIL_SUMMARY_LINES = 10  # the last lines a long failure keeps whole
+ERROR_BLOCK_LINES = 14  # one error block: its message, ``-->`` location, source lines and help
+ERROR_START = re.compile(r"^(error(\[\w+\])?:|---- .* ----$|Diff in |thread '.*' panicked|failures:$)")
 NO_SPEND_REASONS = frozenset({"quota", "mcp-unavailable", "invalid-cell", "auth"})
 FINISH_CELL_SETS = 2  # finish scores two candidates on the test split: the dev winner and the seed
 
@@ -76,6 +82,32 @@ class Settings:
     strict_file_tools: bool = True
     # Seed cells that the replay diagnostic re-sends to the seed and candidate binaries; 0 turns it off.
     replay_diagnostic: int = 0
+    # Seeded proposals, tried in order before the selector picks a component itself.
+    # The bare `Directive` name: `directives.Directive` here would resolve against this field on Python < 3.14.
+    directives: tuple[Directive, ...] = ()
+    # A Codex run before each proposal; off by default. Its spend is not on the Anthropic ledger.
+    deep_diagnosis: bool = False
+    deep_diagnosis_model: str = deepdiag.DEFAULT_MODEL
+    deep_diagnosis_effort: str = deepdiag.DEFAULT_EFFORT
+    deep_diagnosis_max: int = deepdiag.DEFAULT_MAX_RUNS
+    deep_diagnosis_timeout: float = deepdiag.DEFAULT_TIMEOUT_S
+    # One repair call for a src_patch proposal whose child fails apply or `just check`.
+    repair: bool = True
+    # The candidate arm runs with prompts/preamble.md as its system prompt, and the preamble is a text component.
+    preamble: bool = False
+    # The finish reserve in USD; None computes it from the test cells finish buys (`Evolution.finish_reserve`).
+    finish_reserve_usd: float | None = None
+    # Selector bounds: no component waits more than `max_unselected` proposals; src_patch comes by `src_patch_by`.
+    max_unselected: int = diagnosis.MAX_UNSELECTED
+    src_patch_by: int = diagnosis.SRC_PATCH_BY_PROPOSAL
+    # Extra attempts for a cell that did not complete (crash, infra, timeout) in one plan; each one is charged.
+    cell_retries: int = 2
+
+
+def forbidden_terms(panel_path: Path) -> list[str]:
+    """The isolation list: what no proposer trajectory, directive brief, or deep-diagnosis record may name."""
+    panel = Path(panel_path)
+    return ["benchmark/", str(panel), str(panel.resolve()), panel.name, str(external.data.data_dir())]
 
 
 @dataclass(eq=False)
@@ -89,6 +121,10 @@ class Cascade:
     stage: str | None = None
     tail: str = ""
     just_check_ok: bool | None = None
+    # The Rust tests `just check` failed, as cargo prints them; a repair may update exactly these.
+    failing_tests: list[str] = field(default_factory=list)
+    # The cumulative patch changes #[cfg(test)] code (a repair updated pinned tests); finish lists them for review.
+    tests_changed: bool = False
     hook_ok: bool | None = None
     cheap_score: float | None = None
     cheap_scores: dict[str, float] = field(default_factory=dict)
@@ -123,7 +159,7 @@ class Cascade:
         return self
 
     def side_info(self, task: str) -> dict:
-        if self.stage in {"apply", "just check", "build", "hook gate"}:
+        if self.stage in {"apply", "just check", "integrity", "integrity infra", "build", "hook gate"}:
             return {"stage": self.stage, "tail": self.tail}
         if self.stage == "cheap tier":
             return {"stage": self.stage, "task_scores": dict(self.cheap_scores), "records": self.cheap_records}
@@ -140,7 +176,32 @@ class Cascade:
 
 
 def tail(output: str) -> str:
-    return "\n".join(output.rstrip().splitlines()[-TAIL_LINES:])
+    """``output`` cut to ``TAIL_LINES``: its last lines plus, when it is longer, the error blocks cargo printed earlier.
+
+    A cargo failure ends with ``warning: build failed`` and ``error: recipe failed`` lines; the compiler, clippy,
+    test, or fmt block that explains it comes before them and a plain last-lines cut loses it.
+    """
+    lines = output.rstrip().splitlines()
+    if len(lines) <= TAIL_LINES:
+        return "\n".join(lines)
+    summary_start = len(lines) - TAIL_SUMMARY_LINES
+    blocks: list[tuple[int, int]] = []
+    for index, line in enumerate(lines[:summary_start]):
+        if ERROR_START.match(line) and not (blocks and index < blocks[-1][1]):
+            end = index + 1
+            while end < min(index + ERROR_BLOCK_LINES, summary_start) and lines[end].strip():
+                end += 1
+            blocks.append((index, end))
+    if not blocks:
+        return "\n".join(lines[-TAIL_LINES:])
+    room = TAIL_LINES - TAIL_SUMMARY_LINES - 1  # one line for the marker before the summary
+    kept: list[str] = []
+    for start, end in blocks:
+        if len(kept) + 1 >= room:
+            break
+        kept.append("[...]")
+        kept.extend(lines[start:end][:room - len(kept)])
+    return "\n".join([*kept, "[...]", *lines[summary_start:]])
 
 
 def dominates(left: Mapping[str, float], right: Mapping[str, float], tasks: Iterable[str]) -> bool:
@@ -240,10 +301,37 @@ def _paired_score_deltas(winner_rows: Iterable[Mapping], seed_rows: Iterable[Map
     return deltas
 
 
+def _incomplete_cells(arms: Mapping[str, list[dict]], tasks: Iterable[str],
+                      reps: Iterable[int]) -> dict[str, list[str]]:
+    """Each task with a cell that has no completed row in some arm, mapped to those cells as ``arm/repN``."""
+    reps = list(reps)
+    missing: dict[str, list[str]] = {}
+    for task in tasks:
+        for label, rows in arms.items():
+            done = {row["repetition"] for row in rows if row["task"] == task and baselines.is_completed(row)}
+            missing.setdefault(task, []).extend(f"{label}/rep{rep}" for rep in reps if rep not in done)
+        if not missing[task]:
+            del missing[task]
+    return missing
+
+
+def _means_line(finalists: Iterable[Cascade], test_rows: Mapping[str, list[dict]]) -> str:
+    """Each finalist's test pass rate over ``test_rows``, as ``cid=mean`` pairs."""
+    means = {member.cid: mean(correct(row) for row in test_rows[member.cid]) if test_rows[member.cid] else 0.0
+             for member in finalists}
+    return ", ".join(f"{cid[:12]}={value:.3f}" for cid, value in means.items())
+
+
+def _cell_of(row: Mapping) -> tuple[str, str, int]:
+    """The (task, mode, repetition) cell a row answers; one plan has one model."""
+    return row["task"], row["mode"], row["repetition"]
+
+
 class Evolution:
     def __init__(self, settings: Settings, *, panel: panels.Panel, ledger: SpendLedger, judge_: judge.Judge,
                  seed: dict[str, str], pr_client: PRClient, just_check: Callable[[Path], tuple[bool, str]],
-                 spawn: Callable) -> None:
+                 spawn: Callable, deep_runner: deepdiag.Runner | None = None,
+                 cargo: Callable[[Path, list[str]], tuple[bool, str]] | None = None) -> None:
         self.settings = settings
         self.panel = panel
         self.ledger = ledger
@@ -263,12 +351,34 @@ class Evolution:
         self.reflect = engine.ReflectionClient(self.paid, settings.helper_model, self.hypotheses)
         self.proposer = Proposer(settings.repo, settings.seed_sha, self.paid, settings.helper_model, log=self.log,
                                  forbidden=self._forbidden_terms(), hypotheses=self.hypotheses)
-        self.selector = diagnosis.WeightedSelector(self._dominant_of, self.log)
+        self.directives = directives.DirectiveQueue(settings.directives, self.log)
+        self.selector = diagnosis.WeightedSelector(
+            self._dominant_of, self.log, directives=self.directives,
+            stages=lambda: [cascade.stage for cascade in self.results.values()],
+            max_unselected=settings.max_unselected, src_patch_by=settings.src_patch_by)
+        # The scratch dir lives outside the repo so Codex's -C path never names benchmark/ or the run dir.
+        deep_root = Path(tempfile.gettempdir()) / f"tilth-deepdiag-{settings.run_id}"
+        self.deep = (deepdiag.DeepDiagnosis(deep_root, dev_tasks=panel.dev,
+                                            forbidden=self._forbidden_terms(), log=self.log,
+                                            model=settings.deep_diagnosis_model,
+                                            effort=settings.deep_diagnosis_effort,
+                                            max_runs=settings.deep_diagnosis_max,
+                                            timeout=settings.deep_diagnosis_timeout, runner=deep_runner)
+                     if settings.deep_diagnosis else None)
         self.dispatcher = engine.Dispatcher(self.stop, reflect=self.reflect, propose=self.proposer.propose_src_patch,
-                                            hypotheses=self.hypotheses, extra_records=self._extra_records)
+                                            hypotheses=self.hypotheses, extra_records=self._extra_records,
+                                            directives=self.directives,
+                                            check=self.precheck if settings.repair else None,
+                                            failing_tests=self._failing_tests_of, log=self.log)
         self.seed_replays: dict[tuple[str, int], dict] = {}
         self.materializer = Materializer(settings.repo, settings.seed_sha, settings.run_id, self.run_dir / "worktrees",
-                                         forbidden=self._forbidden_terms())
+                                         forbidden=self._forbidden_terms(), preamble=settings.preamble)
+        # Without a cargo runner the integrity stage is off; the stub gates of the offline tests run no cargo.
+        self.integrity = (Integrity(settings.repo, settings.seed_sha, self.run_dir / "worktrees", cargo)
+                          if cargo is not None else None)
+        self._integrity_memo: dict[tuple[str, frozenset[str]], tuple[bool, str]] = {}
+        self.dispatcher.test_scope = self.materializer.test_scope
+        self.dispatcher.test_keep = self.materializer.test_keep
         self.results: dict[str, Cascade] = {}
         self.frontier: list[Cascade] = []
         self.deltas: list[dict] = []
@@ -296,9 +406,7 @@ class Evolution:
             self.log("infra:quota: a usage limit rejected a call; stored rows stay reusable")
 
     def _forbidden_terms(self) -> list[str]:
-        panel = Path(self.settings.panel_path)
-        data = external.data.data_dir()
-        return ["benchmark/", str(panel), str(panel.resolve()), panel.name, str(data)]
+        return forbidden_terms(self.settings.panel_path)
 
     @contextmanager
     def _spending(self, kind: str) -> Iterator[None]:
@@ -316,13 +424,36 @@ class Evolution:
         return [run.CellSpec(task, mode, self.settings.model, rep) for task in tasks for rep in reps]
 
     def _plan(self, cells: list[run.CellSpec], sha: str | None, *, store_only: bool = False) -> list[dict]:
+        """Run ``cells`` once, then re-run each cell that did not complete up to ``cell_retries`` more times.
+
+        The newest attempt's row replaces the cell's earlier row. A stop during a retry keeps the rows so far.
+        A store-only plan never retries.
+        """
+        rows = self._plan_once(cells, sha, store_only=store_only)
+        retries = 0 if store_only else self.settings.cell_retries
+        for attempt in range(1, retries + 1):
+            failed = {_cell_of(row) for row in rows if not baselines.is_completed(row)}
+            if not failed:
+                break
+            retry = [cell for cell in cells if (cell.task, cell.mode, cell.repetition) in failed]
+            self.log(f"cells: retry {attempt}/{self.settings.cell_retries} of {len(retry)} incomplete cell(s): "
+                     + ", ".join(f"{cell.task}/{cell.mode}/rep{cell.repetition}" for cell in retry))
+            try:
+                again = {_cell_of(row): row for row in self._plan_once(retry, sha)}
+            except _Stopped:
+                break
+            rows = [again.get(_cell_of(row), row) if not baselines.is_completed(row) else row for row in rows]
+        return rows
+
+    def _plan_once(self, cells: list[run.CellSpec], sha: str | None, *, store_only: bool = False) -> list[dict]:
         try:
             with self._spending("cells"):
                 rows = run.run_plan(cells, panel=self.panel, ledger=self.ledger, candidate_sha=sha,
                                     refreeze_baselines=self.settings.refreeze_baselines, output=self.rows_path,
                                     cell_estimate_usd=self.settings.cell_estimate_usd,
                                     max_budget_usd=self.settings.cell_budget_usd, store_only=store_only,
-                                    repo=self.settings.repo, **self._strict_plan_kwargs())
+                                    repo=self.settings.repo, preamble=self.settings.preamble,
+                                    **self._strict_plan_kwargs())
         except run.PlanStopped as stopped:
             self.log(f"cells: stopped ({stopped})")
             self.stop.set(stopped.reason)
@@ -350,7 +481,11 @@ class Evolution:
     # --- preflight ---
 
     def finalist_test_cost(self) -> float:
-        """The estimate for one finalist: its test-split cells plus the test-split baseline cells not yet stored."""
+        """The old estimate for one finalist: its test-split cells plus the test-split baseline cells not yet stored.
+
+        ``FINISH_CELL_SETS`` times this counts the seed's stored cells and the baseline cells twice; the reserve
+        now comes from ``finish_reserve``, and the log shows this figure beside it.
+        """
         history = baselines.load_rows(run.RESULTS_DIR / baselines.STORE_FILENAME)
         stored = baselines.completed_by_key(history)
         model = run.MODELS[self.settings.model]
@@ -364,6 +499,59 @@ class Evolution:
                 cost += run.estimate_cell_cost(history, task=cell.task, mode=BASELINE_MODE, model=model,
                                                run_max_cost=None, fallback=self.settings.cell_estimate_usd)
         return cost
+
+    def _seed_test_keys(self, cells: list[run.CellSpec]) -> list[str] | None:
+        """The run keys finish plans for the seed's candidate-arm ``cells``; None when the seed cannot be keyed.
+
+        ``run.run_plan`` keys a tilth cell on the candidate binary and, in a --preamble run, on the preamble at
+        the candidate commit. This swaps the same mode in, keys the cells, and restores the mode.
+        """
+        try:
+            build = run.build_candidate(self.settings.seed_sha, repo=self.settings.repo)
+            text = run.read_preamble(build.git_sha, repo=self.settings.repo) if self.settings.preamble else None
+        except (RuntimeError, OSError, subprocess.SubprocessError, UnicodeDecodeError) as error:
+            self.log(f"reserve: the seed's test cells count in full; they cannot be keyed: {tail(str(error))}")
+            return None
+        base = run.MODES[CANDIDATE_MODE]
+        mode = run.candidate_mode(base, build)
+        run.MODES[CANDIDATE_MODE] = mode if text is None else run.preamble_mode(mode, text)
+        try:
+            return [run.planned_identity(cell, max_budget_usd=self.settings.cell_budget_usd,
+                                         **self._strict_identity_kwargs())["run_key"] for cell in cells]
+        finally:
+            run.MODES[CANDIDATE_MODE] = base
+
+    def finish_reserve(self) -> dict[str, float]:
+        """The finish reserve, by part: only the test-split cells finish buys that no stored row answers.
+
+        ``winner`` is every candidate-arm test cell of the dev winner, a new candidate with no stored row.
+        ``seed`` is each seed candidate-arm test cell with no completed row under the key finish plans.
+        ``baseline`` is each baseline test cell with no completed row; finish plans them once for both finalists.
+        ``total`` is their sum. ``winner`` is also the floor for ``--finish-reserve-usd``, because finish buys
+        those cells in every case. ``old`` is the estimate before: ``FINISH_CELL_SETS * finalist_test_cost()``.
+        """
+        history = baselines.load_rows(run.RESULTS_DIR / baselines.STORE_FILENAME)
+        stored = baselines.completed_by_key(history)
+        model = run.MODELS[self.settings.model]
+
+        # The fallback is not scaled by chain size: on the preamble-r1 panel a size-scaled fallback held $76 per
+        # finalist against a stored mean of $28.
+        def estimate(cell: run.CellSpec) -> float:
+            return run.estimate_cell_cost(history, task=cell.task, mode=cell.mode, model=model, run_max_cost=None,
+                                          fallback=self.settings.cell_estimate_usd)
+
+        candidate_cells = self._cells(self.panel.test, CANDIDATE_MODE, self._reps())
+        seed_keys = self._seed_test_keys(candidate_cells)
+        baseline_cells = self._cells(self.panel.test, BASELINE_MODE, self._reps())
+        baseline_keys = [run.planned_identity(cell, max_budget_usd=self.settings.cell_budget_usd,
+                                              **self._strict_identity_kwargs())["run_key"] for cell in baseline_cells]
+        parts = {
+            "winner": sum(estimate(cell) for cell in candidate_cells),
+            "seed": sum(estimate(cell) for index, cell in enumerate(candidate_cells)
+                        if seed_keys is None or seed_keys[index] not in stored),
+            "baseline": sum(estimate(cell) for cell, key in zip(baseline_cells, baseline_keys) if key not in stored),
+        }
+        return {**parts, "total": sum(parts.values()), "old": FINISH_CELL_SETS * self.finalist_test_cost()}
 
     def refuse(self, message: str) -> int:
         self.log(f"refused: {message}")
@@ -411,15 +599,21 @@ class Evolution:
                                          **self._strict_identity_kwargs())
             except run.BaselineDrift as error:
                 return self.refuse(f"baselines: {error}")
-        # The estimate counts every unstored baseline test cell, so the reserve over-counts them; that error is kept
-        # because holding too much is safe and holding too little would starve finish.
-        per_finalist = self.finalist_test_cost()
-        reserve = FINISH_CELL_SETS * per_finalist
+        computed = self.finish_reserve()
+        override = self.settings.finish_reserve_usd
+        if override is not None and override < computed["winner"]:
+            return self.refuse(f"--finish-reserve-usd ${override:.2f} is below the safe floor ${computed['winner']:.2f}: "
+                               "finish buys every test-split cell of the winner in any case")
+        reserve = computed["total"] if override is None else override
         if self.settings.max_usd <= reserve:
             return self.refuse(f"--max-usd ${self.settings.max_usd:.2f} must exceed the finish reserve ${reserve:.2f} "
-                               f"({FINISH_CELL_SETS} x one finalist's test-split cost ${per_finalist:.2f}); the search would have no budget")
+                               f"(winner ${computed['winner']:.2f} + unstored seed ${computed['seed']:.2f} + unstored "
+                               f"baseline ${computed['baseline']:.2f}); the search would have no budget")
         self.ledger.reserve = reserve
-        self.log(f"reserve: ${reserve:.4f} held for finish (per finalist ${per_finalist:.4f})")
+        source = (f"winner ${computed['winner']:.4f} + seed ${computed['seed']:.4f} + baseline "
+                  f"${computed['baseline']:.4f}" if override is None
+                  else f"--finish-reserve-usd; computed ${computed['total']:.4f}")
+        self.log(f"reserve: ${reserve:.4f} held for finish ({source}; old estimate ${computed['old']:.4f})")
 
         unlabeled = []
         for name in self.panel.select("all"):
@@ -521,17 +715,8 @@ class Evolution:
         if result.cid != self.seed_id and not self.cascade(self.seed).accepted:
             raise EvolveError("the seed is not on the accepted frontier (its dev run failed or did not complete); "
                               "refusing to buy candidate rollouts")
-        if result.sha is None:
-            try:
-                result.sha = self.materializer.materialize(candidate)
-            except ApplyRejected as rejected:
-                return self._fail(result, "apply", tail(rejected.tail))
-        if result.just_check_ok is None:
-            ok, output = self.just_check(self.materializer.worktree(result.sha))
-            result.just_check_ok = ok
-            self.materializer.release(result.sha)
-            if not ok:
-                return self._fail(result, "just check", tail(output))
+        if (failed := self._static_checks(result)) is not None:
+            return failed
         if self.settings.strict_file_tools and not result.hook_ok:
             if (failed := self._hook_gate(result)) is not None:
                 return failed
@@ -541,6 +726,84 @@ class Evolution:
             return self._fail(result, "hook gate", tail(str(failed)))
         except run.CandidateBuildFailed as failed:
             return self._fail(result, "build", tail(str(failed)))
+
+    def _static_checks(self, result: Cascade) -> Cascade | None:
+        """Materialize and run ``just check``, each once per content id; the failed cascade, or None when both pass."""
+        if result.sha is None:
+            try:
+                result.sha = self.materializer.materialize(result.candidate)
+            except ApplyRejected as rejected:
+                return self._fail(result, "apply", tail(rejected.tail))
+            if changed := self.materializer.test_diffs.get(result.cid):
+                result.tests_changed = True
+                self.log(f"candidate {result.cid[:12]}: changes tests for review: {', '.join(sorted(changed))}")
+        if result.just_check_ok is None:
+            worktree = self.materializer.worktree(result.sha)
+            try:
+                ok, output = self.just_check(worktree)
+                result.just_check_ok = ok
+                if ok:
+                    sound, output = self._integrity(result, worktree)
+            finally:
+                self.materializer.release(result.sha)
+            if not ok:
+                # The full output, before `tail` cuts it, holds cargo's whole `failures:` list.
+                result.failing_tests = rust.failing_tests(output)
+                return self._fail(result, "just check", tail(output))
+            if not sound:
+                if output.startswith(INFRASTRUCTURE_HEADLINE):
+                    # No verdict: fail this evaluation, but keep nothing, so the same patch is checked again.
+                    self.results.pop(result.cid, None)
+                    return self._fail(result, "integrity infra", tail(output))
+                return self._fail(result, "integrity", tail(output))
+        return None
+
+    def _integrity(self, result: Cascade, worktree: Path) -> tuple[bool, str]:
+        """Run the seed's tests against the candidate's production code; see ``integrity.py``.
+
+        It runs once per ``src_patch`` and grant: a child that only changes a text component, or the seed,
+        has nothing new to check.
+        """
+        patch = result.candidate[SRC_PATCH]
+        if self.integrity is None or not patch.strip():
+            return True, ""
+        keep = self.materializer.test_keep.get(patch)
+        granted = self.materializer.test_scope.get(patch, frozenset()) | (keep[1] if keep else frozenset())
+        if (patch, granted) not in self._integrity_memo:
+            try:
+                self._integrity_memo[(patch, granted)] = self.integrity.check(worktree, granted)
+            except InfrastructureFailure as fault:
+                # No verdict, so nothing is memoized: the next candidate with this patch runs the stage again.
+                self.log(f"integrity stage gave no verdict: {fault}")
+                return False, f"{INFRASTRUCTURE_HEADLINE}\n{fault}"
+        return self._integrity_memo[(patch, granted)]
+
+    def _failing_tests_of(self, candidate: Mapping[str, str]) -> list[str]:
+        """The Rust tests that ``candidate`` failed in `just check`; empty when it failed for another reason."""
+        result = self.results.get(content_id(candidate))
+        return list(result.failing_tests) if result is not None and result.stage == "just check" else []
+
+    def precheck(self, candidate: Mapping[str, str]) -> tuple[str, str] | None:
+        """The Dispatcher's repair hook: ``(stage, tail)`` when ``candidate`` fails apply, ``just check``, or
+        integrity, else None.
+
+        It runs the cascade's own memoized stages, so a child that passes is not checked again when GEPA evaluates it.
+        """
+        result = self.new_cascade(candidate)
+        if not result.done and not self.stop.is_set:
+            self._static_checks(result)
+        if result.stage in {"apply", "just check", "integrity"}:
+            return result.stage, self._redact(result.tail or "")
+        return None
+
+    def _redact(self, text: str) -> str:
+        """A failure tail fit for the proposer: worktree prefixes cut to repo-relative paths, forbidden terms masked."""
+        text = re.sub(re.escape(str(self.run_dir / "worktrees")) + r"/[^/\s]+/", "", text)
+        text = text.replace(str(self.settings.repo) + "/", "")
+        for term in sorted(self._forbidden_terms(), key=len, reverse=True):
+            if term:
+                text = text.replace(term, "<redacted>")
+        return text
 
     def _hook_gate(self, result: Cascade) -> Cascade | None:
         """Run the corpus through the candidate's hook before any cell; the failed cascade, or None when it passes."""
@@ -739,14 +1002,32 @@ class Evolution:
         """Run-level records for a reflection or proposer call: past hypothesis outcomes and the candidate's own replay."""
         records = self.hypotheses.feedback()
         own = self.results.get(content_id(candidate))
-        return [*records, {"replay": own.replay}] if own and own.replay else records
+        if own and own.replay:
+            records = [*records, {"replay": own.replay}]
+        return [*records, *self._deep_records(own)]
+
+    def _deep_records(self, own: Cascade | None) -> list[dict]:
+        """The parent's deep-diagnosis record: its dev rows against the baseline's, one Codex run per parent."""
+        if self.deep is None or own is None:
+            return []
+        if not own.rows:
+            self.log(f"deep diagnosis {own.cid[:12]}: skipped, the parent has no dev rows")
+            return []
+        # Only the dev baseline plan's rows carry trajectory paths; cost-summary rows cannot stage a comparison.
+        baseline = self.dev_baseline_rows
+        if not baseline:
+            self.log(f"deep diagnosis {own.cid[:12]}: skipped, no dev baseline rows yet")
+            return []
+        return self.deep.records(own.cid, [{**row, "correct": correct(row)} for row in own.rows],
+                                 [{**row, "correct": correct(row)} for row in baseline])
 
     def _diagnose(self, result: Cascade) -> None:
         """Attribute a candidate's paid dev rows once per content id; replay its src change when asked."""
         if result.attribution is None:
             try:
+                hints = {"hints": cost_attribution.PREAMBLE_HINTS} if self.settings.preamble else {}
                 result.attribution = cost_attribution.summarize(result.rows, self.dev_baseline_rows or [],
-                                                                self.panel.dev)
+                                                                self.panel.dev, **hints)
             except Exception as error:  # noqa: BLE001 - a diagnostic never fails a candidate
                 self.log(f"attribution {result.cid[:12]}: skipped ({type(error).__name__}: {error})")
             else:
@@ -840,28 +1121,39 @@ class Evolution:
             return self._finish_failed(f"finish: incomplete (baseline drift: {error})")
         except run.CandidateBuildFailed as error:
             return self._finish_failed(f"finish: incomplete (build failed)\n{tail(str(error))}")
-        test_means = {cid: mean(correct(row) for row in rows) if rows else 0.0 for cid, rows in test_rows.items()}
-        scores = ", ".join(f"{member.cid[:12]}={test_means[member.cid]:.3f}" for member in finalists)
         expected = len(self.panel.test) * len(reps)
         if no_spend and any(len(test_rows[member.cid]) < expected for member in finalists):
-            return self._finish_failed(f"finish: incomplete ({self.stop.reason}); stored test-split scores: {scores}")
-        unfinished = [member.cid[:12] for member in finalists
-                      if not all(baselines.is_completed(row) for row in test_rows[member.cid])]
-        if not all(baselines.is_completed(row) for row in baseline_rows):
-            unfinished.append("baseline")
-        if unfinished:
+            return self._finish_failed(f"finish: incomplete ({self.stop.reason}); stored test-split scores: "
+                                       f"{_means_line(finalists, test_rows)}")
+        arms = {"baseline": baseline_rows, **{member.cid[:12]: test_rows[member.cid] for member in finalists}}
+        dropped = _incomplete_cells(arms, self.panel.test, reps)
+        kept = [task for task in self.panel.test if task not in dropped]
+        if dropped:
+            self.log(f"finish: dropped test task(s) {', '.join(dropped)}: cells did not complete after "
+                     f"{self.settings.cell_retries} retries: "
+                     + ", ".join(f"{task}/{cell}" for task, cells in dropped.items() for cell in cells))
+        if not kept:
+            unfinished = sorted({cell.split("/")[0] for cells in dropped.values() for cell in cells})
             return self._finish_failed(f"finish: incomplete (test-split cells did not complete for "
-                                       f"{', '.join(unfinished)}); test-split means not compared: {scores}")
+                                       f"{', '.join(unfinished)}); no test task has complete paired rows; "
+                                       f"test-split means not compared: {_means_line(finalists, test_rows)}")
+        # Paired: every finalist and the baseline are scored on the same test tasks, each with all its reps.
+        test_rows = {cid: [row for row in rows if row["task"] in kept] for cid, rows in test_rows.items()}
+        baseline_rows = [row for row in baseline_rows if row["task"] in kept]
+        test_means = {cid: mean(correct(row) for row in rows) for cid, rows in test_rows.items()}
+        scores = _means_line(finalists, test_rows)
         self.log(f"finish: test-split means {scores}")
-        test_base = _baseline_costs(baseline_rows, self.panel.test)
-        deltas = _paired_score_deltas(test_rows[winner.cid], test_rows[seed.cid], self.panel.test, test_base)
+        test_base = _baseline_costs(baseline_rows, kept)
+        deltas = _paired_score_deltas(test_rows[winner.cid], test_rows[seed.cid], kept, test_base)
         if not deltas:
             self.log("finish: no improvement (no test task has paired winner and seed rows)")
             return None
         point = sum(deltas) / len(deltas)
         low, high = stats.paired_bootstrap_ci(deltas, n_resamples=10_000, seed=0)
         pass_delta = test_means[winner.cid] - test_means[seed.cid]
-        paired_line = f"paired test delta {point:+.3f} (95% CI [{low:.3f}, {high:.3f}], {len(deltas)} tasks)"
+        dropped_note = f"; dropped incomplete: {', '.join(dropped)}" if dropped else ""
+        paired_line = (f"paired test delta {point:+.3f} (95% CI [{low:.3f}, {high:.3f}], {len(deltas)} tasks"
+                       f"{dropped_note})")
         pass_line = f"test pass rate delta {pass_delta:+.3f}"
         self.log(f"finish: {paired_line}; {pass_line}")
         if not low > 0:
@@ -886,10 +1178,14 @@ class Evolution:
             f"Winner minus seed, {paired_line}", "",
             f"Winner minus seed, {pass_line}", "",
             "## Re-pin before landing", REPIN_NOTE, "",
+            *changed_tests_section(self.materializer.test_diffs.get(winner.cid, {})),
             "## dev delta", "```json", json.dumps(dev_delta, indent=2, sort_keys=True), "```", "",
             "## test delta", "```json", json.dumps(test_delta, indent=2, sort_keys=True), "```",
         ])
         self.log(f"finish: {REPIN_NOTE}")
+        if winner.tests_changed:
+            self.log(f"finish: winner {winner.cid[:12]} changes tests for review: "
+                     f"{', '.join(sorted(self.materializer.test_diffs.get(winner.cid, {})))}")
         try:
             self.pr_client.push(winner.sha, branch)
         except GitError as error:

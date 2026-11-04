@@ -1304,6 +1304,28 @@ fn hint_interpreters_cover_computing_and_writing() {
 }
 
 #[test]
+fn hint_shell_map_names_the_write_then_run_route() {
+    for command in [
+        "python -c 'print(1)'",
+        "node -e 1",
+        "wc -l src/lib.rs",
+        "git grep foo",
+    ] {
+        let reason = tilth_reason_for(command);
+        assert!(
+            reason.contains("unique scratch dir (`mktemp -d`"),
+            "{command:?}: {reason}"
+        );
+        assert!(reason.contains("run that file with Bash"), "{reason}");
+        assert!(!reason.contains("Do not script it"), "{reason}");
+    }
+    let wc = tilth_reason_for("wc -l src/lib.rs");
+    assert!(wc.contains("git grep repo files"), "{wc}");
+    assert!(wc.contains("inline interpreters"), "{wc}");
+    assert!(denies("python -c 'print(1)'") && denies("wc -l src/lib.rs"));
+}
+
+#[test]
 fn hint_wc_points_at_the_read_header_and_listings() {
     let reason = tilth_reason_for("wc -l src/lib.rs");
     assert!(

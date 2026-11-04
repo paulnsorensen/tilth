@@ -17,6 +17,52 @@ Finish opens a PR only if both hold: the lower bound of the paired test-split bo
 per-task score delta (winner minus seed) is above 0, and the winner's aggregate test pass rate is at least
 the seed's.
 
+## Finish reserve
+
+Preflight holds a finish reserve that no search call may spend. `Evolution.finish_reserve` counts only the
+test-split cells that finish buys and that no stored row answers. It looks each cell up by the run key that finish
+plans, in the result store.
+
+- `winner`: every candidate-arm test cell of the dev winner. The winner is a new candidate, so no row answers it.
+- `seed`: each seed candidate-arm test cell with no completed row. The key uses the seed binary and, in a
+  `--preamble` run, the seed preamble, as `run.run_plan` does. When the seed cannot be built, these cells count in
+  full.
+- `baseline`: each baseline test cell with no completed row, counted once. Finish plans the baseline once for both
+  finalists.
+
+Each cell costs the stored mean of its task and arm, else `--cell-estimate-usd`. The log line shows the parts and
+the old estimate, `FINISH_CELL_SETS * finalist_test_cost()`. The old estimate counted the seed's stored cells and
+the baseline cells twice. For the preamble-r1 run the old estimate held $128, and the new count is $96 (winner $32,
+seed $32, baseline $32).
+
+`--finish-reserve-usd USD` holds USD instead. Preflight refuses a value below the `winner` part (exit 2), because
+finish buys those cells in any case. A negative or non-finite value is a usage error.
+
+The baseline part still holds money that `buy_baselines` spends right after preflight, before any candidate cell.
+Only a baseline rep that fails there reaches finish. A refresh of the reserve after `buy_baselines` would release
+that part; it is not done yet.
+
+## Incomplete cells
+
+A cell that ends with `error_max_budget_usd` spent its own `--cell-budget-usd` cap. Its row gets `budget_capped:
+true` and is a completed, incorrect row in search scoring, delta reports, and finish. Its cost counts toward the
+score. A cap that the ledger shrank to the unreserved headroom is not the agent's own: that row stays incomplete,
+and the plan stops with `ceiling`.
+
+A cell that did not complete (a crash with no budget subtype, an infra failure, or a timeout) is run again up to
+`--cell-retries N` more times in the same plan (default 2, at most 5). This applies to every plan: baselines, the
+cheap and dev tiers, admission re-runs, and finish. Each attempt is charged to the ledger and stored, and `log.txt`
+names each retry. The ledger ceiling still applies, and a stop during a retry keeps the rows so far. `--reruns` is a
+different setting: it counts the extra repetitions that admission and finish run, not retries.
+
+If cells are still incomplete after the retries, finish drops each test task with an incomplete cell for the winner,
+the seed, or the baseline. It compares the finalists on the remaining tasks, paired. The log names the dropped cells,
+and the verdict line and the PR body end with `dropped incomplete: <tasks>`. The dev mean still picks the winner, and
+the seed still wins ties. Finish fails only when no test task is left.
+
+A resume with the same `--run-id` reuses every completed row, budget-capped rows included, and runs only the
+incomplete cells again.
+
 Paid-tier side info for reflection carries `cost_pairs` for the task: the candidate's rows and the frozen
 baseline rows, each cut to cost, turns, tokens, tool calls, tool sequence, and batch sizes. Reflection can
 so see why a candidate costs more than stock Claude. The pairs carry no trajectory and no grader output.
@@ -24,6 +70,36 @@ The dispatcher sends reflection and the `src/` proposer one `scores` record per 
 rates, mean costs, baseline costs) and one `cost_pairs` record per task. Both prompts state the score
 (`candidate.OBJECTIVE`) and ask for lower cost without lost correctness.
 
+## Preamble mode
+
+`--preamble` (default off) runs the candidate arm with the launcher preamble, `prompts/preamble.md`, as its whole
+system prompt. This is the prompt that `tilth claude` gives the agent. The baseline arm keeps the harness prompt.
+`run.run_plan(preamble=True)` reads the preamble at the commit of each candidate, so each cell sees the text of its
+own candidate. The preamble text is part of the run key.
+
+In this mode the preamble is a sixth text component. The seed reads it at `--seed-sha`; a seed without the file
+refuses the run (exit 2). The selector, reflection, the proposer export, and the materializer handle it like the
+four MCP texts. Its cap is 4096 bytes (`candidate.MAX_BYTES`); the seed file is about 3 KB. Reflection on the
+preamble gets `engine.PREAMBLE_NOTE`: the file is the system prompt, and it must keep one `# ` heading that names
+tilth and the `## Tools`, `## Safety`, and `## Verification` headings. Attribution maps two causes to the preamble
+(`attribution.PREAMBLE_HINTS`): `read_breadth`, because the preamble tells the agent which code to read before an
+edit, and `hook_denials`, because it tells the agent that shell is not a content reader. `hook_denials` prices each
+strict-hook denial (`PreToolUse:<tool> hook error`) above the baseline's rate per cell at the candidate's mean
+denial size. A run without `--preamble` has no `hook_denials` cause; the other causes keep their hints. The error
+class of a denial is `hook_denied` in both modes.
+
+The selector proposes the preamble within the first 3 proposals (`diagnosis.PREAMBLE_BY_PROPOSAL`), after the
+`src_patch` slot. A directive that names the preamble replaces this slot. Without the slot, the preamble had no
+dominant cause in preamble-r1 and got about one pick in ten. `directives/preamble-r2.json` holds two preamble
+directives that aim at the strict-hook denials.
+
+The preamble has no byte lock and no phrase pin. `tests/launch_preamble.rs` guards its headings and refuses
+personal-policy terms. `just check` runs that test through `cargo test`, so a candidate that breaks the guard
+fails at stage `just check`. A candidate cannot edit the test, because `tests/` is outside the allowlist.
+
+Without `--preamble`, the seed and every candidate hold only the four MCP texts. The materializer refuses a
+candidate that carries the preamble then, and a candidate that drops a seed component in either mode (stage
+`apply`). A key that names no component is not written, as before.
 ## Diagnosis records
 
 After a candidate's paid dev tier, `attribution.summarize` runs once per content id on the candidate's dev
@@ -33,10 +109,17 @@ skipped. The side info for the candidate carries a compact `attribution` view un
 The dispatcher sends it, with a `source_map` record for the leading causes, to reflection and the proposer.
 
 `diagnosis.WeightedSelector` is the gepa `module_selector`. It weights each component by the parent's
-`dominant` hints (the hinted component takes about 44% of the picks, against 20% for a uniform choice), picks
-`src_patch` within the first 2 proposals, and leaves no component out for more than 10 proposals in a row. The
-bound is `MAX_UNSELECTED`. Each pick goes to `log.txt` with its evidence and reason. A reflection or proposer call
-receives a `replay` record only from its own candidate, never from another one.
+`dominant` hints (with five components the hinted component takes about 31% of the picks, against 20% for a
+uniform choice), picks `src_patch` within the first 2 proposals (`--src-patch-by N`), and leaves no component out
+for more than 6 proposals in a row (`--max-unselected N`, at least the component count minus 1). The bound was 10:
+preamble-r1 made 4 proposals, so a component waited past the run. A component whose last 2 proposals each left a
+child that failed `apply`, `just check`, or `integrity` rests for 3 proposals, and its deadline moves past the rest.
+In preamble-r1 both `src_patch` proposals failed `just check` and cost $7.45 of proposer spend. A directive still
+picks a resting component. Each pick and each rest goes to `log.txt` with its evidence and reason. A reflection or
+proposer call receives a `replay` record only from its own candidate, never from another one.
+
+The cheap tier (`panel.cheap`) is the cheap dev subsample before the paid dev tier. The preamble-r1 panel has no
+cheap members, so every candidate there went straight to the full dev split.
 
 Reflection and the proposer end a reply with one `<hypothesis>` block (`metric`, `scope`, `direction`,
 `tolerance`, `invariants`). `hypotheses.jsonl` in the run directory holds it, keyed by parent and child content
@@ -71,6 +154,113 @@ corpus through the candidate binary in both hint modes. Any wrong verdict fails 
 A candidate that cannot allow `go test ./...` or deny `cat src/lib.rs` with the right hint text
 also fails at `hook gate`, through the harness probe. The corpus file itself stays outside the
 candidate allowlist (`src/`, `prompts/`).
+
+## Proposer repair
+
+The proposer has no Bash, so it cannot compile. When a `src_patch` proposal's child fails `apply` or
+`just check`, the dispatcher calls the proposer once more on the same parent, with the failed patch applied and a
+`repair` record: `stage`, `error` (the failure tail), and the instruction to fix only that failure. The repaired
+patch replaces the first one, so the content id names the final patch and GEPA never sees the broken child. The
+check is the cascade's own memoized apply and `just check` stage, so a passing child is not checked twice. A
+repair that also fails is a failed candidate, with one exception: when the repair's own `just check` failure is
+lint-only or fmt-only (every error block is a clippy lint with its `-D clippy::...` note or a rustfmt `Diff in`,
+with no test failure and no `error[E...]`), the dispatcher makes one more repair with the new tail. That is at most
+three proposer calls per proposal, and the log shows each attempt. The extra repair keeps the test grants of the
+repair before it. `--no-repair` turns off both. The directive is claimed once and the
+hypothesis stays on the final child. Each repair call is billed as `proposer` spend. Text components are never
+repaired. `--no-repair` turns the repair off.
+
+A long failure tail keeps the compiler, clippy, test, or fmt error blocks that cargo printed before its closing
+`build failed` lines, plus the last ten lines.
+
+### Pinned-test updates in repair
+
+Adding tests needs no repair. A `src_patch` may add whole new `#[test]` fns inside an existing `#[cfg(test)]`
+module or in a `#[cfg(test)] mod x;` module file. The materializer checks only cheap rules on an added fn: it needs
+a test attribute and no `ignore`. Existing test fns change only under a repair grant (below). Added and changed tests
+count as `tests_changed`, appear in the log, and appear under "Test changes for review" in the draft PR. A new
+`#[test]` fn outside `#[cfg(test)]` code is listed there too. The materializer also refuses a candidate that edits
+a `#[cfg(not(test))]`, `#[cfg(any(..test..))]`, `cfg_attr` or `#[cfg(debug_assertions)]` item, or that adds
+an inner `#![cfg(..test..)]` attribute.
+
+### Integrity stage
+
+The test text is not the safe thing to check. A candidate can add a `macro_rules! assert_eq` on a test attribute line,
+or put `#[cfg(any())]` above the test module. Then `just check` is green while the seed's tests no longer run as the
+seed wrote them. So the cascade has a behavioral stage, `integrity`, after `just check` passes and before `build`.
+The rule: the seed's tests must keep running and passing against the candidate's production code, exactly as the seed
+wrote them. The one exception is a test with a repair grant, which may assert new behavior.
+
+The stage applies to every `src_patch` candidate whose patch differs from the seed. It builds the tree in the
+candidate worktree: the candidate's production code stays, and each outermost `#[cfg(test)]` item is replaced by the
+seed's item with the same header. The header includes the run of attributes stacked above the item, so a candidate
+that adds `#[cfg(any())]` or `#[cfg_attr(.., path = ..)]` there gets no seed twin, and its item is dropped. Granted
+test fns keep the SEED's version in this tree, and the run skips them (`-- --skip <name> --exact`). The candidate's
+granted version is already checked by `just check`, and here it cannot change how the other tests resolve. A granted
+fn whose body defines an item (`impl`, `trait`, `macro_rules!`, `mod`, `use`, `struct`, `enum`, `fn`, `static`,
+`const`, `type`, `union`, `extern`) is still refused, as defence in depth. A candidate `#[test]` fn outside any test
+`cfg` item with the name of a seed test is refused. Seed `#[cfg(test)] mod x;` files are restored byte for byte,
+and test modules or files the candidate added are dropped.
+
+Each restored seed test region also holds a canary, `#[test] fn __tilth_canary_<nonce>() {}`: right after the opening
+brace of an inline test `mod`, or at the end of a test file. The nonce is random per run and no proposer sees it. The
+stage lists the tests of each cargo target apart (`cargo test --lib -- --list`, and `cargo test --bin <name> --
+--list` per bin) and requires every seed test name in the list of the same target as in the seed, and every canary
+under the exact module path of its region. A region that the candidate compiled out, wrapped in a fn, swallowed with a
+macro, or moved lists no canary, so the stage fails with "Unsound or missing seed region <path>". A listed name under
+a seed test's module that the source does not define as often as it is listed (a macro made it) fails too. The seed
+names are listed once per run in a scratch worktree. Last, the stage runs `cargo test --lib --bins`, and all tests
+must pass. A granted test whose seed version no longer compiles against the new production code fails the stage;
+the repair has to keep the old signature.
+
+A failure is a cascade failure at stage `integrity`, and it is repairable like `just check`. The tail names the
+missing or failing seed tests. A repair after an integrity failure never gets test scope. Where a replacement cannot
+be made sound (a production macro that shadows a seed macro, an inner test `cfg` in a production file, a granted fn
+that is gone or defines an item), the candidate fails at this stage with the reason. It is never
+accepted.
+
+A cargo timeout, or a cargo failure that is not a compile error, is an infrastructure fault. The stage then reports
+that cause in its headline instead of blaming the candidate's tests, and the result is not memoized.
+
+The materializer backs the stage with these refusals: an added or changed `cfg` or `cfg_attr` attribute stacked on a
+test item; a `cfg_attr(.., path = ..)`; a test name defined twice in one file; and added code that names
+`current_exe`, `/deps/`, `RUST_TEST_`, or `--test-threads`. The last is a heuristic. Production code can still tell a
+test run from a real run in a way it does not catch, so the winner PR note asks the reviewer to read the production
+diff for that.
+
+Cost per candidate: one incremental test build per listed target and one test run in the shared candidate target dir,
+and one extra seed list build per run. Cargo trusts file mtimes and the trees share a target dir, so the stage touches
+the sources before each cargo call; `just check` gets the same touch.
+
+The stage is on whenever cargo is wired: `build(..., cargo=...)` sets it, and a custom `just_check` without `cargo` turns
+it off with a warning on stderr. The stage is skipped for the seed, for an unchanged patch, and for a text-only child
+(the result is memoized by patch and grant).
+
+Limits: a granted fn that needs a test helper the candidate added fails integrity (repairable). Edits to non-test lines
+in plain `#[cfg(test)]` code pass the materializer, because this stage restores the seed's version.
+
+### Repair grants for existing tests
+
+A proposer cannot change existing `#[cfg(test)]` code, so an intended behavior change used to die on the test that pinned the
+old behavior. When the failed stage is `just check` and cargo's `failures:` list names Rust tests, the repair record
+also carries `failing_tests` and `may_update_tests: true`. The repaired child may then change exactly those `#[test]`
+fns (matched by module path), plus any test its parent already changed. The grant is keyed by the candidate's
+`src_patch`. A child that is not a repair inherits the parent's changed tests read-only, so their text must stay
+byte-equal to the parent's. A text-only child keeps the grant. The prompt allows a change only when the intended change
+makes a pinned test obsolete; the test must assert the new behavior. The materializer refuses any other cfg(test)
+change, a deleted or reverted granted test, and any file outside `src/` and `prompts/`. It also refuses a weakened
+granted test: it needs exactly one test attribute, no added `ignore`, `should_panic`, `cfg` or `cfg_attr`, and an
+assertion (`assert!`, `assert_eq!`, `assert_ne!`, `panic!` or a postfix `?` in a `Result` fn) when the old body had one. A candidate that changes
+tests is `tests_changed`, and the log names the tests. If it wins, the draft PR body lists each changed test with its
+diff under "Test changes for review". Nothing merges automatically.
+
+## Auto-format
+
+The proposer's export is `cargo fmt`-formatted before its cumulative diff is taken, so the content id and every later
+proposal build on formatted code. The materializer runs `cargo fmt` on the applied tree before it commits, so
+as it is, and `just check` reports the real error. A proposer `cargo fmt` failure is logged, and the diff stays
+unformatted. The materializer rewrites the byte-lock literals after the first format, so it formats the tree again
+when the rewrite changes it.
 
 ## Rejected-candidate cleanup
 

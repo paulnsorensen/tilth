@@ -530,10 +530,12 @@ def test_rejects_cfg_test_edit(tilth_clone, tmp_path: Path) -> None:
                            '"SERVER_INSTRUCTIONS may not introduce triple newlines"')
     integration_edit = integration.replace("\n", "\n// candidate edit\n", 1)
 
-    for name, text in (("src/mcp/mod.rs", assertion), ("src/edit/integration_tests.rs", integration_edit)):
-        with pytest.raises(Exception, match=r"cfg\(test\)"):
-            materializer.materialize({**base, "src_patch": _clone_patch(repo, seed, {name: text})})
+    with pytest.raises(Exception, match=r"cfg\(test\)"):
+        materializer.materialize({**base, "src_patch": _clone_patch(repo, seed, {"src/mcp/mod.rs": assertion})})
     assert git("for-each-ref", "refs/evolve/cfgtest", cwd=repo).strip() == ""
+    # A comment outside every test fn passes here; the integrity stage restores the seed's module file.
+    assert materializer.materialize(
+        {**base, "src_patch": _clone_patch(repo, seed, {"src/edit/integration_tests.rs": integration_edit})})
 
 
 def test_rejects_a_candidate_that_flips_the_phrase_pin_exemption(tilth_clone, tmp_path: Path) -> None:
@@ -930,7 +932,9 @@ def test_first_rollout_that_did_not_complete_is_not_rerun(monkeypatch: pytest.Mo
     evo.evaluate(candidate, "dev_a")
     result = evo.results[candidates.content_id(candidate)]
 
-    assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [("dev_a", 0), ("dev_b", 0)]
+    # The errored cell runs once and twice more as --cell-retries (default 2) before the rollout counts as incomplete.
+    assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [
+        ("dev_a", 0), ("dev_a", 0), ("dev_a", 0), ("dev_b", 0)]
     assert not result.accepted and result not in evo.frontier
     assert "a first rollout did not complete; not re-run" in log_text(world)
 
@@ -944,7 +948,7 @@ def test_rerun_that_did_not_complete_is_not_accepted(monkeypatch: pytest.MonkeyP
     result = evo.results[candidates.content_id(candidate)]
 
     assert sorted(call for call in tilth_calls(world, result.sha) if call[0] in DEV) == [
-        ("dev_a", 0), ("dev_a", 1), ("dev_b", 0), ("dev_b", 1)]
+        ("dev_a", 0), ("dev_a", 1), ("dev_a", 1), ("dev_a", 1), ("dev_b", 0), ("dev_b", 1)]
     assert not result.accepted and result not in evo.frontier
     assert "a re-run did not complete; not accepted" in log_text(world)
 
@@ -1660,16 +1664,17 @@ def test_insufficient_reserve_refuses_at_start(world, capsys: pytest.CaptureFixt
     assert main(world, max_usd="0.15") != 0
     assert world.calls == [] and world.judge.labelled == [] and world.spawned == []
     error = capsys.readouterr().err
-    assert "$0.15" in error and "$0.80" in error and "$0.40" in error
+    # test_a x 2 reps at $0.10: winner $0.20 + unstored seed $0.20 + unstored baseline $0.20.
+    assert "$0.15" in error and "$0.60" in error and "winner $0.20" in error
 
 
 def test_max_usd_equal_to_the_reserve_is_refused(world, capsys: pytest.CaptureFixture[str]) -> None:
-    assert main(world, max_usd="0.8") == 2
+    assert main(world, max_usd="0.6") == 2
     error = capsys.readouterr().err
-    assert "$0.80" in error and "$0.40" in error
+    assert "$0.60" in error and "winner $0.20" in error
     assert world.calls == [] and world.judge.labelled == []
 
-    assert build(world, max_usd="0.85").preflight() is None
+    assert build(world, max_usd="0.65").preflight() is None
 
 
 def test_stop_state_neutralizes_calls(world) -> None:
@@ -1710,7 +1715,8 @@ def _ceiling_world(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, spawn):
     """max 1.2, a 0.2 finish reserve, free search cells, and 0.1 test cells; a metric budget the stop must cut short."""
     world = weak_world(monkeypatch, tmp_path)
     world.costs.update(dev_a=1e-6, dev_b=1e-6, cheap_a=1e-6, test_a=0.1)
-    evo = build(world, "--reruns", "0", "--cell-estimate-usd", "0.05", max_usd="1.2", calls="2000", spawn=spawn)
+    evo = build(world, "--reruns", "0", "--cell-estimate-usd", "0.05", "--finish-reserve-usd", "0.2", max_usd="1.2",
+                calls="2000", spawn=spawn)
     monkeypatch.setattr("gepa.optimize_anything.make_litellm_lm", lambda *a, **k: pytest.fail("litellm used"))
     assert evo.preflight() is None
     assert evo.ledger.reserve == pytest.approx(0.2)
@@ -2355,7 +2361,7 @@ def test_rejects_cfg_test_attribute_with_whitespace_or_comment(world, attribute:
     materializer = Materializer(world.repo, world.seed_sha, "run1", world.tmp / "work")
     patch = patch_for(world, {"src/lib.rs": LIB + attribute + "\npub fn gated() {}\n"})
 
-    with pytest.raises(ApplyRejected, match=r"#\[cfg\(test\)\]"):
+    with pytest.raises(ApplyRejected, match=r"#\[cfg\(test\)\]|adds the test gated"):
         materializer.materialize({**seed_candidate(), "src_patch": patch})
     assert refs(world) == []
 
@@ -2421,7 +2427,7 @@ def _budget_records(name: str) -> list[dict]:
 def _status_spawn(calls: list[dict], method: str = "oauth_token"):
     def spawn(argv, **kwargs):
         calls.append({"argv": list(argv), **kwargs})
-        return subprocess.CompletedProcess(argv, 0, json.dumps({"authMethod": method}), "")
+        return subprocess.CompletedProcess(argv, 0, json.dumps({"authMethod": method, "apiProvider": "firstParty"}), "")
     return spawn
 
 
@@ -2509,13 +2515,32 @@ def test_non_oauth_status_refuses_before_any_paid_call(world) -> None:
     assert statuses and world.spawned == [] and world.calls == [] and world.builds == []
 
 
-def test_missing_oauth_token_is_refused_before_any_paid_call(world, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_without_token_a_token_status_is_refused_before_any_paid_call(world, monkeypatch: pytest.MonkeyPatch) -> None:
     statuses: list[dict] = []
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
 
     assert main(world, auth_spawn=_status_spawn(statuses)) == 2
 
-    assert statuses == [] and world.spawned == [] and world.calls == []
+    assert statuses and world.spawned == [] and world.calls == []
+
+
+def test_login_session_runs_paid_calls_in_the_host_config(world, monkeypatch: pytest.MonkeyPatch) -> None:
+    statuses: list[dict] = []
+    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
+    host_config = os.environ["CLAUDE_CONFIG_DIR"]
+    seen: list[dict] = []
+
+    def spawn(argv, **kwargs):
+        seen.append(dict(kwargs["env"]))
+        return subprocess.CompletedProcess(argv, 0, tool_stream([]), "")
+
+    evo = build(world, auth_spawn=_status_spawn(statuses, method="claude.ai"), spawn=spawn)
+
+    assert not isinstance(evo, int)
+    assert {call["env"]["CLAUDE_CONFIG_DIR"] for call in statuses} == {host_config}
+    assert evo.paid.call("reflection", ["claude", "-p"], "prompt", world.tmp) is not None
+    [env] = seen
+    assert env["CLAUDE_CONFIG_DIR"] == host_config and "CLAUDE_CODE_OAUTH_TOKEN" not in env
 
 
 # --- a definitively rejected candidate's kept build is cleared ---

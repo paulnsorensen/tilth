@@ -85,9 +85,17 @@ The estimate is the mean stored cost for that task, arm, and model, else this ru
 A paid run that would re-run a stock-arm cell (an arm with no MCP server or plugin, such as `baseline` or `no_tilth`) whose stored row for the same task, model, arm, effort, timeout, repetition, and harness digest was recorded under other key inputs, such as a new CLI version or environment fingerprint, refuses to start and names the changed inputs. Pass `--refreeze-baselines` to re-run them.
 The run key of a Claude cell includes a per-cell budget placeholder, so rows stored before this change need `--refreeze-baselines` to be reused.
 Runner subprocesses set `DISABLE_AUTOUPDATER=1`, and the run stops before a paid cell when the agent CLI version changed since planning.
-A Claude run refuses to start when `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`, a `CLAUDE_CODE_USE_*` provider flag, or a federation variable is set, because each outranks `CLAUDE_CODE_OAUTH_TOKEN`.
+
+The Claude CLI version is pinned in `benchmark/claude-cli.version`, because the version is part of every cell's run key.
+The runner binary is, in order: `$TILTH_BENCH_CLAUDE`; the mise install `~/.local/share/mise/installs/aqua-anthropics-claude-code/v<pin>/claude` when it exists; `claude` on PATH.
+Before it plans any cell, `run.py` and `evolve/cli.py` probe that binary with `--version` (no model call) and refuse to start when the version is not the pin. The message names the version found and the fix.
+`--allow-cli-drift` runs anyway; the run keys then differ from the stored cells, so those cells are bought again.
+To bump the pin on purpose: install the new version (`mise install aqua:anthropics/claude-code@<new>`), write it into `benchmark/claude-cli.version`, and commit.
+A bump invalidates every stored cell's run key, so every stored cell, baselines included, is bought again (`--refreeze-baselines` for stock arms).
+A Claude run bills the Claude subscription: through `CLAUDE_CODE_OAUTH_TOKEN` when it is set, else through the host's `claude /login` session.
+A Claude run refuses to start when `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_PROFILE`, a `CLAUDE_CODE_USE_*` provider flag, or a federation variable is set, because each outranks subscription auth.
 It also refuses when a settings file that a cell loads sets one of these keys under `env` or sets `apiKeyHelper`; no runner receives any `ANTHROPIC_*` variable.
-Before the first paid cell, a Claude run also needs `CLAUDE_CODE_OAUTH_TOKEN` and a passing `claude auth status` preflight that reports `oauth_token` for each distinct cell environment.
+Before the first paid cell, a Claude run also needs a passing `claude auth status` preflight for each distinct cell environment: it must report the `firstParty` provider and `oauth_token` with the token, or `claude.ai` without it.
 A live Claude call can report an init `apiKeySource` other than `none`, report no `apiKeySource`, or send an assistant event before its init event.
 The run then records the cell as `infra: auth` and stops.
 Every paid run charges a persistent budget file at `$TILTH_BENCH_DATA/budgets/<budget_id>.jsonl`.
@@ -124,6 +132,7 @@ The check passes when any single removal fails the held-out tests, and the verdi
 The harness caches verdicts by instance ID, data revision, and environment fingerprint.
 Delete a verdict file under `$TILTH_BENCH_DATA/verdicts/` to retry it.
 The harness recomputes a verdict from an older admission version or another tamper bound.
+`external/long_pool_candidates.json` lists admitted SWE-bench Multilingual instances with large gold patches, as candidates for a long-task panel screen.
 `run.py --tasks <instance_id>` runs an admitted instance.
 Its workdir is the `base_commit` tree as the single commit of a fresh repository.
 FeatureBench workdirs also apply the mask and delete the FAIL_TO_PASS tests.
@@ -163,11 +172,19 @@ The first completed stored row for a panel name locks its split: a later split c
 `analyze.py` counts a `contaminated` panel row as incorrect, keeps it in its denominators, and tallies it per task and arm.
 `benchmark/tests/fixtures/panels/gepa-v1-rows/` holds redacted rows (`instance_id`, `repo`, `base_commit`) for the committed panel's language check; full rows stay in `$TILTH_BENCH_DATA`.
 
+`panel_health.py` prints one markdown row per task from stored result rows: pass rate per arm, failure classes (a chain names each wrong sub-task), wall time against the cell timeout, cost against the cell budget, and budget-cap and timeout hits.
+It flags a failure class that hits at least 25% of the cells in every arm, a cell over half its timeout, and a budget cap.
+It skips `reused` rows, counts a row shared by two files once, and times a chain by its slowest turn, because the timeout applies to each turn.
+
+```bash
+python3 benchmark/panel_health.py benchmark/results/evolve/*/rows.jsonl --panel benchmark/panels/gepa-v3-long-3.json
+```
+
 ## Applicability judge
 
 `benchmark/judge/` labels each task `strong`, `weak`, or `none` for structural-tool applicability.
 It also critiques stripped rollouts for reflection.
-It uses the claude CLI alias `opus` (`--model opus`) through an isolated, tool-less `claude -p` on `CLAUDE_CODE_OAUTH_TOKEN`.
+It uses the claude CLI alias `opus` (`--model opus`) through an isolated, tool-less `claude -p` on the Claude subscription: `CLAUDE_CODE_OAUTH_TOKEN` when it is set, else the host `/login` session.
 The alias follows the newest opus release, and cache keys and calibration records store only `opus`.
 Evolve reflection and the proposer use the claude CLI alias `sonnet`.
 The call has no tools, MCP servers, settings, or hooks, and the prompt goes on stdin.
@@ -190,7 +207,7 @@ Judge calls share the `--max-usd` ceiling and pass its remaining headroom as `--
 The first usage-limit rejection stops every later judge call.
 The flags accept finite positive numbers only.
 `--budget-id NAME` keeps the judge spend in `$TILTH_BENCH_DATA/budgets/NAME.jsonl`; without it, no budget file is written.
-Before the first uncached call, the judge runs one `claude auth status` check and refuses unless `CLAUDE_CODE_OAUTH_TOKEN` is set and the method is `oauth_token`.
+Before the first uncached call, the judge runs one `claude auth status` check and refuses unless it reports subscription auth (`oauth_token` with `CLAUDE_CODE_OAUTH_TOKEN`, else `claude.ai`).
 A judge call whose init event reports an API key raises an error, keeps its cost on the ledger, and discards its output.
 The maintainer hand-labels `benchmark/judge/calibration.json`.
 Its shape is `{"tasks": {name: label}, "trajectories": [{"run_key", "verdict"}]}`, with verdict `apt`, `missed`, or `misapplied`.
@@ -205,10 +222,13 @@ An external instance needs only a cached dataset row: the judge does not run adm
 
 `benchmark/evolve/` runs a GEPA (`gepa==0.1.4`) search whose candidates are tilth commits.
 A candidate holds the four `prompts/` files that `src/` embeds, plus a cumulative `src/**` patch on `--seed-sha`.
+With `--preamble`, a candidate also holds `prompts/preamble.md`, and the `tilth_forced` arm runs with that file as its system prompt (see [Preamble arm](#preamble-arm)).
+Each cell reads the preamble from the commit of its candidate, so reflection can change it and the next cell sees the change.
 Each candidate becomes one local commit on the seed (ref `evolve/<run-id>/<content-id>`).
 The commit passes `just check`, then the hook gate (strict runs), then a cheap tier, then the panel's dev split.
 That `just check` sets `TILTH_EVOLVE_CANDIDATE=1`, so the Rust tests skip their phrase pins on `prompts/` text; CI does not set it, so the winner PR must re-pin them before it lands.
-The MCP host truncates the instructions field and each tool description past 2048 UTF-8 bytes. Reflection is told this cap and the current size, and a candidate prompt file over it is refused before its worktree and `just check`.
+The MCP host truncates the instructions field and each tool description past 2048 UTF-8 bytes. The preamble fills no MCP field; its cap is 4096 bytes. Reflection is told the cap of the file and its current size, and a candidate prompt file over its cap is refused before its worktree and `just check`.
+A candidate that carries the preamble outside a `--preamble` run, or that drops a component of the seed, is refused at the apply stage.
 The run log names the stage at which each candidate failed (apply, `just check`, build, hook gate, or cheap tier), with the output tail.
 Candidates run in the `tilth_forced` arm (tilth MCP only, no built-in tools) and are compared with the `baseline` arm, so `--model` accepts only Claude models.
 A task's score is `p * base / c`: pass rate times the frozen baseline mean cost over the candidate's mean rollout cost; contaminated rollouts count as incorrect.
@@ -243,7 +263,8 @@ A stronger model, such as `sonnet`, costs more per token, so give it a larger bu
 `--cell-estimate-usd` defaults to `--cell-budget-usd`, so the finish reserve and a cell with no stored cost are estimated at the full per-cell budget.
 Evolve runs strict by default (`--no-strict-file-tools` opts out); see [evolve/README.md](evolve/README.md) for the seed-hook preflight and the hook gate.
 A panel row from `run.py --panel` has the same key only when that run passed `--bare` and the same `--max-budget-usd`, passed `--strict-file-tools` with its hook commit equal to the evolve `--seed-sha`, and did not pass `--reasoning-effort`.
-The evolve run refuses before any paid call unless `CLAUDE_CODE_OAUTH_TOKEN` is set and `claude auth status` reports `oauth_token`.
+The evolve run refuses before any paid call unless `claude auth status` reports subscription auth (`oauth_token` with `CLAUDE_CODE_OAUTH_TOKEN`, else `claude.ai`).
+With the token, evolve and judge calls use an empty temp `CLAUDE_CONFIG_DIR`; with a `/login` session they keep the host config dir, which holds its credentials, and `--setting-sources ""` with `--strict-mcp-config` keeps its settings and MCP servers out.
 A call whose init event shows an API key stops the run with the `auth` reason, and its cost stays on the ledger.
 The finish step holds back the test-split cost of two finalists, the dev winner and the seed.
 A non-seed winner is pushed as `evolve/<run-id>-winner` and opened as one draft PR; nothing is merged.
@@ -535,7 +556,7 @@ python benchmark/run.py \
   --models sonnet --reps 1 --modes baseline,tilth --max-usd 5
 
 # Local three-way Sonnet 5 comparison: one Gin renderer task, five matched repetitions.
-# Set CLAUDE_CODE_OAUTH_TOKEN outside this command. Use a dedicated CLAUDE_CONFIG_DIR;
+# Log in with claude /login or set CLAUDE_CODE_OAUTH_TOKEN outside this command. Use a dedicated CLAUDE_CONFIG_DIR;
 # only its wozcode/auth.json is copied into each temporary Woz cell.
 TILTH_BIN=/absolute/path/to/target/release/tilth \
 CLAUDE_CONFIG_DIR=/absolute/path/to/isolated/config \
@@ -547,9 +568,30 @@ python benchmark/run.py \
 
 # Diagnostic only: remove built-in search tools and force the local tilth MCP
 python benchmark/run.py --tasks all --models haiku --reps 1 --modes tilth_forced --max-usd 20
+
+# Preamble arm: the tilth arms run with prompts/preamble.md as their system prompt
+python benchmark/run.py --tasks rg_search_dispatch --models haiku --reps 1 --modes baseline,tilth \
+  --preamble --max-usd 5
 ```
 
 `--strict-file-tools` gives the native arm Read, Edit, Write, Grep, Glob, and Bash. Both MCP arms get Bash and their own MCP tools, with no native file tools. All three arms guard Bash with `tilth hook` (exec form, `onFailure: block`, so a missing binary denies). A tilth arm runs its own binary with `hook --hint tilth`; the baseline runs the binary built at the hook commit with `hook --hint native`. The hook commit is the checkout's `HEAD` (the seed hook), even with `--candidate-sha`; `run_plan(strict_file_tools=True, hook_sha=...)` takes it explicitly. A strict run needs Claude CLI >= 2.1.295 (exec-form hooks and `onFailure: block`) and refuses an older one. The hook denies shell file reads, searches, and writes; see `src/hook`. Before any paid strict cell, the run probes every distinct hook binary (each tilth arm's binary with `--hint tilth`, the hook-commit build with `--hint native`) with one allow event (`go test ./...`, exit 0) and one deny event (`cat src/lib.rs`, exit 2, with the matching hint text). A binary that fails the probe, such as one built before `tilth hook` existed, refuses the run before any spend (`parser.error` in `run.py`, `HookProbeFailed` from `run_plan`). The wozcode arm has no native file tools, but its denials use `--hint native` and name them; read its denial text with that in mind. After each cell, the audit replays every Bash call through the hook binary built at the hook commit. A call that ran and that hook denies fails the cell as `hook_loosened`, whichever arm made it, so the seed hook is the floor for a candidate hook. This controls tool use, not code run by tests or MCP servers; it is not a security sandbox. Raw streams retain denied attempts, and result rows record `strict_file_tools`, `hook_source_key`, and the count of Bash calls that the hook-commit hook denies (a call that only a candidate hook denied is not counted).
+
+#### Preamble arm
+
+`--preamble` runs every selected tilth arm with the launcher preamble (`prompts/preamble.md`) as its whole system prompt.
+This is the prompt that `tilth claude` and `tilth codex` give the agent.
+The stock arms keep the harness system prompt.
+The run reads the preamble at `--candidate-sha`, or from this checkout when that flag is absent.
+A Claude cell passes the preamble and the working-directory line with `--system-prompt`, in place of the harness prompt.
+A Codex cell passes the preamble as `-c model_instructions_file=<file>`, as `tilth codex` does.
+The file is a content-addressed copy under the gitignored `benchmark/results/configs/preambles/`.
+The Codex developer message keeps the working-directory line and the Codex guidance, without the harness prompt.
+The preamble text is part of the run key, so a changed preamble buys new cells.
+Result rows record `preamble_sha256`.
+The flag needs a tilth arm and Claude or Codex models.
+It refuses `--experiment`, an OpenCode model, and a `--modes-json` tilth arm with `prompt_mode: "append"`.
+A `--modes-json` arm cannot set `prompt_mode: "preamble"` or `preamble` itself.
+`run_plan(preamble=True)` is the same switch for library callers such as evolve.
 
 **Analyze:**
 
@@ -611,3 +653,24 @@ Good tasks have unambiguous correct answers that can be verified by string match
 | v0.5.0 | MCP instruction overhaul (top-weighted DO NOT rules, search-first guidance), scope fallback with warning, Gemini CLI install | **-44%** (Sonnet), **-39%** (Opus), **-38%** (Haiku) |
 
 v0.4.5 focus: bumped `TOKEN_THRESHOLD` from 3500 to 6000 estimated tokens (~24KB). Files in the 14–24KB range now return full content instead of an outline, eliminating multi-read spirals where agents read the entire file via 5–7 sequential `--section` calls. Key fixes: `gin_radix_tree` flipped from +35% regression to ~tie, `rg_search_dispatch` flipped from +90% regression to -26% win (Sonnet now 100% accuracy). Sonnet achieves 100% accuracy across all 52 tilth runs.
+
+## Chained cells
+
+A chained cell runs several tasks back to back as turns of one `claude -p` conversation. A real main thread makes about 93 API calls at about 105k context tokens each. A single task makes 5-6 calls. A chain of 5-7 tasks reaches a realistic length, so the per-result size of tilth is weighed against the built-in tools at that length.
+
+Chains live in `chains.py`. Pass `--tasks chain:<id>`, or list `chain:<id>` as a panel member with family `chain`. `--tasks all` never includes a chain.
+
+- The first turn is a normal `claude -p`. Every later turn runs `claude -p --resume <session id>` in the same workspace, with the same mode and model. Only chain turns keep the session on disk, in the cell's throwaway `CLAUDE_CONFIG_DIR`. Single cells still pass `--no-session-persistence`.
+- Each member is prepared, run, and graded by its own task code, right after its turn. A wrong sub-task does not stop the next turn. A crashed turn stops the chain.
+- The members must share one repo. Read tasks come first. At most one task that grades the whole workspace (an edit task) is allowed, and it goes last. Mutation files must not overlap. `chains.parse_chain` refuses anything else.
+- The chain budget is the per-cell budget times the number of members. Each turn is capped at what the earlier turns left. If `--max-usd` is below the planned chain budget ($1 times the member count), the run refuses up front.
+- The chain row carries `sub_tasks`, `api_calls`, the summed token and cost fields, and the concatenated `per_turn_context_tokens`. `correct` is true when every sub-task is correct. `pass_rate` is the fraction that are. The existing score path reads `correct`, so `p` for a chain is the mean of a 0/1 value over repetitions; `task_score` does not read `pass_rate`.
+- A chain has its own run key. The key covers the chain id and the digest of every member.
+
+Preview a plan without any model call or `--max-usd`:
+
+```bash
+python3 benchmark/run.py --tasks chain:gin-edit-5 --modes baseline --models sonnet --reps 1 --dry-run
+```
+
+The committed chains are `gin-edit-5`, `fastapi-edit-5`, `rg-edit-7`, `express-edit-6`, `rg-edit-6`, and `fastapi-edit-4`. `rg-edit-6` and `fastapi-edit-4` drop `grok_rg_matcher` and `fastapi_request_validation`, whose required strings a chain answer often omits; `gepa-v3-long-3` uses them. Their API call counts (about 40-60) are estimates. One live run of `fastapi-edit-5` (tilth_forced, sonnet, one rep) made 31 API calls over 38 turns, cost $1.38, and passed all five sub-tasks. Cost per sub-task rose with the carried context (0.09 to 0.77 USD), so summing the per-turn costs is correct.

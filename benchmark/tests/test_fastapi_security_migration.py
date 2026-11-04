@@ -128,3 +128,77 @@ def test_grader_rejects_unapproved_and_symlinked_paths(tmp_path, monkeypatch):
     assert not ok and reason.startswith("Unsafe changed path"), reason
     ok, reason = run_with(" M tests/test_security_http_bearer.py\n")
     assert not ok, reason
+
+
+def _git(cwd, *args):
+    subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True)
+
+
+def _stub_build(monkeypatch):
+    """Replace the uv sync with a fake that creates the venv; return the recorded calls."""
+    calls = []
+    real_run = subprocess.run
+
+    def fake_run(command, **kwargs):
+        if command[0] != "uv":
+            return real_run(command, **kwargs)
+        calls.append((command, kwargs["env"], kwargs["cwd"]))
+        bin_dir = Path(kwargs["env"]["UV_PROJECT_ENVIRONMENT"]) / "bin"
+        bin_dir.mkdir(parents=True)
+        (bin_dir / "pytest").write_text("")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+    return calls
+
+
+def test_prepare_builds_an_excluded_agent_venv_once(tmp_path, monkeypatch):
+    workdir = tmp_path / "workdir"
+    workdir.mkdir()
+    _git(workdir, "init", "-q")
+    calls = _stub_build(monkeypatch)
+    task = module.FastAPISecurityMigrationTask()
+
+    task.prepare(workdir)
+    task.prepare(workdir)  # a chain prepares a member once per cell; the venv is reused
+
+    assert (workdir / ".venv" / "bin").is_dir()
+    assert len(calls) == 1
+    command, env, cwd = calls[0]
+    assert command == module.VENV_SYNC_COMMAND and cwd == workdir
+    assert {"--frozen", "--extra", "all", "tests"} <= set(command)
+    assert env["UV_PROJECT_ENVIRONMENT"] == str(workdir / ".venv") and env["UV_LINK_MODE"] == "copy"
+    exclude = (workdir / ".git" / "info" / "exclude").read_text().splitlines()
+    assert exclude.count(".venv/") == 1
+
+
+def test_grader_ignores_the_agent_venv_in_a_git_worktree(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    _git(source, "init", "-q")
+    _git(source, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "base")
+    workdir = tmp_path / "workdir"
+    _git(source, "worktree", "add", "--detach", str(workdir), "HEAD")
+    _stub_build(monkeypatch)
+
+    module.FastAPISecurityMigrationTask().prepare(workdir)
+    (workdir / ".venv" / "lib").mkdir()
+    (workdir / ".venv" / "lib" / "site.py").write_text("")
+
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"], cwd=workdir, capture_output=True, text=True,
+    )
+    assert status.stdout == ""
+    ok, reason = module.FastAPISecurityMigrationTask().check_correctness("", str(workdir))
+    assert not ok and reason == "No source changes"
+
+
+def test_failed_venv_build_leaves_no_half_built_venv(tmp_path, monkeypatch):
+    def failing_run(command, **kwargs):
+        (Path(kwargs["env"]["UV_PROJECT_ENVIRONMENT"]) / "bin").mkdir(parents=True)
+        return subprocess.CompletedProcess(command, 1, stdout="", stderr="no network")
+
+    monkeypatch.setattr(module.subprocess, "run", failing_run)
+    with pytest.raises(RuntimeError, match="no network"):
+        module.build_agent_venv(tmp_path)
+    assert not (tmp_path / ".venv").exists()

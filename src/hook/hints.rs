@@ -146,6 +146,13 @@ pub(super) fn reason(rule: &str, hint: Hint) -> String {
     }
 }
 
+/// The shell boundary in one line, shared by the tilth denial hints.
+const SHELL_MAP: &str = "Shell cannot cat/head/tail/sed/awk/wc/grep/rg/git grep repo files, \
+    redirect to files, or run heredocs and inline interpreters (`python -c`, `node -e`). \
+    Allowed: tilth_read and tilth_search for content; tilth_write to create a script or fixture \
+    in a unique scratch dir (`mktemp -d`), then run that file with Bash; ls/find; git history \
+    and review; tests; builds.";
+
 /// Formats a denial reason with tilth tool calls for the rule's kind.
 fn tilth_reason(rule: &str, kind: Kind) -> String {
     let read = "mcp__tilth__tilth_read(paths:[\"<path>\"], cwd:\"<checkout>\")";
@@ -158,18 +165,21 @@ fn tilth_reason(rule: &str, kind: Kind) -> String {
              A large file comes back as a signature outline, with the count still in the header.\n\n\
              Run instead:\n  {read}\n\n\
              Use `ls` or `find` for file listings. \
-             Filters on command output (`git log | wc -l`) still run."
+             Filters on command output (`git log | wc -l`) still run.\n\n\
+             {SHELL_MAP}"
         ),
         Kind::Read => format!(
             "Blocked: shell `{rule}` reads file content. Use tilth_read, not a shell reader.\n\n\
              Run instead:\n  {read}\n\n\
              Append #start-end or #symbol to a path to read one section. \
-             Filters on command output (`git log | head`) still run."
+             Filters on command output (`git log | head`) still run.\n\n\
+             {SHELL_MAP}"
         ),
         Kind::Search => format!(
             "Blocked: shell `{rule}` searches files. Use tilth_search, not a raw search tool.\n\n\
              Run instead:\n  {search}\n\n\
-             Filters on command output (`git log | grep fix`) still run."
+             Filters on command output (`git log | grep fix`) still run.\n\n\
+             {SHELL_MAP}"
         ),
         Kind::Write => write_reason(rule, write),
         Kind::Generic => format!(
@@ -186,7 +196,9 @@ fn write_reason(rule: &str, write: &str) -> String {
         format!(
             "Blocked: shell `{rule}` runs inline code. Pick by purpose.\n\n\
              To compute or check something: run the project's own test or build command, \
-             or inspect with tilth_search or tilth_read. Do not script it.\n\
+             or inspect with tilth_search or tilth_read.\n\
+             To run a script: create it with tilth_write in a unique scratch dir (`mktemp -d`, \
+             not a fixed /tmp name), then run that file with Bash.\n\
              To write a new file:\n  {create}\n\
              To change an existing file, use the [path#TAG] you already have from tilth_read \
              or tilth_search (read only if you have none):\n  {write}"

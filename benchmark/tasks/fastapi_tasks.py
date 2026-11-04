@@ -56,7 +56,7 @@ class FastAPIRequestValidationTask(Task):
                 "get_request_handler",
                 "solve_dependencies",
                 "RequestValidationError",
-                "async def app|async function app|inner async function app|async app(",
+                "async def app|async function app|inner async function app|async app(|closure app(|coroutine app(|function app(",
             ],
         )
 

@@ -19,7 +19,7 @@ $ tilth src/auth.ts
   [132-180] fn authorize(user, resource)
 ```
 
-Small files come back whole. Large files get an outline. Drill in with `--section`:
+Small files come back whole. Large files get an outline. Drill in with `--section`. A line range that ends inside a function grows to the function's end. If that does not fit `--budget`, the range stops before the function and names the next `tilth` call:
 
 ```bash
 tilth src/auth.ts --section 44-89
@@ -230,6 +230,41 @@ To remove the guard, delete the tilth entry (the handler whose command ends in `
 
 Or call it from bash — see [AGENTS.md](./AGENTS.md) for the MCP agent prompt, or [skills/SKILL.md](./skills/SKILL.md) for a Claude Code skill prompt.
 
+### Launch with the tilth preamble
+
+`tilth claude` and `tilth codex` start the harness with the tilth preamble: a short system prompt that tells the agent to use the tilth tools.
+
+```bash
+tilth claude -p "find where handleAuth is defined"   # runs: claude --system-prompt-file <F> -p ...
+tilth codex exec "summarize src/auth.ts"             # runs: codex -c model_instructions_file="<F>" exec ...
+```
+
+- The tilth preamble replaces the built-in system prompt of the harness.
+- The launcher does not register the tilth MCP server. The preamble sends file reads and edits to the tilth tools, so run `tilth install claude-code` or `tilth install codex` first (see [MCP server](#mcp-server)).
+- `<F>` is `$XDG_CACHE_HOME/tilth/preamble-<hash>.md`, or `~/.cache/tilth/` when `XDG_CACHE_HOME` is unset. The launcher writes only in this directory. It writes no host config (`~/.claude.json`, `~/.claude/settings.json`, `~/.codex/config.toml`).
+- On Unix, the launcher refuses a `tilth` cache directory that is a symlink, that another user owns, or that all users can write.
+- Your own `--system-prompt` or `--system-prompt-file` (claude), or a `model_instructions_file` override (codex), wins. The launcher then adds nothing. Arguments after `--` are text, so they do not count.
+- All arguments pass through unchanged, including `--` and `--help`.
+- Run management subcommands (`claude mcp ...`, `codex login`) with the harness directly. The launcher adds the tilth preamble to every call.
+- `tilth claude` and `tilth codex` run the launcher. They do not search for that word. To search for the word, run `tilth -- claude` or use `tilth_search`.
+- `tilth codex` exits 1 when the cache path is not valid UTF-8, because TOML cannot hold it.
+- `claude` or `codex` must be the first argument to tilth. `tilth --json claude` is a usage error (exit 2).
+- On Windows, the launcher needs a native `claude.exe` or `codex.exe` on `PATH`. It does not run `.cmd` shims, such as the ones npm creates.
+
+### Use the tilth preamble in another harness
+
+`tilth preamble` prints the tilth preamble. `tilth preamble --path` writes it to the cache file and prints the path of that file.
+
+```bash
+tilth preamble >> AGENTS.md                               # add it to project instructions
+claude --append-system-prompt "$(tilth preamble)"         # add it after the built-in Claude Code prompt
+<harness> --system-prompt-file "$(tilth preamble --path)" # give the file to a harness that takes one
+```
+
+- The text is the same text that `tilth claude` and `tilth codex` use.
+- `--path` uses the same cache file and the same directory checks as the launcher.
+- The preamble tells the agent to use the tilth tools, so register the tilth MCP server in that harness too (see [MCP server](#mcp-server)).
+
 ### Smaller models
 
 Smaller models (e.g. Haiku) may ignore tilth tools in favor of built-in Bash/Grep. To force tilth adoption, disable the overlapping built-in tools:
@@ -318,7 +353,7 @@ Inspired by [The Harness Problem](https://blog.can.ac/2026/02/12/the-harness-pro
 
 ```bash
 tilth <path>                      # read file (outline if large)
-tilth <path> --section 45-89      # exact line range
+tilth <path> --section 45-89      # line range, grown to the end of a cut function
 tilth <path> --section "## Foo"   # markdown heading
 tilth <path> --full               # force full content
 tilth <symbol> --scope <dir>      # definitions + usages

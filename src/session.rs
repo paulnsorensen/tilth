@@ -124,9 +124,6 @@ pub struct Session {
     baseline_tokens: AtomicU64,
     saved_tokens: AtomicU64,
     batch_nudges: Mutex<BatchNudgeState>,
-    /// Paths whose latest read was clipped by `budget`. The snapshot counts the
-    /// clipped lines as seen, but the caller never received them.
-    clipped_reads: Mutex<std::collections::HashSet<std::path::PathBuf>>,
 }
 
 // Every lock site in this file recovers from poisoning via
@@ -149,28 +146,7 @@ impl Session {
             baseline_tokens: AtomicU64::new(0),
             saved_tokens: AtomicU64::new(0),
             batch_nudges: Mutex::new(BatchNudgeState::default()),
-            clipped_reads: Mutex::new(std::collections::HashSet::new()),
         }
-    }
-
-    /// Note whether the latest read of `path` was clipped by its budget.
-    pub fn set_read_clipped(&self, path: &Path, clipped: bool) {
-        let mut set = self
-            .clipped_reads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if clipped {
-            set.insert(path.to_path_buf());
-        } else {
-            set.remove(path);
-        }
-    }
-
-    pub fn read_was_clipped(&self, path: &Path) -> bool {
-        self.clipped_reads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(path)
     }
 
     /// Lock the per-session snapshot store. Callers hold the guard for the

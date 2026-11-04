@@ -313,7 +313,8 @@ def test_second_run_on_a_held_budget_is_refused_before_any_spend(bench, capsys, 
 # --- AC-15/AC-17 preflight through main ---
 
 
-def test_missing_oauth_token_refuses_before_any_cell(bench, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
+def test_without_token_a_token_status_refuses_before_any_cell(bench, monkeypatch: pytest.MonkeyPatch,
+                                                               capsys) -> None:
     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
     bench.runner(lambda _stream: pytest.fail("model call started"))
 

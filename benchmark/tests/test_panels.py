@@ -1,8 +1,10 @@
 """Pre-registered panels: schema, completeness, admission, tiers, stratified split, stamp, lock, registration."""
 
 import json
+import shutil
 import socket
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -10,6 +12,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import baselines
+import chains
 import config
 import external
 import external.data
@@ -17,6 +20,7 @@ import external.featurebench
 import external.swebench_ml
 import panels
 import run
+import tasks
 from panel_support import (
     CHEAP, COMMITTED_PANEL, COMPLETE, EXPECTED_DEV, EXPECTED_TEST, FALLBACKS, FB_ALGORITHMS, FB_IDS, FB_NULLSPACE,
     FB_REGRESSION, GEPA_ROWS, GO_FALLBACK, GO_SLOT, RENDER, RUST_FALLBACK, RUST_SLOT, load, member, panel_run, read,
@@ -24,6 +28,8 @@ from panel_support import (
 )
 
 GEPA_V2_PANEL = Path(__file__).parent.parent / "panels" / "gepa-v2.json"
+GEPA_V3_LONG_PANEL = Path(__file__).parent.parent / "panels" / "gepa-v3-long-2.json"
+GEPA_V3_LONG_3_PANEL = Path(__file__).parent.parent / "panels" / "gepa-v3-long-3.json"
 STAMP_FIELDS = ("panel_name", "panel_split_digest", "panel_split")
 REDACTED_KEYS = {"instance_id", "repo", "base_commit", "language"}
 GRADER_KEYS = {"patch", "test_patch", "FAIL_TO_PASS", "PASS_TO_PASS", "problem_statement"}
@@ -692,3 +698,84 @@ def test_committed_gepa_v2_panel_loads(store: Path) -> None:
     assert panel.dev and panel.test
     assignment = panels.stratify(data["members"], data["split_seed"])
     assert all(entry["split"] == assignment[entry["id"]] for entry in data["members"])
+
+
+def test_committed_gepa_v3_long_panel_loads(store: Path) -> None:
+    data = read(GEPA_V3_LONG_PANEL)
+    assert data["version"] == 2
+    languages = {entry["id"]: entry["language"] for entry in data["members"]}
+    panel = load(GEPA_V3_LONG_PANEL, store, rows=lambda member_id: {"language": languages[member_id]})
+
+    assert len(panel.members) == 18
+    assert not {"sharkdp__bat-1892", "chain:gin-edit-7"} & {member.id for member in panel.members}
+    assert panel.cheap == ()
+    assert panel.dev and panel.test
+    assignment = panels.stratify(data["members"], data["split_seed"])
+    assert all(entry["split"] == assignment[entry["id"]] for entry in data["members"])
+    assert set(panel.dev) == {i for i, s in assignment.items() if s == "dev"}
+    assert set(panel.test) == {i for i, s in assignment.items() if s == "test"}
+
+
+@pytest.mark.parametrize("chain_id", ["express-edit-6"])
+def test_new_gepa_v3_long_chains_compose_and_sit_in_the_panel(chain_id: str) -> None:
+    chain = chains.CHAINS[chain_id]
+
+    members = chains.parse_chain(chain.id, chain.members, tasks.TASKS)
+
+    assert 5 <= len(members) <= 7
+    assert members[-1].capability == "fix"
+    assert f"chain:{chain_id}" in {entry["id"] for entry in read(GEPA_V3_LONG_PANEL)["members"]}
+
+
+def test_gepa_v3_long_3_swaps_only_the_two_false_negative_chains(store: Path) -> None:
+    old, new = read(GEPA_V3_LONG_PANEL), read(GEPA_V3_LONG_3_PANEL)
+    languages = {entry["id"]: entry["language"] for entry in new["members"]}
+
+    panel = load(GEPA_V3_LONG_3_PANEL, store, rows=lambda member_id: {"language": languages[member_id]})
+
+    swapped = {"chain:rg-edit-7": "chain:rg-edit-6", "chain:fastapi-edit-5": "chain:fastapi-edit-4"}
+    expected = [{**entry, "id": swapped.get(entry["id"], entry["id"])} for entry in old["members"]]
+    assert new["members"] == expected
+    assert new["split_seed"] == old["split_seed"]
+    assert (len(panel.dev), len(panel.test)) == (10, 8)
+    reached = {name for member in panel.members if member.family == "chain"
+               for name in chains.CHAINS[member.id.removeprefix(chains.PREFIX)].members}
+    assert not {"grok_rg_matcher", "fastapi_request_validation"} & reached
+    assert chains.CHAINS["rg-edit-6"].members == tuple(
+        name for name in chains.CHAINS["rg-edit-7"].members if name != "grok_rg_matcher")
+    assert chains.CHAINS["fastapi-edit-4"].members == tuple(
+        name for name in chains.CHAINS["fastapi-edit-5"].members if name != "fastapi_request_validation")
+
+
+@pytest.mark.parametrize("task_name", ["rg_edit_flow_migration", "fastapi_edit_security_raise_on_missing"])
+def test_long_edit_tasks_get_a_loaded_host_timeout(task_name: str) -> None:
+    task = tasks.TASKS[task_name]
+
+    assert run._task_timeout(task) == 900 > run.CELL_TIMEOUT_S
+
+def test_a_task_in_a_dev_chain_and_in_test_is_refused() -> None:
+    leaking = [
+        panels.Member("chain:express-edit-6", "chain", "javascript", "dev"),
+        panels.Member("express_edit_example_start", "local", "javascript", "test"),
+    ]
+
+    with pytest.raises(panels.PanelError, match="express_edit_example_start"):
+        panels._check_no_shared_task(leaking)
+    panels._check_no_shared_task([replace(entry, split="test") for entry in leaking])
+
+
+def test_long_pool_ids_hold_the_controls_and_stay_out_of_the_package_digest(tmp_path: Path, monkeypatch) -> None:
+    controls = {"tokio-rs__tokio-4867", "burntsushi__ripgrep-2209", "caddyserver__caddy-6350",
+                "hashicorp__terraform-35611", "axios__axios-5085", "uutils__coreutils-6682"}
+    assert controls <= panels.long_pool_ids()
+    assert not controls & set(external.swebench_ml.GEPA_V2_CANDIDATES)
+    assert panels.LONG_POOL_FILE.suffix != ".py"
+
+    package = tmp_path / "external"
+    shutil.copytree(external.task.PACKAGE_DIR, package, ignore=shutil.ignore_patterns("__pycache__"))
+    monkeypatch.setattr(external.task, "PACKAGE_DIR", package)
+    before = external.task.package_digest()
+    pool_file = package / "long_pool_candidates.json"
+    pool_file.write_text(pool_file.read_text().replace("tokio-rs__tokio-4867", "tokio-rs__tokio-0000"))
+    assert external.task.package_digest() == before
+    assert panels.long_pool_ids(pool_file) != panels.long_pool_ids()
