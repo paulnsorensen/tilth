@@ -151,7 +151,7 @@ fn replay_session_chain(
     Some((applied.text, applied.normalized_swap))
 }
 
-/// seenLines gate for the no-drift path: reject an edit anchored on a line the
+/// seenLines gate for the drift path: reject an edit anchored on a line the
 /// producer never displayed under this tag. An empty `seen_lines` set rejects
 /// every source anchor because the producer displayed no source lines.
 ///
@@ -159,8 +159,18 @@ fn replay_session_chain(
 /// by one line (the model saw part of the text it is replacing). Line, insert,
 /// and block ops stay strict — every anchored line must have been displayed.
 pub fn check_seen_lines(snapshot: &Snapshot, path: &Path, ops: &[Op]) -> Result<(), MismatchError> {
-    check_text_swap_overlap(snapshot, path, ops)?;
+    check_text_swap_overlap(snapshot, path, ops, ExactSwap::Gated)?;
     check_strict_anchors(snapshot, path, ops)
+}
+
+/// Whether a single `replace_text` whose `old` matches byte-exactly once may
+/// skip the overlap check. Only the no-drift egress ([`gated_apply`]) exempts
+/// it: there the matched text is the text the edit applies to, so the exact
+/// match proves the agent holds it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExactSwap {
+    Exempt,
+    Gated,
 }
 
 // Text swaps: resolve the span against the snapshot and require one seen
@@ -171,12 +181,17 @@ fn check_text_swap_overlap(
     snapshot: &Snapshot,
     path: &Path,
     ops: &[Op],
+    exact: ExactSwap,
 ) -> Result<(), MismatchError> {
     let lines = NewlineIndex::new(&snapshot.text);
     for op in ops {
         if let Op::TextSwap { old, .. } = op {
-            if let Ok((start, end, _)) = match_text_span(&snapshot.text, old) {
-                check_span_seen(snapshot, &lines, start, end)?;
+            if let Ok((start, end, normalized)) = match_text_span(&snapshot.text, old) {
+                // A whitespace-normalized match does not prove the agent holds
+                // the exact text, so it stays gated even when exact is exempt.
+                if normalized || exact == ExactSwap::Gated {
+                    check_span_seen(snapshot, &lines, start, end)?;
+                }
             }
         }
         // all/count: every occurrence must overlap a seen line, not just one.
@@ -408,12 +423,18 @@ pub enum EditError {
 /// entrypoint PR2 wires; raw `apply_ops` stays module-internal so no caller can
 /// apply edits while skipping the gate.
 ///
+/// The gate matches [`check_seen_lines`] with one exemption: a single
+/// `replace_text` (no `all`/`count`) whose `old` matches byte-exactly once in
+/// `snapshot.text` skips the overlap check. `all`/`count`, `rewrite`, line,
+/// insert, and block ops stay gated.
+///
 /// # Errors
 ///
 /// Returns [`EditError::Mismatch`] when the provenance gate rejects the edit,
 /// or [`EditError::Apply`] when applying the ops fails.
 pub fn gated_apply(snapshot: &Snapshot, path: &Path, ops: &[Op]) -> Result<ApplyResult, EditError> {
-    check_seen_lines(snapshot, path, ops)?;
+    check_text_swap_overlap(snapshot, path, ops, ExactSwap::Exempt)?;
+    check_strict_anchors(snapshot, path, ops)?;
     Ok(apply_ops(path, &snapshot.text, ops)?)
 }
 
@@ -875,17 +896,15 @@ mod tests {
             "the overlapping edit must land"
         );
 
-        // Span 898-899 shares no seen line → rejected, naming the displayed range
-        // and the smallest covering re-read.
+        // Span 898-899 shares no seen line → the drift-path gate rejects it,
+        // naming the displayed range and the smallest covering re-read.
         let rej_ops = vec![Op::TextSwap {
             old: "line898\nline899".into(),
             new: "X".into(),
         }];
-        let err = gated_apply(&snap, &p(), &rej_ops).unwrap_err();
-        let EditError::Mismatch(m) = err else {
-            panic!("expected mismatch, got {err:?}");
-        };
-        let s = m.to_string();
+        let s = check_seen_lines(&snap, &p(), &rej_ops)
+            .unwrap_err()
+            .to_string();
         assert!(s.contains("displayed: 886-897"), "{s}");
         assert!(s.contains("Re-read big.rs#886-899"), "{s}");
     }
@@ -1121,13 +1140,85 @@ mod tests {
             old: "bar".into(),
             new: "baz".into(),
         }];
-        let err = gated_apply(&snap, &p(), &ops).unwrap_err();
-        let EditError::Mismatch(MismatchError::UnseenAnchor { reads, .. }) = err else {
+        let err = check_seen_lines(&snap, &p(), &ops).unwrap_err();
+        let MismatchError::UnseenAnchor { reads, .. } = err else {
             panic!("expected UnseenAnchor, got {err:?}");
         };
         assert!(
             reads.is_empty(),
             "a single swap keeps the bounded re-read hint"
+        );
+    }
+
+    fn text_swap(old: &str, new: &str) -> Vec<Op> {
+        vec![Op::TextSwap {
+            old: old.into(),
+            new: new.into(),
+        }]
+    }
+
+    #[test]
+    fn gated_apply_exempts_an_exact_unique_replace_text_on_an_unseen_line() {
+        let snap = snap_with_seen("foo\nmid\nbar\n", &[1]);
+        let r = gated_apply(&snap, &p(), &text_swap("bar", "baz"))
+            .expect("an exact unique match applies without a displayed line");
+        assert_eq!(r.text, "foo\nmid\nbaz\n");
+        assert!(!r.normalized_swap);
+    }
+
+    #[test]
+    fn gated_apply_keeps_the_gate_for_a_normalized_replace_text_on_an_unseen_line() {
+        let snap = snap_with_seen("foo\nmid\nlet  x = 1;\n", &[1]);
+        let err = gated_apply(&snap, &p(), &text_swap("let x = 1;", "let x = 2;")).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EditError::Mismatch(MismatchError::UnseenAnchor { line: 3, .. })
+            ),
+            "a whitespace-normalized match must stay gated: {err:?}"
+        );
+    }
+
+    #[test]
+    fn gated_apply_rejects_an_ambiguous_replace_text() {
+        let snap = snap_with_seen("foo\nmid\nfoo\n", &[2]);
+        let err = gated_apply(&snap, &p(), &text_swap("foo", "bar")).unwrap_err();
+        assert!(
+            matches!(err, EditError::Apply(ApplyError::TextAmbiguous { .. })),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn gated_apply_keeps_the_gate_for_count_one_on_an_unseen_line() {
+        let snap = snap_with_seen("foo\nmid\nbar\n", &[1]);
+        let ops = vec![Op::TextSwapAll {
+            old: "bar".into(),
+            new: "baz".into(),
+            count: Some(1),
+        }];
+        let err = gated_apply(&snap, &p(), &ops).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EditError::Mismatch(MismatchError::UnseenAnchor { line: 3, .. })
+            ),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn gated_apply_keeps_the_gate_for_a_line_op_beside_an_exempt_replace_text() {
+        let snap = snap_with_seen("foo\nmid\nbar\n", &[1]);
+        let mut ops = text_swap("bar", "baz");
+        ops.extend(swap(2, "x"));
+        let err = gated_apply(&snap, &p(), &ops).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EditError::Mismatch(MismatchError::UnseenAnchor { line: 2, .. })
+            ),
+            "{err:?}"
         );
     }
 

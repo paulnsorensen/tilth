@@ -222,7 +222,7 @@ class TestFacetEditable(SearchFixture):
         original = target.read_text()
         rejected = self.write({
             "path": "tests/test_alpha.py", "tag": tag,
-            "ops": [{"op": "replace_text", "old": "unrelated_tail", "new": "x"}]})
+            "ops": [{"op": "replace", "start": 6, "end": 6, "content": "    return x"}]})
         self.assertTrue(harness.tool_is_error(rejected), harness.tool_result_text(rejected))
         self.assertEqual(target.read_text(), original)
         written = self.write({
