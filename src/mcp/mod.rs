@@ -554,6 +554,11 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
+        let held_read = services.session().snapshots().head(root.join("a.rs"));
+        assert!(
+            held_read.is_some_and(|snap| snap.seen_lines.contains(&1)),
+            "the timed-out read must record line 1, or the check below proves nothing"
+        );
         let delivered = run_tool_with_timeout(
             &services,
             "tilth_read",
