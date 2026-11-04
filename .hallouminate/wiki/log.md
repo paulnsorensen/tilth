@@ -113,6 +113,8 @@
 
 2026-10-16 · small-followups-kind-hints · merged · adr/tilth-search-v2-roadmap-002.md; specs/fuzzy-suggest-only.md; specs/tilth-search-revival.md; specs/tilth-api-adoption.md · Point footnote 4 at PR #309 instead of an untracked spec. Record the removed kind hints and the fuzzy_path doc fix. Record #175 as closed.
 
+2026-10-25 · wiki-harvest-auto/tilth-20261025 · merged · benchmark-task-inventory.md · Record the 61-task registry at 50f3e46, including the three migration tasks (#369, #370, #371) as held-out replays, and update the per-repo, capability, and grading counts.
+
 - 2026-10-29 · 739cdeebd9b488f0 · new-page · benchmark-gepa-v3-evolve.md · gepa-v3 evolve campaign state: panel, cost per correct at parity, trajectory diagnosis, spend, ideas
 - 2026-10-29 · 739cdeebd9b488f0 · merged · benchmark-gepa-invariants.md · proposer repair, directives, deep diagnosis, auto-fmt, test grants, integrity stage, CLI pin, chain digest scope
 - 2026-10-29 · 739cdeebd9b488f0 · merged · benchmark-gepa-gotchas.md · gepa-v3 rounds: CLI auto-update drift, hook-hint drift, split lock rename, wrapper pid, stale cargo binaries, finish reserve, text-rule test guards
@@ -124,3 +126,4 @@
 - 2026-11-02 · stock-ab-2026-11-02 · merged · benchmark-harness-gotchas.md · `mise prune` deletes an ad-hoc pinned Claude CLI; `/tmp` aging corrupts the rg-flow grader cache. Written directly; no ground probes ran.
 - 2026-11-04 · stock-ab-diagnosis-2026-11-04 · merged · benchmark-gepa-v3-evolve.md · Replace `num_turns` with deduplicated API calls (18.5 against 18.9–20.1), add the context split, and resolve the conflict note: dependent turns are now the minor cause.
 - 2026-11-04 · stock-ab-diagnosis-2026-11-04 · created · stock-ab-trajectory-diagnosis.md; index.md · Chain-only gap, six trajectory causes, ranked levers, stream dedup rules. Written through hallouminate `add_markdown`.
+- 2026-11-04 · pr-395-cure · merged · benchmark-task-inventory.md · Merge main into #395. Re-check the registry at 863464bb: it is the same as at 50f3e46. State that the 61-task snapshot includes the three migration tasks.

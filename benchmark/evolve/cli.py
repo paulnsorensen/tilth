@@ -27,8 +27,10 @@ if not __package__:
 
 import auth  # noqa: E402
 import baselines  # noqa: E402
+import config  # noqa: E402
 import panels  # noqa: E402
 import run  # noqa: E402
+import tmp_aging  # noqa: E402
 from config import REPO_ROOT  # noqa: E402
 from evolve import deepdiag, diagnosis, directives, failures  # noqa: E402
 from evolve.candidate import SeedError, read_seed  # noqa: E402
@@ -214,6 +216,10 @@ def build(argv: list[str] | None = None, *,
     try:
         print(run.require_pinned_cli(allow_drift=args.allow_cli_drift))
     except run.CliPinError as error:
+        return _error(str(error))
+    try:
+        tmp_aging.require_exclusion(config.REPOS_DIR.parent)
+    except tmp_aging.TmpAgingError as error:
         return _error(str(error))
     if args.deep_diagnosis_max < 0 or not math.isfinite(args.deep_diagnosis_timeout) \
             or args.deep_diagnosis_timeout <= 0:

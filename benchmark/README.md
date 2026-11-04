@@ -16,6 +16,7 @@ The runner explicitly disables discovered host and project skills through Codex 
 Install Python 3.12+ and a tilth binary.
 For pinned repository tasks, run `python benchmark/fixtures/setup_repos.py`.
 For synthetic tasks, run `python benchmark/fixtures/setup.py`.
+On a systemd host, exclude `/tmp/tilth_bench` from `/tmp` age cleanup once (see [Running benchmarks](#running-benchmarks)).
 Set `TILTH_BIN` to select a specific binary.
 The runner preserves saved Codex authentication and `CODEX_HOME`.
 It ignores user config and rules and disables skill search, plugins, hooks, apps, and multi-agent support.
@@ -512,6 +513,9 @@ All selected modes use the same system prompt, model, and per-cell budget cap (d
 **Setup:**
 
 ```bash
+# systemd hosts, once: keep /tmp age cleanup out of the benchmark tree
+echo 'x /tmp/tilth_bench' | sudo tee /etc/tmpfiles.d/tilth-bench.conf
+
 # Clone repos at pinned commits (~100MB total)
 python benchmark/fixtures/setup_repos.py
 
@@ -528,6 +532,13 @@ python benchmark/build_variants.py /tmp/tilth-benchmark/experiment.json
 # Install the analysis stats deps used by analyze.py / paired.py / stats.py
 pip install -r benchmark/requirements.txt
 ```
+
+The benchmark keeps repo clones and cargo build caches under `/tmp/tilth_bench`.
+Stock Ubuntu ships `q /tmp 1777 root root 10d`, so `systemd-tmpfiles-clean` deletes files there after 10 days.
+It keeps the directories and cargo fingerprints, so cargo skips the rebuild and a grader build fails on a missing file.
+The `x` line excludes the path and its contents from age cleanup (tmpfiles.d(5)). `X` excludes only the directory, so it does not help.
+A paid `run.py` run reads `systemd-tmpfiles --cat-config` and refuses to start without an `x` rule that covers `/tmp/tilth_bench`.
+The check does not run on a host without `systemd-tmpfiles` or on a `--dry-run`, and it does not change any run key.
 
 **Run:**
 
