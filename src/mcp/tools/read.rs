@@ -1203,8 +1203,8 @@ fn unchanged_reread_stub(
 /// spec, so no caller re-parses to recover the same span. `signature` and
 /// `stripped` are whole-file shape modes honored only for `PathSuffix::None`
 /// (any explicit suffix wins); they are mutually exclusive — `signature` takes
-/// precedence if both happen to be set. The returned spec for signature/stripped
-/// views is `Whole`, but those views never record (see
+/// precedence if both happen to be set. The returned spec for a whole-file
+/// signature/stripped view is `Whole`, but those views never record (see
 /// [`should_record_edit_snapshot`]).
 pub(crate) fn read_single_with_suffix(
     path: &Path,
@@ -1268,12 +1268,14 @@ pub(crate) fn read_single_with_suffix(
 }
 
 /// Whether an edit-mode read of `path` with `suffix` should record a
-/// whole-file-tag snapshot. Returns `false`
-/// for signature and stripped views (non-editable, no tag emitted), and an
-/// outlined whole-file
-/// view (no numbered lines shown — recording whole-file seen-lines would poison
-/// the snapshot for a later range read and defeat the unseen-anchor gate). The
-/// single predicate the three `tool_read` dispatch sites share.
+/// whole-file-tag snapshot. Any explicit suffix renders numbered lines under
+/// the tag, also when `signature` or `stripped` is set (the suffix wins, see
+/// [`read_single_with_suffix`]), so it records. A whole-file read records
+/// nothing for the signature and stripped views (non-editable, no tag
+/// emitted) or an outlined view (no numbered lines shown — recording
+/// whole-file seen-lines would poison the snapshot for a later range read and
+/// defeat the unseen-anchor gate). The single predicate the three `tool_read`
+/// dispatch sites share.
 fn should_record_edit_snapshot(
     path: &Path,
     suffix: &PathSuffix,
@@ -1281,13 +1283,13 @@ fn should_record_edit_snapshot(
     stripped: bool,
     force_full: bool,
 ) -> bool {
+    if !matches!(suffix, PathSuffix::None) {
+        return true;
+    }
     if signature || stripped {
         return false;
     }
-    if matches!(suffix, PathSuffix::None) && !force_full && crate::read::would_outline(path) {
-        return false;
-    }
-    true
+    force_full || !crate::read::would_outline(path)
 }
 
 fn find_symbol_entry(entries: &[crate::types::OutlineEntry], name: &str) -> Option<(usize, usize)> {
@@ -1721,6 +1723,52 @@ mod tests {
             ),
             Some((3, 5)),
             "symbol lookup must reach definitions below the shallow display outline"
+        );
+    }
+
+    #[test]
+    fn edit_snapshot_records_every_section_and_no_whole_file_shape_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let small = dir.path().join("small.rs");
+        std::fs::write(&small, "fn one() {}\nfn two() {}\n").unwrap();
+        let big = dir.path().join("big.rs");
+        std::fs::write(
+            &big,
+            "let big = \"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\";\n".repeat(3000),
+        )
+        .unwrap();
+        assert!(crate::read::would_outline(&big), "fixture must outline");
+
+        let range = PathSuffix::LineRange(1, 2);
+        let symbol = PathSuffix::Symbol("two".into());
+        let record = |path: &Path, suffix: &PathSuffix, signature, stripped, force_full| {
+            should_record_edit_snapshot(path, suffix, signature, stripped, force_full)
+        };
+        // An explicit suffix prints numbered lines whatever the shape mode.
+        for (path, suffix) in [(&small, &range), (&small, &symbol), (&big, &range)] {
+            assert!(record(path, suffix, false, false, false), "{suffix:?}");
+            assert!(
+                record(path, suffix, true, false, false),
+                "signature {suffix:?}"
+            );
+            assert!(
+                record(path, suffix, false, true, false),
+                "stripped {suffix:?}"
+            );
+        }
+        // A whole-file shape view prints no editable lines.
+        for path in [&small, &big] {
+            assert!(!record(path, &PathSuffix::None, true, false, false));
+            assert!(!record(path, &PathSuffix::None, false, true, false));
+        }
+        assert!(record(&small, &PathSuffix::None, false, false, false));
+        assert!(
+            !record(&big, &PathSuffix::None, false, false, false),
+            "outline view"
+        );
+        assert!(
+            record(&big, &PathSuffix::None, false, false, true),
+            "mode=full"
         );
     }
 

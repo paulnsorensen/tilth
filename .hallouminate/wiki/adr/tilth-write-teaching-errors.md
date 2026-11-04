@@ -191,7 +191,22 @@ Session 2026-08-02; spec at the durable corpus
 [^multi-match]: `src/edit/recovery.rs` (`merge_ranges`, `MAX_READ_RANGES`); `src/edit/mismatch.rs` (`unseen_message`). Decision: October 3, 2026, after three /age passes on `feat/edit-efficiency` that reproduced each rejected design against the built binary.
 
 
-### ADR-010: Seen lines persist per checkout across tilth processes [status: accepted]
+### ADR-010: Tag fill-in and exact-match exemption (amends ADR-004 and ADR-009) [status: accepted]
+
+- **Approval:** The user approved this guard change on 2026-11-04.
+- **Context:** A benchmark trajectory diagnosis (wiki page `stock-ab-trajectory-diagnosis.md`, commit `d615858a`, causes 5 and 8) found two costly rejections.
+  - Cause 8 was the most common write error, 111 times in 162 cells. A tagless `replace_text` or `rewrite` got `needs a tag; this session already displayed [path#TAG]`. The server knew the tag, so the retry only sent it back.
+  - Cause 5: a `replace_text` whose `old` matched exactly once got an unseen-line rejection. The exact match proves that the agent holds that text.
+- **Decision:**
+  1. Tag fill-in. A tagless section with `replace_text` or `rewrite` takes the live tag when this session holds a snapshot whose text equals the live file (`fill_live_tag` in `src/mcp/tools/write.rs`). The section then runs the tagged path, with the gate and the seen-line carry-forward. With no such snapshot, the rejection stays.
+  2. Exact-match exemption. On the no-drift path (`gated_apply` in `src/edit/recovery.rs`), a single `replace_text` (no `all`, no `count`) whose `old` matches byte-exactly once skips the overlap check.
+  3. These stay gated: `all`/`count`, `rewrite`, a whitespace-normalized match, line, insert, and block ops. The drift path (`check_seen_lines` in `recover_edit`, and `replay_session_chain`) does not change.
+- **Consequences:** The exemption marks only the lines that the edit wrote as seen. Lines next to the match stay unseen. Tests that used an exact `replace_text` to prove an unseen-line rejection now use line ops. The `tilth_write` description now limits "every match must be on shown lines" to `all`/`count` matches.
+- **Verification:** `tests/mcp_v2/test_write_tag_fill_exact_match.py` and the `gated_apply_*` unit tests in `src/edit/recovery.rs`.
+
+
+
+### ADR-011: Seen lines persist per checkout across tilth processes [status: accepted]
 
 - **Context:** The seen-lines gate kept its record only in the MCP server process. `claude --resume` starts a new `tilth --mcp` process, so the gate forgot earlier reads, although the agent still had their text and tags. In the stock A/B chain benchmark, each chain sub-task ran as a new `claude -p --resume` process. Sub-task 3 displayed `glue.rs` lines 11-300 and 310-360. The edit sub-task then wrote line 166 and got `displayed: 58, 1-15`. It re-read 352 lines in `mode=full` and retried. Rejections were 0.33-0.67 per chain cell and 0.07-0.14 per single-session cell.
 - **Decision:** This is a guard change. The user approved it on 2026-11-04.
@@ -212,4 +227,3 @@ Session 2026-08-02; spec at the durable corpus
 - **Verification:** `tests/mcp_v2/test_seen_persist.py` fails on `aec0efd4` (4 failures, 1 error) and passes with the change. Unit tests are in `src/edit/seen_store.rs`, `src/edit/snapshots.rs`, and `src/mcp/tools/write.rs`.[^seen-persist]
 
 [^seen-persist]: `src/edit/seen_store.rs`; `src/session.rs` (`persist_seen`, `persisted_seen`); `src/mcp/mod.rs` (`dispatch_tool`); `src/mcp/tools/write.rs` (`resolve_edit`, `carried_seen_lines`). Decision: November 4, 2026, from the stock A/B trajectory diagnosis, cause 3.
-

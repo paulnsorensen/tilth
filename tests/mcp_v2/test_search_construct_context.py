@@ -57,7 +57,7 @@ class SearchConstructContext(unittest.TestCase):
         source = ("def host():\n    marker_call(\n        first,\n        second,\n    )\n"
                   f"{filler(80)}    return last_line\n")
         request, _text, tag = self.search("big.py", source)
-        written = self.write(request, "big.py", tag, {"op": "replace_text", "old": "return last_line", "new": "return done"})
+        written = self.write(request, "big.py", tag, {"op": "replace", "start": 86, "end": 86, "content": "    return done"})
         self.assertTrue(harness.tool_is_error(written), harness.tool_result_text(written))
         self.assertEqual((self.root / "big.py").read_text(), source, "a refused edit must not write")
 
@@ -74,7 +74,7 @@ class SearchConstructContext(unittest.TestCase):
         source = f"def host():\n    marker_call(\n{arguments}    )\n{filler(80)}    return last_line\n"
         request, text, tag = self.search("wide.py", source)
         self.assertNotIn("arg_20", text)
-        written = self.write(request, "wide.py", tag, {"op": "replace_text", "old": "arg_20,", "new": "arg_x,"})
+        written = self.write(request, "wide.py", tag, {"op": "replace", "start": 23, "end": 23, "content": "        arg_x,"})
         self.assertTrue(harness.tool_is_error(written), harness.tool_result_text(written))
 
 

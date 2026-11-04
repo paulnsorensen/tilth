@@ -10,6 +10,7 @@
 //! through the seen-lines-gated apply / recover entrypoints, never raw
 //! `apply_ops`.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -177,6 +178,8 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
         }
     };
 
+    let section = fill_live_tag(section, path, session, &live);
+    let section: &Section = &section;
     let (new_text, file_op, normalized, written) =
         resolve_edit(section, path, session, &live, ctx.cwd)?;
 
@@ -256,7 +259,8 @@ fn text_unmatched_message(path: &Path, tag: u16, preview: &str) -> String {
 /// Enrich a `replace_text` no-match into decision 4's provenance-teaching error;
 /// every other edit failure keeps its own already-actionable message. The tag is
 /// the section's whole-file tag — always present when a `replace_text` reaches
-/// the matcher, since a tagless text swap is rejected upstream.
+/// the matcher, since a tagless text swap either takes the live tag in
+/// [`fill_live_tag`] or is rejected in [`resolve_edit`].
 fn map_edit_error(e: EditError, path: &Path, tag: u16) -> TilthError {
     if let EditError::Apply(ApplyError::TextUnmatched { preview }) = &e {
         return TilthError::EditRejected(text_unmatched_message(path, tag, preview));
@@ -269,12 +273,50 @@ fn map_edit_error(e: EditError, path: &Path, tag: u16) -> TilthError {
 /// after a 3-way merge, which cannot say where this section's lines landed.
 type Resolved = (String, Option<FileOp>, bool, Option<Written>);
 
+fn has_text_op(ops: &[Op]) -> bool {
+    ops.iter().any(|op| {
+        matches!(
+            op,
+            Op::TextSwap { .. } | Op::TextSwapAll { .. } | Op::Rewrite { .. }
+        )
+    })
+}
+
+/// Give a tagless `replace_text`/`rewrite` section the live tag when this
+/// session already displayed the live content. The server holds that tag, so
+/// a rejection that asks the agent to resend it only costs a round trip. The
+/// filled section then takes the tagged path, seen-lines gate included. Every
+/// other section passes through unchanged.
+fn fill_live_tag<'a>(
+    section: &'a Section,
+    path: &Path,
+    session: &Session,
+    live: &str,
+) -> Cow<'a, Section> {
+    if section.tag.is_some() || !has_text_op(&section.ops) {
+        return Cow::Borrowed(section);
+    }
+    let key = crate::edit::normalize_path_key(path);
+    let live_tag = compute_file_hash(live);
+    let Some(snap) = session.snapshots().by_tag(&key, live_tag) else {
+        return Cow::Borrowed(section);
+    };
+    if snap.text != live {
+        return Cow::Borrowed(section);
+    }
+    let mut section = section.clone();
+    section.tag = Some(live_tag);
+    Cow::Owned(section)
+}
+
 /// Verify the section's tag against live content and produce the edit. On a
 /// matched tag with intact content, the seen-lines-gated apply runs; on a
 /// drifted (or tag-collided) tag, [`recover_edit`] runs; a tagless section
-/// seeds/edits against live with synthetic empty provenance. On a matched tag,
-/// lines that an earlier tilth process in the checkout of `cwd` displayed for
-/// the exact live content also pass the gate.
+/// seeds/edits against live with synthetic empty provenance. A tagless text
+/// edit reaches this point only when [`fill_live_tag`] found no snapshot of
+/// the live content, so it is rejected. On a matched tag, lines that an
+/// earlier tilth process in the checkout of `cwd` displayed for the exact live
+/// content also pass the gate.
 fn resolve_edit(
     section: &Section,
     path: &Path,
@@ -288,34 +330,13 @@ fn resolve_edit(
     match section.tag {
         // Tagless [path]: seed a new file or edit live with no source-line provenance.
         None => {
-            if section.ops.iter().any(|op| {
-                matches!(
-                    op,
-                    Op::TextSwap { .. } | Op::TextSwapAll { .. } | Op::Rewrite { .. }
-                )
-            }) {
-                // Naming only the requirement sent agents into a full re-read.
-                // A section read carries the whole-file tag, so the cheap route
-                // has to be part of the rejection. When this session already
-                // displayed the live content, hand back its tag and shown lines.
-                if let Some(snap) = session.snapshots().by_tag(&key, live_tag) {
-                    if snap.text == live {
-                        return Err(TilthError::EditRejected(format!(
-                            "replace_text/rewrite needs a tag; this session already displayed {}. \
-                             Retry with tag \"{live_tag:04X}\" and edit only displayed lines ({}); \
-                             for other lines read {}#START-END first.",
-                            format_header(&crate::format::display_path(path), live_tag),
-                            crate::edit::mismatch::format_ranges(&snap.seen_ranges(), 1),
-                            crate::format::display_path(path),
-                        )));
-                    }
-                }
+            if has_text_op(&section.ops) {
                 return Err(TilthError::EditRejected(
                     "replace_text/rewrite requires the [path#TAG] from a tilth_read or tilth_search \
                      result; a search match header or a section read (path#12-40) carries the \
-                     whole-file tag without reading the file in full, but the matched text must \
-                     occur in the lines it displayed. Files over the tag cap mint no tag — use \
-                     line ops there."
+                     whole-file tag without reading the file in full, but rewrite and all/count \
+                     matches must occur in the lines it displayed. Files over the tag cap mint no \
+                     tag — use line ops there."
                         .into(),
                 ));
             }
