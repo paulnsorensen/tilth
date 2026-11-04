@@ -30,7 +30,7 @@ import baselines  # noqa: E402
 import panels  # noqa: E402
 import run  # noqa: E402
 from config import REPO_ROOT  # noqa: E402
-from evolve import deepdiag, diagnosis, directives  # noqa: E402
+from evolve import deepdiag, diagnosis, directives, failures  # noqa: E402
 from evolve.candidate import SeedError, read_seed  # noqa: E402
 from evolve.finish import GitHubPRClient, PRClient  # noqa: E402
 from evolve.gitops import GitError, git  # noqa: E402
@@ -164,7 +164,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--avoid-failures-from", type=Path, action="append", default=[], metavar="RUN_DIR",
                         help="a prior run directory: its candidates that failed apply, just check, integrity, compile, "
                              "or hook gate are not checked again and are shown to the proposer; repeatable. The prior "
-                             "run must use the same --seed-sha: a verdict holds only on its own seed")
+                             "run's log.txt must record the same --seed-sha: a verdict holds only on its own seed, so "
+                             "a log that records another seed or no seed is refused")
     parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d-%H%M%S"))
     parser.add_argument("--repo", type=Path, default=REPO_ROOT, help=argparse.SUPPRESS)
     return parser
@@ -242,8 +243,22 @@ def build(argv: list[str] | None = None, *,
     if not 1 <= args.src_patch_by <= args.max_unselected + 1:
         return _error("--src-patch-by must be between 1 and --max-unselected + 1")
     for prior in args.avoid_failures_from:
-        if not (prior / "log.txt").is_file():
+        log_path = prior / "log.txt"
+        if not log_path.is_file():
             return _error(f"--avoid-failures-from {prior} has no log.txt")
+        seeds = failures.recorded_seeds(log_path)
+        if not seeds:
+            return _error(f"--avoid-failures-from {prior}: log.txt records no seed, so its verdicts may not hold on "
+                          f"--seed-sha {seed_sha}; if that run used this seed, add the line "
+                          f"'{failures.seed_line(seed_sha)}' to its log.txt")
+        if seeds != {seed_sha}:
+            return _error(f"--avoid-failures-from {prior} ran on seed {', '.join(sorted(seeds))}, not --seed-sha "
+                          f"{seed_sha}: a gate verdict holds only on its own seed")
+    # A resume reads this run's own log too; a log from before seed lines records none and is trusted, as before.
+    own_seeds = failures.recorded_seeds(run.RESULTS_DIR / "evolve" / args.run_id / "log.txt")
+    if own_seeds and own_seeds != {seed_sha}:
+        return _error(f"--run-id {args.run_id} resumes a run on seed {', '.join(sorted(own_seeds))}, not --seed-sha "
+                      f"{seed_sha}: its gate verdicts hold only on that seed; use a new --run-id")
     queue: list[directives.Directive] = []
     if args.directives is not None:
         try:

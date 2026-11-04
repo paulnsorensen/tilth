@@ -201,7 +201,7 @@ def test_a_later_seed_replaces_an_earlier_verdict_for_the_same_patch(tmp_path: P
 
 
 def test_a_prior_failure_recorded_for_the_seed_never_blocks_the_seed(world, tmp_path) -> None:  # noqa: F811
-    evo = build(world, "--avoid-failures-from", str(prior_run(tmp_path, build(world).seed_id)))
+    evo = build(world, "--avoid-failures-from", str(prior_run(tmp_path, world.seed_sha, build(world).seed_id)))
 
     assert evo.failed.get(evo.seed_id) is not None
     assert not evo._failed_before(evo.seed)
@@ -209,7 +209,7 @@ def test_a_prior_failure_recorded_for_the_seed_never_blocks_the_seed(world, tmp_
 
 
 def test_a_resumed_run_keeps_the_prior_dir_and_adds_its_own_log(world, tmp_path) -> None:  # noqa: F811
-    prior = prior_run(tmp_path, "a" * 12)
+    prior = prior_run(tmp_path, world.seed_sha, "a" * 12)
     first = build(world)
     first.log(failures.header("b" * 12, "build"))
     first.log("  error: own")

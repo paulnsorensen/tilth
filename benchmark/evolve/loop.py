@@ -36,7 +36,7 @@ from .calls import PaidCalls, StopState
 from .directives import Directive
 from .candidate import SRC_PATCH, content_id
 from .integrity import INFRASTRUCTURE_HEADLINE, InfrastructureFailure, Integrity
-from .failures import FailedPatches, header
+from .failures import FailedPatches, header, seed_line
 from .finish import REPIN_NOTE, PRClient, outside_allowlist, changed_tests_section
 from .gitops import GitError, git
 from .materialize import ApplyRejected, Materializer
@@ -357,6 +357,8 @@ class Evolution:
         self.run_dir = run.RESULTS_DIR / "evolve" / settings.run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.log_path = self.run_dir / "log.txt"
+        # A later run's --avoid-failures-from reads this line: its gate verdicts hold only on this seed.
+        self.log(seed_line(settings.seed_sha))
         # Gate failures from prior runs and from this run's own log (a resume) are known before the first proposal.
         self.failed = FailedPatches()
         for prior in (*settings.avoid_failures_from, self.run_dir):
@@ -834,8 +836,12 @@ class Evolution:
         return list(result.failing_tests) if result is not None and result.stage == "just check" else []
 
     def _failed_patch_records(self) -> list[dict]:
-        """The record that lists earlier failed patches for a ``src_patch`` proposal; empty when none failed."""
-        summary = self.failed.summary()
+        """The record that lists earlier failed patches for a ``src_patch`` proposal; empty when none failed.
+
+        Each error passes ``_redact``, as a ``precheck`` tail does: a prior run's log line can name a repo path or a
+        forbidden term.
+        """
+        summary = [{**entry, "error": self._redact(entry["error"])} for entry in self.failed.summary()]
         return [{"failed_patches": summary}] if summary else []
 
     def _failed_before(self, candidate: Mapping[str, str]) -> bool:

@@ -251,8 +251,10 @@ The recovery deleted the cache and rebuilt it from a clean copy of the ripgrep f
 The standalone `rg_edit_flow_migration` cells ran at 01:43–02:25, before the clean, so they stay valid.
 
 Do not move the `/tmp/tilth_bench` literals. Four task modules hold them, and `_task_source_files` hashes those modules into `task_digest`.
-A move re-keys 8 `gepa-v3-long-3` tasks and discards about $100 of stored rows per 4-arm, 3-rep pass.
+A move re-keys 8 `gepa-v3-long-3` tasks: the 4 edit tasks in those modules and the 4 chains that hold them, because a chain keys on its members' digests.
+In the stock-prompt A/B, the 96 stored rows of those 8 tasks (4 arms, 3 reps) cost $105.57, so a move discards about $100 of rows per such pass.
 Instead, exclude the tree from aging once per host: `echo 'x /tmp/tilth_bench' | sudo tee /etc/tmpfiles.d/tilth-bench.conf`.
+This rule covers only the default tree. The rg-flow grader uses `$RG_FLOW_TARGET_DIR` instead when it is set (`rg_flow_migration_tasks.py:32`). Exclude that path too, or put it outside an aged directory.
 A grader build failure that is not the agent's fault still reads as a wrong answer. Check `sub_tasks[].reason` before you trust a uniform failure across all arms.
 
-_Source: PR #277 at 411e183; stock-prompt A/B run log and `systemd-tmpfiles-clean` journal (2026-11-02) · Updated: 2026-11-02 · Supersedes: no historical measurements; narrows general claims to their measured configurations_
+_Source: PR #277 at 411e183; stock-prompt A/B run log, `systemd-tmpfiles-clean` journal (2026-11-02), and the A/B `rows.jsonl` cost sum (local, untracked) · Updated: 2026-11-04 · Supersedes: no historical measurements; narrows general claims to their measured configurations_

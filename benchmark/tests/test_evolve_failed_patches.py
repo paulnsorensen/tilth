@@ -29,10 +29,12 @@ def failed_child(world) -> str:
     return content_id({**seed_candidate(), SRC: broken_patch(world)})
 
 
-def prior_run(tmp_path: Path, cid: str, stage: str = "just check", error: str = "error: prior failure") -> Path:
+def prior_run(tmp_path: Path, seed: str, cid: str, stage: str = "just check",
+              error: str = "error: prior failure") -> Path:
     prior = tmp_path / "prior"
     prior.mkdir()
-    (prior / "log.txt").write_text(f"{failures.header(cid, stage)}\n  {error}\n  error: Recipe `check` failed\n")
+    (prior / "log.txt").write_text(f"{failures.seed_line(seed)}\n{failures.header(cid, stage)}\n  {error}\n"
+                                   "  error: Recipe `check` failed\n")
     return prior
 
 
@@ -84,7 +86,7 @@ def test_the_cascade_fails_a_known_patch_without_a_cell_or_a_check(world) -> Non
 
 
 def test_a_prior_run_dir_seeds_the_ledger_and_the_proposal_records(world, tmp_path) -> None:  # noqa: F811
-    prior = prior_run(tmp_path, failed_child(world))
+    prior = prior_run(tmp_path, world.seed_sha, failed_child(world))
     harness = Harness(world, "--avoid-failures-from", str(prior), patches=[broken_patch(world), fixed_patch(world)])
 
     proposal = harness.dispatch()
@@ -96,11 +98,21 @@ def test_a_prior_run_dir_seeds_the_ledger_and_the_proposal_records(world, tmp_pa
                                          "error": "error: prior failure"}]
 
 
+def test_a_prior_error_is_redacted_before_it_reaches_the_proposer(world, tmp_path) -> None:  # noqa: F811
+    error = f"error: benchmark/run.py and {world.repo}/src/lib.rs:3 broke"
+    prior = prior_run(tmp_path, world.seed_sha, failed_child(world), error=error)
+
+    [record] = build(world, "--avoid-failures-from", str(prior))._failed_patch_records()
+
+    assert record["failed_patches"][0]["error"] == "error: <redacted>run.py and src/lib.rs:3 broke"
+
+
 def test_the_flag_repeats_and_each_dir_seeds(world, tmp_path) -> None:  # noqa: F811
-    first = prior_run(tmp_path, "a" * 12)
+    first = prior_run(tmp_path, world.seed_sha, "a" * 12)
     second = tmp_path / "second"
     second.mkdir()
-    (second / "log.txt").write_text(failures.header("b" * 12, "build") + "\n  error[E0425]: no x\n")
+    (second / "log.txt").write_text(failures.seed_line(world.seed_sha) + "\n"
+                                    + failures.header("b" * 12, "build") + "\n  error[E0425]: no x\n")
 
     evo = build(world, "--avoid-failures-from", str(first), "--avoid-failures-from", str(second))
 
@@ -124,6 +136,44 @@ def test_a_prior_dir_without_a_log_is_refused(world, tmp_path, capsys) -> None: 
     assert main(world, "--avoid-failures-from", str(missing)) == 2
     assert "has no log.txt" in capsys.readouterr().err
 
+
+def test_a_run_records_its_seed_in_its_own_log(world) -> None:  # noqa: F811
+    evo = build(world)
+
+    assert failures.recorded_seeds(evo.log_path) == {evo.settings.seed_sha}
+
+
+def test_a_prior_run_on_another_seed_is_refused(world, tmp_path, capsys) -> None:  # noqa: F811
+    prior = prior_run(tmp_path, "f" * 40, failed_child(world))
+
+    assert main(world, "--avoid-failures-from", str(prior)) == 2
+    assert f"ran on seed {'f' * 40}, not --seed-sha" in capsys.readouterr().err
+
+
+def test_a_resume_on_another_seed_is_refused(world, capsys) -> None:  # noqa: F811
+    own = run.RESULTS_DIR / "evolve" / "run1" / "log.txt"
+    own.parent.mkdir(parents=True, exist_ok=True)
+    own.write_text(failures.seed_line("f" * 40) + "\n")
+
+    assert main(world) == 2
+    assert f"--run-id run1 resumes a run on seed {'f' * 40}" in capsys.readouterr().err
+
+
+def test_a_resume_of_a_log_without_a_seed_line_still_runs(world) -> None:  # noqa: F811
+    own = run.RESULTS_DIR / "evolve" / "run1" / "log.txt"
+    own.parent.mkdir(parents=True, exist_ok=True)
+    own.write_text(failures.header("e" * 12, "build") + "\n  error: old\n")
+
+    assert build(world).failed.get("e" * 12) == ("build", "error: old")
+
+
+def test_a_prior_log_that_records_no_seed_is_refused(world, tmp_path, capsys) -> None:  # noqa: F811
+    prior = tmp_path / "old"
+    prior.mkdir()
+    (prior / "log.txt").write_text(failures.header(failed_child(world), "just check") + "\n  error: x\n")
+
+    assert main(world, "--avoid-failures-from", str(prior)) == 2
+    assert "log.txt records no seed" in capsys.readouterr().err
 
 # --- the log reader ---
 
@@ -166,7 +216,8 @@ PRE_INFRA_LOG = (
 def test_a_just_check_timeout_in_an_older_log_is_not_a_known_failure(world, tmp_path) -> None:  # noqa: F811
     prior = tmp_path / "gepa-v3-r3"
     prior.mkdir()
-    (prior / "log.txt").write_text(PRE_INFRA_LOG)
+    # An older log records no seed; the operator adds the line after confirming the seed, as the refusal says.
+    (prior / "log.txt").write_text(failures.seed_line(world.seed_sha) + "\n" + PRE_INFRA_LOG)
 
     evo = build(world, "--avoid-failures-from", str(prior))
 

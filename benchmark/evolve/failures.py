@@ -2,6 +2,7 @@
 
 The loop already writes each gate failure to ``log.txt`` (``header``'s line and the indented
 tail), so a prior or resumed run seeds this ledger from that log. No separate state file exists.
+The log also records the run's seed commit (``seed_line``): a gate verdict holds only on its own seed.
 """
 
 import re
@@ -17,6 +18,7 @@ _HEADER = re.compile(r"^candidate ([0-9a-f]{%d}): failed at (.+)$" % ID_LENGTH)
 _TEST_NAME = re.compile(r"^---- .* ----$")
 _ERROR = re.compile(r"^(?:error(?:\[\w+\])?: (?!could not compile|aborting due to|Recipe |test failed)|Diff in )")
 _WORKTREE = re.compile(r"\S*/worktrees/[^/\s]+/")
+_SEED = re.compile(r"^run seed: ([0-9a-f]{40,64})$")
 # Before `just check infra` existed, a `just check` timeout was logged at `just check` with this line as its whole tail.
 _OLD_JUST_CHECK_TIMEOUT = re.compile(r"just check timed out after \d+ s")
 
@@ -24,6 +26,20 @@ _OLD_JUST_CHECK_TIMEOUT = re.compile(r"just check timed out after \d+ s")
 def header(cid: str, stage: str) -> str:
     """The log line that opens one gate failure; ``parse_log`` reads it back."""
     return f"candidate {cid[:ID_LENGTH]}: failed at {stage}"
+
+
+def seed_line(sha: str) -> str:
+    """The log line that records the run's seed commit; ``recorded_seeds`` reads it back."""
+    return f"run seed: {sha}"
+
+
+def recorded_seeds(log_path: Path) -> set[str]:
+    """The seed commits that ``log_path`` records; empty for a log from before seed lines or an unreadable one."""
+    try:
+        text = Path(log_path).read_text()
+    except (OSError, UnicodeDecodeError):
+        return set()
+    return {match[1] for line in text.splitlines() if (match := _SEED.match(line))}
 
 
 def first_error(tail: str) -> str:

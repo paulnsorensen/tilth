@@ -7,7 +7,10 @@ A preamble cannot remove these causes. Fix the tools first, then steer.
 ## Data and dedup rules
 
 - Source: `benchmark/results/stock-ab/rows_streams/` (untracked) at candidate `aec0efd4`, `claude-sonnet-5-5`, CLI 2.1.310, `--strict-file-tools --bare`.
-- One stream name, minus its numeric prefix, can exist in several run dirs. The 12 `chain:rg-edit-6` cells re-ran after the grader fix, and some cells re-ran after interrupts. Keep the file from the latest run dir.
+- One stream name, minus its numeric prefix, can exist in several run dirs. The 12 `chain:rg-edit-6` cells re-ran after the grader fix, and some cells re-ran after interrupts.
+  Keep the file from the run dir that the stored row's `trajectory_path` names. That is the attempt whose row the result store kept, not a newer partial attempt from an interrupted rerun.
+  For a chain row, it names the `.turn1` trajectory; take the base and `.turnN` streams from the same run dir.
+  In this A/B, that run dir is also the latest one for all 216 rows.
 - A chain cell has one base stream and one `.turnN` stream per sub-task. The base stream repeats the turn streams, so count only the turn streams.
 - An API call is a distinct assistant `message.id`.
 - A first pass without these rules counted chain output twice and over-counted API calls. Its numbers, for example "5–12% more API calls", are wrong.

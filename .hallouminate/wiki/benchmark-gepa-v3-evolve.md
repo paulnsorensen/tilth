@@ -114,7 +114,7 @@ Both rounds ran the tilth arm with `prompts/preamble.md` as its whole system pro
 - preamble-r1 never proposed the preamble: the selector weighted it about 10% per pick, and the $128 reserve left 4 proposals. #427 gives the preamble a slot by proposal 3 and cuts the reserve to the cells finish buys ($75.63 in r2).
 - preamble-r1's `$1` budget re-bought every baseline and capped one long cell. #428 counts a budget-capped cell as a completed failure and retries incomplete cells (r2 retried one `chain:gin-edit-5` cell).
 - The preamble directives met their tool hypotheses (error rate 0.119 to 0.100 to 0.083) while dev accuracy fell; this repeats the per-tool-metric lesson above.
-- The src_patch proposer re-proposed the same failing patch (`b6f01ab8`, pinned test `batch_records_only_emitted_source_lines`) in both rounds, and logged `cargo fmt failed on the export` on every src_patch proposal. Cause: the export holds only src, prompts, Cargo.toml and Cargo.lock, and Cargo.toml declares the `[[test]]` target `tests/bdd/main.rs`, so `cargo fmt` exited 1. The export now runs `rustfmt --edition` on its files; failed patches are remembered and shown to later proposals, and `--avoid-failures-from <run dir>` carries them into the next round.
+- The src_patch proposer re-proposed the same failing patch (`b6f01ab8`, pinned test `batch_records_only_emitted_source_lines`) in both rounds, and logged `cargo fmt failed on the export` on every src_patch proposal. Cause: the export holds only src, prompts, Cargo.toml and Cargo.lock, and Cargo.toml declares the `[[test]]` target `tests/bdd/main.rs`, so `cargo fmt` exited 1. The export now runs `rustfmt --edition` on its files; failed patches are remembered and shown to later proposals, and `--avoid-failures-from <run dir>` carries them into the next round. The prior run must use the same seed: its `log.txt` must record a `run seed: <sha>` line for `--seed-sha`, so a log from before that line (gepa-v3-r*, preamble-r1, preamble-r2) is refused until the line is added by hand.
 - The finish reserve kept the baseline share after `buy_baselines` bought those cells ($24.60 locked in preamble-r2, enough for about one more proposal). The loop now refreshes the reserve after the baselines.
 - Stored baselines from another checkout do not transfer: harness digest, CLI version, and env fingerprint are part of the key, so a run there needs `--refreeze-baselines` (about $45 on long-3).
 
@@ -143,7 +143,9 @@ A logging proxy (`ANTHROPIC_BASE_URL` at a local server that saves each request 
 
 The stock-prompt A/B measured tilth against Claude Code's stock system prompt on 2026-11-02.
 It ran the 18 `gepa-v3-long-3` tasks with `claude-sonnet-5-5`, CLI 2.1.310, 3 reps, `--strict-file-tools --bare --max-budget-usd 3`, and candidate `aec0efd4`.
-The arms are in `benchmark/results/stock-ab/modes.json`:
+The run read its arms from `benchmark/results/stock-ab/modes.json`.
+That file and the `rows.jsonl`, `rows_streams/`, and `run.log` beside it are local artifacts on the run host. The repo does not track them, so the tables below cannot be reproduced from a checkout.
+The arms are:
 
 - `baseline_stock`: built-in tools and the stock prompt (`prompt_mode` `append`, memory off).
 - `tilth_stock`: tilth MCP plus Bash, and the stock prompt.
@@ -185,7 +187,7 @@ The paired deltas come from `benchmark/paired.py`. The task is the sampling unit
 - Single tasks cost the same ($0.27 per cell for baseline and tilth_stock). The whole gap is in the four chains ($1.48 against $1.76 per cell). The causes are in [Stock A/B trajectory diagnosis](stock-ab-trajectory-diagnosis.md).
 - Fixed prefix per call against baseline: tilth_stock +1.9k tokens, tilth_steer +2.95k, tilth_pre +1.25k. Under `--bare` the stock prompt is 4.5k characters and the preamble 3.0k, so the replace arm saves about 0.7k tokens per call. About half of the preamble's Tools section repeats `prompts/mcp.md`. The `tilth_write` schema (5.2k characters) is the largest tool schema; `Edit` is 1.0k.
 - The largest per-task gaps are `chain:rg-edit-6` (+22–30% per cell) and `chain:express-edit-6` (+13–23%).
-- `benchmark/analyze.py` stops with `no pricing entry for model 'claude-sonnet-5-5'`. The tables come from `jq` over `rows.jsonl` and from `paired.py`.
+- `benchmark/analyze.py` stops with `no pricing entry for model 'claude-sonnet-5-5'`. The tables come from `jq` over the local `rows.jsonl` and from `paired.py`.
 - The run resumed after four stops: a CLI version change, a full disk, the first $130 cap, and 12 `chain:rg-edit-6` cells that a corrupt grader cache failed. See [Benchmark harness gotchas](benchmark-harness-gotchas.md).
 
 ## Spend
@@ -211,8 +213,8 @@ The stock-prompt A/B at `aec0efd4` changes the priority. There tilth made only 2
 4. Coalesce adjacent read sections and return complete enclosing constructs, to cut fragmented reads (about 0.30 calls per cell).
 5. Prevent malformed `tilth_write` JSON: the seed had 5 rejected write calls against none for baseline. Smaller structural payloads or a schema-first example would help (about 0.17 calls per cell).
 6. Batch independent discovery: baseline searches two entry points in its first turn, while tilth spends two turns (about 0.13 calls per cell).
-7. Smaller tool schemas and instructions, since they ride every API call; [MCP cost model](mcp-cost-model-sonnet5.md) found the fixed MCP prefix, not per-call output, is where cost went. In the stock-prompt A/B the prefix was 10–23% of the extra context.
+7. Smaller tool schemas and instructions, since they ride every API call; in the August 2026 Sonnet 5 gin/fastapi workload, [MCP cost model](mcp-cost-model-sonnet5.md) found the fixed MCP prefix, not per-call output, was where cost went. In the stock-prompt A/B, the prefix was 10–23% of the extra context and larger conversation content was 64–74%.
 - A per-cell `TMPDIR` for scratch isolation, which does not change run keys.
 - Measurement: more reps or more test tasks, so evolve can see 5% effects; about $100 or more per comparison.
 
-_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412; PR #413 review fixes (r2 note, call-count labels, call-gap source copy); panel-health pass over r1-r6, gepa-v3-baselines and preamble-r1 with `benchmark/panel_health.py`; preamble-r1 and preamble-r2 run logs (`benchmark/results/evolve/preamble-r{1,2}/log.txt`); stock-prompt A/B rows and streams (`benchmark/results/stock-ab/`, budget `stock-ab-1`) · Updated: 2026-11-04 · Supersedes: the 2026-11-02 A/B note that read `num_turns` as API calls and its conflict note on the Ideas section_
+_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412; PR #413 review fixes (r2 note, call-count labels, call-gap source copy); panel-health pass over r1-r6, gepa-v3-baselines and preamble-r1 with `benchmark/panel_health.py`; preamble-r1 and preamble-r2 run logs (`benchmark/results/evolve/preamble-r{1,2}/log.txt`); stock-prompt A/B rows and streams (`benchmark/results/stock-ab/`, local and untracked, budget `stock-ab-1`) · Updated: 2026-11-04 · Supersedes: the 2026-11-02 A/B note that read `num_turns` as API calls and its conflict note on the Ideas section_
