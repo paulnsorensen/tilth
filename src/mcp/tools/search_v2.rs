@@ -2261,7 +2261,7 @@ mod tests {
         let outcome = h.write(
             dir.path(),
             json!({"path": "n.txt", "tag": tag, "ops": [
-                {"op": "replace_text", "old": "delta", "new": "omega"}]}),
+                {"op": "replace", "start": 74, "end": 74, "content": "omega"}]}),
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         let message = outcome.unwrap_or_else(|e| e);
@@ -2391,7 +2391,7 @@ mod tests {
         let outcome = h.write(
             dir.path(),
             json!({"path": "n.txt", "tag": tag, "ops": [
-                {"op": "replace_text", "old": "needle line 1\n", "new": "edited\n"}]}),
+                {"op": "replace", "start": 1, "end": 1, "content": "edited"}]}),
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         let message = outcome.unwrap_or_else(|e| e);
@@ -2405,7 +2405,7 @@ mod tests {
         h.write(
             dir.path(),
             json!({"path": "n.txt", "tag": tag, "ops": [
-                {"op": "replace_text", "old": "needle line 1\n", "new": "edited\n"}]}),
+                {"op": "replace", "start": 1, "end": 1, "content": "edited"}]}),
         )
         .expect("untrimmed preview lines stay editable");
     }
@@ -2428,7 +2428,7 @@ mod tests {
         let outcome = h.write(
             dir.path(),
             json!({"path": "a.rs", "tag": tag, "ops": [
-                {"op": "replace_text", "old": "let v1 = 1;", "new": "let v1 = 9;"}]}),
+                {"op": "replace", "start": 3, "end": 3, "content": "    let v1 = 9;"}]}),
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
         assert!(outcome.is_err() || outcome.unwrap().contains("seen"));

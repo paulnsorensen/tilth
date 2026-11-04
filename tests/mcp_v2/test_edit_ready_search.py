@@ -54,7 +54,7 @@ class EditReadySearch(unittest.TestCase):
         source = f"def host():\n    marker_call(1)\n{filler(80)}    return last_line\n"
         target, written = self.search_then_write(
             "large.py", source,
-            {"op": "replace_text", "old": "return last_line", "new": "return done"})
+            {"op": "replace", "start": 83, "end": 83, "content": "    return done"})
         self.assertTrue(harness.tool_is_error(written), harness.tool_result_text(written))
         self.assertEqual(target.read_text(), source, "a rejected edit must not write")
 

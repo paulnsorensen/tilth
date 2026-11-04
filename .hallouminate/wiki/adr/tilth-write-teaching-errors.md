@@ -189,3 +189,18 @@ Session 2026-08-02; spec at the durable corpus
 - **Verification:** `tests/mcp_v2/test_unseen_match_hint.py` runs the first read, the hinted read, and the retry in one session. The retry must apply, and the hinted read must not truncate. One case documents the #305 residual as an expected failure.[^multi-match]
 
 [^multi-match]: `src/edit/recovery.rs` (`merge_ranges`, `MAX_READ_RANGES`); `src/edit/mismatch.rs` (`unseen_message`). Decision: October 3, 2026, after three /age passes on `feat/edit-efficiency` that reproduced each rejected design against the built binary.
+
+
+### ADR-010: Tag fill-in and exact-match exemption (amends ADR-004 and ADR-009) [status: accepted]
+
+- **Approval:** The user approved this guard change on 2026-11-04.
+- **Context:** A benchmark trajectory diagnosis (wiki page `stock-ab-trajectory-diagnosis.md`, commit `d615858a`, causes 5 and 8) found two costly rejections.
+  - Cause 8 was the most common write error, 111 times in 162 cells. A tagless `replace_text` or `rewrite` got `needs a tag; this session already displayed [path#TAG]`. The server knew the tag, so the retry only sent it back.
+  - Cause 5: a `replace_text` whose `old` matched exactly once got an unseen-line rejection. The exact match proves that the agent holds that text.
+- **Decision:**
+  1. Tag fill-in. A tagless section with `replace_text` or `rewrite` takes the live tag when this session holds a snapshot whose text equals the live file (`fill_live_tag` in `src/mcp/tools/write.rs`). The section then runs the tagged path, with the gate and the seen-line carry-forward. With no such snapshot, the rejection stays.
+  2. Exact-match exemption. On the no-drift path (`gated_apply` in `src/edit/recovery.rs`), a single `replace_text` (no `all`, no `count`) whose `old` matches byte-exactly once skips the overlap check.
+  3. These stay gated: `all`/`count`, `rewrite`, a whitespace-normalized match, line, insert, and block ops. The drift path (`check_seen_lines` in `recover_edit`, and `replay_session_chain`) does not change.
+- **Consequences:** The exemption marks only the lines that the edit wrote as seen. Lines next to the match stay unseen. Tests that used an exact `replace_text` to prove an unseen-line rejection now use line ops. The `tilth_write` description now limits "every match must be on shown lines" to `all`/`count` matches.
+- **Verification:** `tests/mcp_v2/test_write_tag_fill_exact_match.py` and the `gated_apply_*` unit tests in `src/edit/recovery.rs`.
+
