@@ -41,10 +41,10 @@ The other ten members pass at least 92% of cells in both arms and use at most 40
 - **Grading false negatives.** `grok_rg_matcher` requires the literal `impl Matcher for RegexMatcher`; chain answers write "`Matcher` impl (line 409)". `fastapi_request_validation` requires an `async def app` form; chain answers write "an async closure, `app(request)`".
 - Without these sub-tasks, rg-edit-7 passes 13/13 and 20/20, and fastapi-edit-5 passes 15/16 and 71/71.
 - The fix drops the sub-tasks from new chains, as for `gin_context_next`. A grader edit would change the task digests and move the stored long-2 chain keys.
-- **tokio-4867** fails only in the tilth arm. The failures are quick (8 turns) alternative fixes in `recv_ref` that the hidden test rejects; the sampled passing runs fix `new_receiver`. The grade builds in 9 s, so it is not flaky.
-- **ripgrep-2209** fails in both arms (25% and 15%). The grade compiles in 6 s, then `r2208` fails on a different `replace_all` fix, so the failures are real wrong answers. It stays as a short control, but it adds noise to the test split.
-- **Background-task wake-ups.** When an agent backgrounds a test run, each notification starts a new one-turn result in the same stream, and the row keeps only the last. Seven slow rows report 1-3 turns for 15-37 real turns.
-- vuejs rep 0 of preamble-r1 is one of them: 37 turns for $0.43, then 3 wake-ups, for 824 s of wall time. Cost stays correct because the last result event is cumulative; `num_turns` and `duration_ms` do not.
+- **tokio-4867** fails only in the tilth arm: 24 of 97 tilth cells fail against 0 of 17 baseline cells (Fisher p = 0.013). Every failure is a quick `recv_ref` edit that the hidden test rejects. Tilth picks `recv_ref` in 43 of 97 cells against 2 of 17; why is not proven (the grouped `[3 usages in function recv_ref]` search output is a suspect). The grade builds in 9 s, so it is not flaky.
+- **ripgrep-2209** fails 3 of 14 baseline and 3 of 28 tilth cells (no arm effect, p = 0.31). All 6 failures make the same naive `replace_all` edit, so they are real wrong answers. It stays as a short control, but it adds noise to the test split.
+- **Background-task wake-ups.** When an agent backgrounds a test run, each notification starts a new result event in the same stream. Before the November audit the row kept only the last one, so `num_turns`, `duration_ms` and the usage token fields described the last segment only (9 unique streams; rows said 1-3 turns for 10-38 real turns).
+- `total_cost_usd`, `duration_api_ms` and `modelUsage` are cumulative across result events; `num_turns`, `duration_ms` and `usage` are per segment. `parse_stream_json` now sums the per-segment fields and keeps the cumulative ones from the last event. Grading was never affected: `result_text` joins every assistant message.
 
 ## Cell timeouts and budget
 
@@ -91,6 +91,8 @@ The report is in the corpus at [Seed API-call gap: tilth versus built-in tools](
 
 After the fixes, tilth makes fewer calls than baseline on 7 of 10 dev tasks; for example, the fastapi chain fell from 44 to 31 calls.
 
+This diagnosis is for the seed `4c56a06`. At `aec0efd4` the API-call gap is 2–8%, and larger conversation content is the main cause; see [Stock A/B trajectory diagnosis](stock-ab-trajectory-diagnosis.md).
+
 ## What evolve found
 
 Across r1-r6, evolve's best winner was a prompt edit, not a source patch.
@@ -112,20 +114,95 @@ Both rounds ran the tilth arm with `prompts/preamble.md` as its whole system pro
 - preamble-r1 never proposed the preamble: the selector weighted it about 10% per pick, and the $128 reserve left 4 proposals. #427 gives the preamble a slot by proposal 3 and cuts the reserve to the cells finish buys ($75.63 in r2).
 - preamble-r1's `$1` budget re-bought every baseline and capped one long cell. #428 counts a budget-capped cell as a completed failure and retries incomplete cells (r2 retried one `chain:gin-edit-5` cell).
 - The preamble directives met their tool hypotheses (error rate 0.119 to 0.100 to 0.083) while dev accuracy fell; this repeats the per-tool-metric lesson above.
-- The src_patch proposer re-proposed the same failing patch (`b6f01ab8`, pinned test `batch_records_only_emitted_source_lines`) in both rounds, and logs `cargo fmt failed on the export` on every src_patch proposal.
+- The src_patch proposer re-proposed the same failing patch (`b6f01ab8`, pinned test `batch_records_only_emitted_source_lines`) in both rounds, and logged `cargo fmt failed on the export` on every src_patch proposal. Cause: the export holds only src, prompts, Cargo.toml and Cargo.lock, and Cargo.toml declares the `[[test]]` target `tests/bdd/main.rs`, so `cargo fmt` exited 1. The export now runs `rustfmt --edition` on its files; failed patches are remembered and shown to later proposals, and `--avoid-failures-from <run dir>` carries them into the next round. The prior run must use the same seed: its `log.txt` must record a `run seed: <sha>` line for `--seed-sha`, so a log from before that line (gepa-v3-r*, preamble-r1, preamble-r2) is refused until the line is added by hand.
+- The finish reserve kept the baseline share after `buy_baselines` bought those cells ($24.60 locked in preamble-r2, enough for about one more proposal). The loop now refreshes the reserve after the baselines.
 - Stored baselines from another checkout do not transfer: harness digest, CLI version, and env fingerprint are part of the key, so a run there needs `--refreeze-baselines` (about $45 on long-3).
+
+## November 2026 audit: what the arms receive
+
+A logging proxy (`ANTHROPIC_BASE_URL` at a local server that saves each request body and refuses it) captured the exact requests of live cells, with no model spend.
+
+- Both arms use `prompt_mode` `replace`: `--system-prompt` holds `SYSTEM_PROMPT` plus the cwd line and the strict guidance. Neither arm sees Claude Code's stock system prompt or its `gitStatus` context block. The baseline is not "stock Claude".
+- `--preamble` swaps only the tilth arm's text for `prompts/preamble.md`. That equals `tilth claude` (`--system-prompt-file`) except the cwd and strict lines, so the preamble is applied correctly.
+- Tool rules reach the tilth arm three ways: the preamble, the MCP server instructions (`prompts/mcp.md`, in the environment block), and the tool descriptions. The preamble's `## Tools` repeats six rules of `prompts/mcp.md`; seeded as directive `preamble-drop-duplicate-tool-rules` in `benchmark/evolve/directives/audit-r1.json`.
+- Claude Code's stock `-p` prompt (CLI 2.1.316, about 6.1k characters) has a `# Memory` section that points the agent at the host's `~/.claude/projects/<cwd>/memory` directory, because `/login` cells keep the host config dir. `--settings '{"autoMemoryEnabled": false}'` removes it, also with `--setting-sources ""`.
+- Stock arms now exist: a `--modes-json` arm with `prompt_mode: append` keeps the stock prompt (memory off), and `append_preamble` appends the preamble to it. A modes file can mix `append`, `append_preamble` and `preamble` arms in one run.
+- Every cell also carries two host-account reminders (user email and commit attribution) in its first user message; they are equal across arms.
+
+## November 2026 audit: noise causes
+
+- **Dev split spread is sampling noise.** The r4, r5 and r6 seed cells use the same binary and the same 30 reused baseline cells. A bootstrap over the 9 seed cells per task gives a 3-rep dev-mean SD of 0.042; P(range of three means >= 0.075) = 0.40. Pass flips on metaflow, tokio-4867 and terraform carry 56% of the variance, caddy-6288 cost 23%.
+- The ratio score turns one failed cell on a cheap task into -0.03 of the dev mean; chains add about 1% each.
+- **Power.** At 8 test tasks and 3 reps, a paired test detects about a 20% cost-per-correct effect, not 5% (power 0.12 for 5%). Adding tasks is cheaper than adding reps: about 15 reps at 24 tasks reach 80% power for 5%.
+- The 27 rows at CLI 2.1.311 in r5 came from an aborted first attempt; no score used them.
+- **Strict-hook denials.** About 73% of tilth-arm denials are compound commands with one read or search segment (`git status && grep ...`); the rest are single reads or writes. No pipe-filter false positives. The hook source is identical across runs, so the preamble seed's higher rate (1.30 against 0.90 per cell) is behavior. Seeded as directive `hook-compound-nothing-ran`.
+- **Preamble side effects.** No preamble-r2 tilth cell ended by asking a question, and no chain read sub-task ran a test or lint gate.
+- Cost swings on express and vuejs track call count and test runs; tilth responses on express average 69K characters against 37K for baseline.
+
+## November 2026 stock-prompt A/B
+
+The stock-prompt A/B measured tilth against Claude Code's stock system prompt on 2026-11-02.
+It ran the 18 `gepa-v3-long-3` tasks with `claude-sonnet-5-5`, CLI 2.1.310, 3 reps, `--strict-file-tools --bare --max-budget-usd 3`, and candidate `aec0efd4`.
+The run read its arms from `benchmark/results/stock-ab/modes.json`.
+That file and the `rows.jsonl`, `rows_streams/`, and `run.log` beside it are local artifacts on the run host. The repo does not track them, so the tables below cannot be reproduced from a checkout.
+The arms are:
+
+- `baseline_stock`: built-in tools and the stock prompt (`prompt_mode` `append`, memory off).
+- `tilth_stock`: tilth MCP plus Bash, and the stock prompt.
+- `tilth_steer`: `tilth_stock` with the preamble appended (`append_preamble`).
+- `tilth_pre`: the preamble replaces the system prompt (`preamble`), as in `tilth claude`.
+
+| arm | correct | $/cell | $/correct | API calls/cell | tool calls/cell | context tokens/cell |
+|---|---|---|---|---|---|---|
+| baseline_stock | 54/54 | 0.547 | 0.547 | 18.5 | 56.3 | 791,654 |
+| tilth_stock | 52/54 | 0.605 | 0.628 | 18.9 | 21.6 | 994,020 |
+| tilth_steer | 53/54 | 0.621 | 0.633 | 19.3 | 21.9 | 1,044,164 |
+| tilth_pre | 53/54 | 0.599 | 0.611 | 20.1 | 22.6 | 1,042,344 |
+
+API calls are distinct assistant `message.id` values in `rows_streams/`, counted once per cell (see the dedup rules in [Stock A/B trajectory diagnosis](stock-ab-trajectory-diagnosis.md)). The row field `num_turns` (58.3 against 23.5–24.6) follows the tool-call count, not API calls, because baseline sends many parallel `Edit` calls in one response. Do not read `num_turns` as round trips.
+
+The paired deltas come from `benchmark/paired.py`. The task is the sampling unit (18 tasks), with a 95% task bootstrap CI.
+
+| comparison | cost/correct Δ | accuracy Δ |
+|---|---|---|
+| tilth_stock vs baseline_stock | +14.7% [+2.1, +33.8] | −3.7pp [−9.3, +0.0] |
+| tilth_steer vs baseline_stock | +15.6% [+8.9, +34.7] | −1.9pp [−5.6, +0.0] |
+| tilth_pre vs baseline_stock | +11.6% [+3.6, +24.1] | −1.9pp [−5.6, +0.0] |
+| tilth_steer vs tilth_stock | +0.8% [−1.6, +15.0] | +1.9pp [−3.7, +7.4] |
+| tilth_pre vs tilth_stock | −2.8% [−10.1, +15.0] | +1.9pp [−3.7, +7.4] |
+| tilth_steer vs tilth_pre | +3.6% [−0.4, +19.0] | +0.0pp [−5.6, +5.6] |
+
+- Against the stock prompt, every tilth arm costs more per correct answer. All three cost CIs exclude 0. All accuracy CIs include 0.
+- The preamble has no detectable effect inside the tilth arms, as an appended text or as the replacement prompt.
+- Power: 18 tasks × 3 reps give paired cost CIs 17–25 points wide. A difference below about 10% between tilth arms stays inside these CIs, so this A/B cannot rank the preamble placements.
+- The tilth arms make about 60% fewer tool calls and 2–8% more API calls. Each call carries more context: a mean of 49–52k tokens against 40k. Nearly all of the extra context is cache reads.
+- Split of the extra cache reads against baseline (prefix: first-call context delta × API calls; extra calls: delta calls × baseline mean context; content: the rest):
+
+  | arm | larger fixed prefix | extra API calls | larger conversation content |
+  |---|---|---|---|
+  | tilth_stock | 18% | 8% | 74% |
+  | tilth_steer | 23% | 12% | 65% |
+  | tilth_pre | 10% | 26% | 64% |
+
+- Single tasks cost the same ($0.27 per cell for baseline and tilth_stock). The whole gap is in the four chains ($1.48 against $1.76 per cell). The causes are in [Stock A/B trajectory diagnosis](stock-ab-trajectory-diagnosis.md).
+- Fixed prefix per call against baseline: tilth_stock +1.9k tokens, tilth_steer +2.95k, tilth_pre +1.25k. Under `--bare` the stock prompt is 4.5k characters and the preamble 3.0k, so the replace arm saves about 0.7k tokens per call. About half of the preamble's Tools section repeats `prompts/mcp.md`. The `tilth_write` schema (5.2k characters) is the largest tool schema; `Edit` is 1.0k.
+- The largest per-task gaps are `chain:rg-edit-6` (+22–30% per cell) and `chain:express-edit-6` (+13–23%).
+- `benchmark/analyze.py` stops with `no pricing entry for model 'claude-sonnet-5-5'`. The tables come from `jq` over the local `rows.jsonl` and from `paired.py`.
+- The run resumed after four stops: a CLI version change, a full disk, the first $130 cap, and 12 `chain:rg-edit-6` cells that a corrupt grader cache failed. See [Benchmark harness gotchas](benchmark-harness-gotchas.md).
 
 ## Spend
 
 Evolve spend totals about $487: r1 $99, baseline buy $32, r2 $45, r3 $161, r4 $12, r5 $48, r6 $89.
 The preamble rounds add $306: preamble-r1 $128 and preamble-r2 $178.
+The stock-prompt A/B adds $168.39 of its $170 cap (budget `stock-ab-1`). That includes about $35 for the 12 `chain:rg-edit-6` cells that the corrupt grader cache failed, and about $35 to re-run them.
 The finish reserve is about $40 whenever the seed commit changes, because `git_sha` is in every tilth cell's run key.
 
 ## Ideas to push cost per correct lower
 
-These ideas cut dependent turns, the measured cause of tilth's extra cost.
-They are untested; the call savings are the deep-diagnosis estimates for the main seed (`4c56a06`), and the ranges overlap, so do not add them.
-The recommended order is ideas 1, 2 and 4 by hand, then one higher-rep test-split measurement, rather than more evolve rounds.
+Ideas 1–7 cut dependent turns, the cause measured on the seed `4c56a06` before #404–#416.
+They are untested; the call savings are the deep-diagnosis estimates for that seed, and the ranges overlap, so do not add them.
+
+The stock-prompt A/B at `aec0efd4` changes the priority. There tilth made only 2–8% more API calls than baseline, and larger conversation content was 64–74% of the extra context. Extra dependent turns are now the minor cause. The ranked levers for that finding are in [Stock A/B trajectory diagnosis](stock-ab-trajectory-diagnosis.md#levers-to-beat-the-stock-arm); do them before ideas 1–7.
 
 1. Explicit search modes (literal, regex, symbol), so auto-resolution stops narrowing or changing the agent's intent. This is the largest remaining cause, about 0.45 calls per cell.
 2. Edit from search: let `tilth_write` edit lines that a search hit displayed, now that #404 tags test hits, to skip a read turn.
@@ -136,8 +213,8 @@ The recommended order is ideas 1, 2 and 4 by hand, then one higher-rep test-spli
 4. Coalesce adjacent read sections and return complete enclosing constructs, to cut fragmented reads (about 0.30 calls per cell).
 5. Prevent malformed `tilth_write` JSON: the seed had 5 rejected write calls against none for baseline. Smaller structural payloads or a schema-first example would help (about 0.17 calls per cell).
 6. Batch independent discovery: baseline searches two entry points in its first turn, while tilth spends two turns (about 0.13 calls per cell).
-7. Smaller tool schemas and instructions, since they ride every API call; [MCP cost model](mcp-cost-model-sonnet5.md) found the fixed MCP prefix, not per-call output, is where cost went. This is unmeasured on this panel.
+7. Smaller tool schemas and instructions, since they ride every API call; in the August 2026 Sonnet 5 gin/fastapi workload, [MCP cost model](mcp-cost-model-sonnet5.md) found the fixed MCP prefix, not per-call output, was where cost went. In the stock-prompt A/B, the prefix was 10–23% of the extra context and larger conversation content was 64–74%.
 - A per-cell `TMPDIR` for scratch isolation, which does not change run keys.
 - Measurement: more reps or more test tasks, so evolve can see 5% effects; about $100 or more per comparison.
 
-_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412; PR #413 review fixes (r2 note, call-count labels, call-gap source copy); panel-health pass over r1-r6, gepa-v3-baselines and preamble-r1 with `benchmark/panel_health.py`; preamble-r1 and preamble-r2 run logs (`benchmark/results/evolve/preamble-r{1,2}/log.txt`) · Updated: 2026-10-31_
+_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412; PR #413 review fixes (r2 note, call-count labels, call-gap source copy); panel-health pass over r1-r6, gepa-v3-baselines and preamble-r1 with `benchmark/panel_health.py`; preamble-r1 and preamble-r2 run logs (`benchmark/results/evolve/preamble-r{1,2}/log.txt`); stock-prompt A/B rows and streams (`benchmark/results/stock-ab/`, local and untracked, budget `stock-ab-1`) · Updated: 2026-11-04 · Supersedes: the 2026-11-02 A/B note that read `num_turns` as API calls and its conflict note on the Ideas section_

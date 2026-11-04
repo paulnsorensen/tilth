@@ -33,6 +33,9 @@ REPAIR_NOTE = ("A record with a `repair` key means your earlier change failed. W
                "fns, and only when your intended behavior change makes a pinned test obsolete. Update each such test "
                "to assert the NEW intended behavior. Never delete a test, and never weaken it so that it passes "
                "trivially; a person reviews every test change. If a test fails for another reason, fix the code.")
+FAILED_PATCHES_NOTE = ("A record with a `failed_patches` key lists earlier patches that failed a build or test gate, each "
+                       "with its `stage` and first `error` line. Do not propose them again, or any change with the same "
+                       "failure.")
 PROPOSER_HEADER = (
     "You are improving tilth, a Rust MCP server for code intelligence whose source is in the current "
     "directory. Below are reflective records of AI agents' rollouts with tilth on benchmark tasks: each holds "
@@ -44,7 +47,7 @@ PROPOSER_HEADER = (
     "reviews every one. After `just check` passes, the seed's own tests also run against your production code, "
     "exactly as the seed wrote them, in a tree without your test code. All of them must still exist and pass, so "
     "do not rely on a helper, macro, or `use` that you add to test code. "
-    f"{DIAGNOSIS_NOTE} {DIRECTIVE_NOTE} {REPAIR_NOTE} {PROPOSER_HYPOTHESIS}"
+    f"{DIAGNOSIS_NOTE} {DIRECTIVE_NOTE} {REPAIR_NOTE} {FAILED_PATCHES_NOTE} {PROPOSER_HYPOTHESIS}"
 )
 
 

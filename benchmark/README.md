@@ -591,7 +591,7 @@ python benchmark/run.py --tasks rg_search_dispatch --models haiku --reps 1 --mod
 
 `--preamble` runs every selected tilth arm with the launcher preamble (`prompts/preamble.md`) as its whole system prompt.
 This is the prompt that `tilth claude` and `tilth codex` give the agent.
-The stock arms keep the harness system prompt.
+The `baseline` arm keeps the harness system prompt.
 The run reads the preamble at `--candidate-sha`, or from this checkout when that flag is absent.
 A Claude cell passes the preamble and the working-directory line with `--system-prompt`, in place of the harness prompt.
 A Codex cell passes the preamble as `-c model_instructions_file=<file>`, as `tilth codex` does.
@@ -600,8 +600,38 @@ The Codex developer message keeps the working-directory line and the Codex guida
 The preamble text is part of the run key, so a changed preamble buys new cells.
 Result rows record `preamble_sha256`.
 The flag needs a tilth arm and Claude or Codex models.
-It refuses `--experiment`, an OpenCode model, and a `--modes-json` tilth arm with `prompt_mode: "append"`.
-A `--modes-json` arm cannot set `prompt_mode: "preamble"` or `preamble` itself.
+It refuses `--experiment` and an OpenCode model.
+A `--modes-json` tilth arm can set `prompt_mode: "preamble"` or `"append_preamble"` itself, so one run can hold arms with different placements.
+The harness then reads the preamble text at `--candidate-sha`, else from this checkout; an entry cannot set `preamble`.
+An arm without tilth that sets a preamble placement is refused.
+With `--preamble`, such an arm is refused because it already set `prompt_mode`.
+
+**Placement follows the arm's `prompt_mode`.**
+A tilth arm in `replace` (every built-in arm) gets `prompt_mode: "preamble"`: the preamble is the whole system prompt.
+A tilth arm in `append` (a stock arm from `--modes-json`) gets `prompt_mode: "append_preamble"`: Claude Code keeps its stock system prompt, and the run passes `--append-system-prompt <preamble>\n<cwd line>`.
+Any other `prompt_mode` is refused.
+A Codex cell refuses `append_preamble`; Codex has no stock prompt to append to.
+Every `append` and `append_preamble` arm passes `--settings '{"autoMemoryEnabled": false}'`, merged with the strict hook settings under `--strict-file-tools`.
+The stock prompt carries a Memory section that points at the host's `~/.claude/projects/<cwd-slug>/memory`; the setting removes it.
+A `replace` or `preamble` arm passes no such setting, so its run key is unchanged.
+
+To A/B the preamble appended to the stock prompt against the preamble that replaces it, load two stock arms and run them with and without `--preamble`:
+
+```json
+[
+  {"name": "baseline_stock", "tools": ["Read", "Edit", "Grep", "Glob", "Bash"],
+   "description": "Native tools on Claude Code's stock system prompt", "prompt_mode": "append"},
+  {"name": "tilth_stock", "tools": [], "mcp_config_path": "benchmark/fixtures/tilth_mcp.json",
+   "description": "tilth MCP on Claude Code's stock system prompt", "prompt_mode": "append"}
+]
+```
+
+```bash
+# stock prompt + appended preamble (tilth_stock becomes append_preamble)
+python benchmark/run.py --modes-json stock.json --preamble ...
+# the preamble replaces the system prompt (built-in tilth arm)
+python benchmark/run.py --modes tilth --preamble ...
+```
 `run_plan(preamble=True)` is the same switch for library callers such as evolve.
 
 **Analyze:**

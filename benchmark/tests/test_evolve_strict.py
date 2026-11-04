@@ -588,8 +588,8 @@ def test_a_candidate_build_failure_in_the_gate_is_a_build_stage(monkeypatch: pyt
     original = run.build_candidate
 
     def failing(sha, repo=None):
-        if sha != world.seed_sha:
-            raise run.CandidateBuildFailed("cargo build failed", "error[E0432]", [])
+        if sha != world.seed_sha:  # the real build_candidate raises a plain RuntimeError for a compile failure
+            raise RuntimeError(f"cargo build --release --locked failed at {sha}:\nerror[E0432]: unresolved import")
         return original(sha, repo)
 
     monkeypatch.setattr(run, "build_candidate", failing)

@@ -474,6 +474,32 @@ def test_opencode_result_text_single_turn_unchanged():
 _STREAMS = Path(__file__).parent / "fixtures" / "streams"
 
 
+def test_background_wakeup_result_events_are_summed_per_segment():
+    # Real stream: a backgrounded command adds a second result event. Per-segment
+    # fields (turns, duration_ms, usage) sum; total_cost_usd, modelUsage and
+    # duration_api_ms are cumulative, so the last event wins: segment 2 reports
+    # 136607 = 130386 + 6221 API ms in a 6253 ms segment. Tool-result bodies are trimmed.
+    result = parse_stream_json((_STREAMS / "claude_background_wakeup.jsonl").read_text())
+
+    assert result.num_turns == 21 + 2
+    assert result.duration_ms == 252709 + 6253
+    assert result.duration_api_ms == 136607
+    assert result.total_input_tokens == 32 + 4
+    assert result.total_output_tokens == 14844 + 269
+    assert result.total_cache_creation_tokens == 53500 + 2768
+    assert result.total_cache_read_tokens == 542319 + 108377
+    assert result.total_cost_usd == 0.44134359999999995
+    assert result.model_usage["claude-sonnet-5-5"]["outputTokens"] == 15113
+
+
+def test_result_event_without_num_turns_counts_the_parsed_turns():
+    events = [_assistant_event("one"), _assistant_event("two"), {"type": "result", "total_cost_usd": 0.01}]
+
+    result = parse_stream_json("\n".join(json.dumps(e) for e in events))
+
+    assert result.num_turns == len(result.turns) > 0
+
+
 def test_present_native_cost_is_used():
     result = parse_stream_json((_STREAMS / "claude_native_cost.jsonl").read_text())
 

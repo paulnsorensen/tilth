@@ -86,7 +86,8 @@ class ModeConfig:
     plugin_sha256: Optional[str] = None
     # "preamble" replaces the system prompt with the launcher preamble (``tilth claude``, ``tilth codex``).
     # Only the harness sets it (``--preamble``), with ``preamble`` read from the tree under test.
-    prompt_mode: Literal["replace", "append", "preamble"] = "replace"
+    # "append_preamble" keeps claude's stock prompt and appends the preamble to it (Claude only).
+    prompt_mode: Literal["replace", "append", "preamble", "append_preamble"] = "replace"
     preamble: Optional[str] = None
 
 

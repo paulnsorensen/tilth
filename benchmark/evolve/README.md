@@ -38,9 +38,12 @@ seed $32, baseline $32).
 `--finish-reserve-usd USD` holds USD instead. Preflight refuses a value below the `winner` part (exit 2), because
 finish buys those cells in any case. A negative or non-finite value is a usage error.
 
-The baseline part still holds money that `buy_baselines` spends right after preflight, before any candidate cell.
-Only a baseline rep that fails there reaches finish. A refresh of the reserve after `buy_baselines` would release
-that part; it is not done yet.
+The baseline part holds money that `buy_baselines` spends right after preflight, before any candidate cell. When
+`buy_baselines` succeeds, `Evolution._refresh_reserve` computes the reserve again with the same logic and lowers the
+ledger reserve. The baseline cells are then stored, so only the winner and unstored seed parts remain, and the log
+shows `reserve: $A -> $B after the baselines`. Only a baseline rep that fails there reaches finish, and the refresh
+counts it. An explicit `--finish-reserve-usd` is not refreshed. For the preamble-r2 run, this releases the $24.60
+baseline share to the search.
 
 ## Incomplete cells
 
@@ -173,6 +176,28 @@ repaired. `--no-repair` turns the repair off.
 A long failure tail keeps the compiler, clippy, test, or fmt error blocks that cargo printed before its closing
 `build failed` lines, plus the last ten lines.
 
+### Failed-patch memory
+
+A candidate that failed a deterministic gate (`apply`, `just check`, `integrity`, `build`, or `hook gate`) is a known
+failure, kept in `Evolution.failed` (`evolve/failures.py`) by the first 12 characters of its content id. A
+cheap-tier or paid-tier loss is a score, not a known failure. A build that cannot run (a timeout, a full disk, a
+cache or network fault, the seed's hook build) fails at `build infra`, not `build`, and a `just check` timeout fails
+at `just check infra`: neither says anything about the patch, so the memory skips them and `--avoid-failures-from`
+does not read them. A log from before `just check infra` existed records a `just check` timeout at `just check`, with
+`just check timed out after N s` as its whole tail; the log reader skips that entry too. Only a nonzero
+`cargo build` exit at the candidate's own commit is `build`. A `build infra` fault also keeps nothing in the run's
+own memo, so a later evaluation of the same patch builds it again.
+
+- A known failure gets no repair call, no `just check`, no build, and no cell. The cascade fails it at the stage it
+  failed before, and the log shows `candidate <id>: skipped, it already failed at <stage>`.
+- Every `src_patch` proposal receives one `failed_patches` record: the latest five known failures, each as `id`,
+  `stage`, and the first error line (a failed test name, else the first compiler error). The proposer header tells
+  the model not to propose them again. The list is not filtered by directive.
+- `--avoid-failures-from RUN_DIR` (repeatable) seeds the memory from the `log.txt` of a prior run. A directory
+  without `log.txt` is refused (exit 2). The memory also reads this run's own `log.txt`, so a resume keeps it. No
+  state file exists: `Evolution._fail` already writes each gate failure to the log. The prior run must use the same
+  `--seed-sha`: the content id does not include the seed commit, and a gate verdict holds only on its own seed.
+
 ### Pinned-test updates in repair
 
 Adding tests needs no repair. A `src_patch` may add whole new `#[test]` fns inside an existing `#[cfg(test)]`
@@ -256,11 +281,13 @@ diff under "Test changes for review". Nothing merges automatically.
 
 ## Auto-format
 
-The proposer's export is `cargo fmt`-formatted before its cumulative diff is taken, so the content id and every later
-proposal build on formatted code. The materializer runs `cargo fmt` on the applied tree before it commits, so
-as it is, and `just check` reports the real error. A proposer `cargo fmt` failure is logged, and the diff stays
-unformatted. The materializer rewrites the byte-lock literals after the first format, so it formats the tree again
-when the rewrite changes it.
+The proposer's export is formatted before its cumulative diff is taken, so the content id and every later
+proposal build on formatted code. The materializer formats the applied tree before it commits. The formatter is
+`rustfmt` on the `src/**/*.rs` files with the edition of `Cargo.toml` (`evolve/rustfmt.py`), not `cargo fmt`: an
+export has no `tests/` directory, and `cargo fmt` exits 1 when `Cargo.toml` declares a `[[test]]` target whose file
+is missing. A failed format is logged, the tree stays as it is, and `just check` reports the real error. A
+proposer format failure leaves the diff unformatted. The materializer rewrites the byte-lock literals after the
+first format, so it formats the tree again when the rewrite changes it.
 
 ## Rejected-candidate cleanup
 

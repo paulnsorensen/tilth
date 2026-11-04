@@ -139,6 +139,21 @@ def test_format_tree_formats_a_tiny_crate(tmp_path: Path) -> None:
     assert (tmp_path / "src" / "lib.rs").read_text() == FORMATTED_FN
 
 
+@fmt_needed
+def test_format_tree_formats_an_export_whose_manifest_declares_a_missing_test_target(tmp_path: Path) -> None:
+    # The proposer export holds src, prompts, Cargo.toml and Cargo.lock only; the real manifest declares tests/bdd.
+    (tmp_path / "Cargo.toml").write_text(
+        '[package]\nname = "fixture"\nversion = "0.1.0"\nedition = "2021"\n\n'
+        '[[test]]\nname = "bdd"\npath = "tests/bdd/main.rs"\nharness = false\n')
+    (tmp_path / "src" / "edit").mkdir(parents=True)
+    (tmp_path / "src" / "lib.rs").write_text(UNFORMATTED_FN)
+    (tmp_path / "src" / "edit" / "mod.rs").write_text(UNFORMATTED_FN)
+
+    assert format_tree(tmp_path) is True
+    assert (tmp_path / "src" / "lib.rs").read_text() == FORMATTED_FN
+    assert (tmp_path / "src" / "edit" / "mod.rs").read_text() == FORMATTED_FN
+
+
 def test_the_proposers_cumulative_diff_is_formatted_so_the_content_id_is_too(world) -> None:  # noqa: F811
     seen: list[Path] = []
 

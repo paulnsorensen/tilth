@@ -553,7 +553,7 @@ class SkillUnavailableError(ArmUnavailableError):
 
 def _uses_claude_session_features(mode: ModeConfig) -> bool:
     """Skill arms and appended-prompt arms need Claude's session init, which other runners lack."""
-    return _is_skill_arm(mode) or mode.prompt_mode == "append"
+    return _is_skill_arm(mode) or mode.prompt_mode in _APPENDED_PROMPT_MODES
 
 
 def _expected_plugin_skills(plugin_dir: str) -> list[str]:
@@ -1178,7 +1178,7 @@ def cell_identity(
         **({"git_sha": mode.git_sha, "binary_sha256": mode.binary_sha256} if _is_tilth_arm(mode) else {}),
         **({"plugin_sha256": mode.plugin_sha256} if mode.plugin_dir else {}),
         **({"preamble_sha256": hashlib.sha256(_base_prompt(mode).encode("utf-8")).hexdigest()}
-           if mode.prompt_mode == "preamble" else {}),
+           if mode.prompt_mode in _PREAMBLE_PROMPT_MODES else {}),
     }
     key_inputs = {
         **identity, "task": task_name, "model": MODELS[model_name], "mode": mode_name,
@@ -1384,6 +1384,8 @@ def _codex_command(
         f'{{path={json.dumps(path)},enabled=false}}' for path in skill_paths
     )
     cmd += ["-c", f"skills.config=[{skills_config}]"]
+    if mode.prompt_mode == "append_preamble":
+        raise ValueError(f"mode '{mode.name}': prompt_mode append_preamble is Claude-only; Codex has no stock prompt to append to")
     if mode.prompt_mode == "preamble":
         # As `tilth codex` does: the preamble replaces Codex's model instructions, not the developer message.
         cmd += ["-c", f"{_PREAMBLE_KEY}{json.dumps(str(_preamble_file(_base_prompt(mode))))}"]
@@ -1444,6 +1446,12 @@ def _opencode_command(
     return cmd, opencode_config
 
 
+_APPENDED_PROMPT_MODES = ("append", "append_preamble")
+_PREAMBLE_PROMPT_MODES = ("preamble", "append_preamble")
+# The stock prompt's Memory section points at the host's ~/.claude/projects memory dir; keep it out of the cell.
+_STOCK_PROMPT_SETTINGS = {"autoMemoryEnabled": False}
+
+
 @dataclass(frozen=True)
 class _ClaudeArmFlags:
     """The arm-shape facts that decide a Claude argv."""
@@ -1459,7 +1467,7 @@ def _claude_arm_flags(mode: ModeConfig) -> _ClaudeArmFlags:
         skill=_is_skill_arm(mode),
         woz=_is_woz_arm(mode),
         mcp=bool(mode.mcp_config_path),
-        append_prompt=mode.prompt_mode == "append",
+        append_prompt=mode.prompt_mode in _APPENDED_PROMPT_MODES,
     )
 
 
@@ -1495,8 +1503,10 @@ def _claude_command(
     ]
     cwd_prompt = f"Your current working directory is: {repo_path}" + ("\n" + _STRICT_SYSTEM_GUIDANCE if strict_file_tools else "")
     if arm.append_prompt:
-        # Keep claude's own system prompt (and its native skill handling); add only the cwd line.
-        cmd += ["--append-system-prompt", cwd_prompt]
+        # Keep claude's own system prompt (and its native skill handling); add the cwd line, and the
+        # preamble when the arm carries one.
+        appended = _base_prompt(mode) + "\n" + cwd_prompt if mode.prompt_mode == "append_preamble" else cwd_prompt
+        cmd += ["--append-system-prompt", appended]
     else:
         # A preamble arm replaces the system prompt with the preamble, as `tilth claude` does.
         cmd += ["--system-prompt", _base_prompt(mode) + "\n" + cwd_prompt]
@@ -1516,7 +1526,12 @@ def _claude_command(
         cmd += ["--agent", "woz:code"]
 
     if strict_file_tools:
-        cmd += ["--settings", _strict_bash_settings(*_strict_hook_spec(mode, strict_hook_binary))]
+        settings = _strict_bash_settings(*_strict_hook_spec(mode, strict_hook_binary))
+        if arm.append_prompt:
+            settings = json.dumps({**json.loads(settings), **_STOCK_PROMPT_SETTINGS})
+        cmd += ["--settings", settings]
+    elif arm.append_prompt:
+        cmd += ["--settings", json.dumps(_STOCK_PROMPT_SETTINGS)]
     tools_list = (list(_STRICT_BASELINE_TOOLS) if not arm.mcp else ["Bash"]) if strict_file_tools else list(mode.tools)
     if arm.skill and tools_list and "Skill" not in tools_list:
         tools_list.append("Skill")
@@ -2187,13 +2202,19 @@ def read_preamble(sha: str | None = None, *, repo: Path | None = None) -> str:
 
 
 def preamble_mode(mode: ModeConfig, text: str) -> ModeConfig:
-    """``mode`` with ``text`` as its whole system prompt, in place of ``SYSTEM_PROMPT``."""
-    return replace(mode, prompt_mode="preamble", preamble=text)
+    """``mode`` with ``text`` as its whole system prompt, in place of ``SYSTEM_PROMPT``.
+
+    A stock arm (``append``) keeps claude's own prompt and gets ``text`` appended to it instead.
+    """
+    placement = {"replace": "preamble", "append": "append_preamble"}.get(mode.prompt_mode)
+    if placement is None:
+        raise ValueError(f"mode '{mode.name}': prompt_mode {mode.prompt_mode} cannot take a preamble")
+    return replace(mode, prompt_mode=placement, preamble=text)
 
 
 def _base_prompt(mode: ModeConfig) -> str:
     """The system prompt text of an arm: its preamble for a preamble arm, else ``SYSTEM_PROMPT``."""
-    if mode.prompt_mode != "preamble":
+    if mode.prompt_mode not in _PREAMBLE_PROMPT_MODES:
         return SYSTEM_PROMPT
     if mode.preamble is None:
         raise ValueError(f"mode '{mode.name}' is a preamble arm with no preamble text")
@@ -2550,11 +2571,13 @@ def _validate_plugin_arm(path: Path, mode: ModeConfig) -> ModeConfig:
     return replace(mode, plugin_sha256=_tree_sha256(Path(mode.plugin_dir)))
 
 
-def load_modes_json(path: Path) -> list[str]:
+def load_modes_json(path: Path, preamble_sha: str | None = None) -> list[str]:
     """Register the arms of a ``--modes-json`` file in ``MODES``; return their names in file order.
 
     An entry takes ``ModeConfig`` fields only, so no arm can set its own budget or timeout:
     the harness owns both caps. A plugin arm loads skills and serves no MCP server.
+    A tilth arm may set a preamble placement (``preamble`` or ``append_preamble``); the harness reads the
+    text at ``preamble_sha``, else from this checkout, so one run can hold arms with different placements.
     """
     try:
         entries = json.loads(path.read_text())
@@ -2579,8 +2602,13 @@ def load_modes_json(path: Path) -> list[str]:
         mode = ModeConfig(**{"mcp_config_path": None, **entry})
         if not isinstance(mode.tools, list) or not all(isinstance(tool, str) for tool in mode.tools):
             raise ValueError(f"--modes-json {path}: mode '{mode.name}' tools must be a list of strings")
-        if mode.prompt_mode not in ("replace", "append"):
-            raise ValueError(f"--modes-json {path}: mode '{mode.name}' prompt_mode must be replace or append")
+        if mode.prompt_mode not in ("replace", "append", *_PREAMBLE_PROMPT_MODES):
+            raise ValueError(f"--modes-json {path}: mode '{mode.name}' prompt_mode must be replace, append, "
+                             f"preamble or append_preamble")
+        if mode.prompt_mode in _PREAMBLE_PROMPT_MODES:
+            if not _is_tilth_arm(mode):
+                raise ValueError(f"--modes-json {path}: mode '{mode.name}': only a tilth arm takes a preamble")
+            mode = replace(mode, preamble=read_preamble(preamble_sha))
         if mode.name in MODES or mode.name in loaded:
             raise ValueError(f"--modes-json {path}: mode name '{mode.name}' is already taken")
         if mode.plugin_dir:
@@ -2624,7 +2652,7 @@ def _select_arms(args: argparse.Namespace, models: list[str], timestamp: str) ->
         if args.runner == "codex" and "tilth_forced" in modes:
             raise ValueError("tilth_forced is not supported by the codex runner")
     elif args.modes_json:
-        modes = load_modes_json(args.modes_json)
+        modes = load_modes_json(args.modes_json, preamble_sha=args.candidate_sha)
         if any(RUNNERS[model] != "claude" for model in models) and any(
             _uses_claude_session_features(MODES[name]) for name in modes
         ):
@@ -2638,7 +2666,10 @@ def _select_arms(args: argparse.Namespace, models: list[str], timestamp: str) ->
 
 
 def _apply_preamble(modes: list[str], models: list[str], experiment: object, candidate_sha: str | None) -> None:
-    """Make every selected tilth arm a preamble arm, with the preamble at ``candidate_sha`` or in this checkout."""
+    """Make every selected tilth arm a preamble arm, with the preamble at ``candidate_sha`` or in this checkout.
+
+    A replace arm gets the preamble as its whole system prompt; a stock (append) arm gets it appended.
+    """
     if experiment is not None:
         raise ValueError("a pinned experiment manifest owns its arms; it cannot be combined with --preamble")
     if any(RUNNERS[model] not in ("claude", "codex") for model in models):
@@ -2646,7 +2677,7 @@ def _apply_preamble(modes: list[str], models: list[str], experiment: object, can
     tilth_modes = [name for name in modes if _is_tilth_arm(MODES[name])]
     if not tilth_modes:
         raise ValueError("no selected arm serves tilth")
-    if appended := [name for name in tilth_modes if MODES[name].prompt_mode != "replace"]:
+    if appended := [name for name in tilth_modes if MODES[name].prompt_mode not in ("replace", "append")]:
         raise ValueError(f"arm(s) {appended} already set prompt_mode")
     text = read_preamble(candidate_sha)
     for name in tilth_modes:
