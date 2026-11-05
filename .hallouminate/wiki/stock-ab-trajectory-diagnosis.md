@@ -96,32 +96,35 @@ Ordered by evidence. Prompt steering cannot remove causes 1–5, 7 or 8, so the 
 - **Minimal repro tasks.** Use `rg_trait_implementors` for cause 1 and the edit sub-task of `chain:rg-edit-6` for causes 3–5.
 - **Paid check.** Run `chain:rg-edit-6` and `chain:express-edit-6`, `tilth_stock` against `baseline_stock`, with more reps. The chains carry the whole gap.
 
-## Litmus re-run after the fixes (2026-11-04)
+## Litmus re-run after the fixes (2026-11-04, 2026-11-05)
 
-#433, #434, #435 and #436 fix causes 2, 3, 4, 5 and 8, and narrow cause 1. A paid re-run of `chain:rg-edit-6`, `tilth_stock`, 3 reps, at main `a9ab01f4` cut the cell cost by 18%. The gap to `baseline_stock` fell from +30% to +7%. **The re-run omitted `--bare`, and the November 2 rows used it, so the comparison is confounded.** See the second bullet.
+#433, #434, #435 and #436 fix causes 2, 3, 4, 5 and 8, and narrow cause 1. Two paid re-runs of `chain:rg-edit-6`, `tilth_stock`, 3 reps, at main `a9ab01f4` test them. **With `--bare`, as in the November 2 rows, tilth costs $2.17 per cell against $2.46 for baseline (−12%).** Before the fixes the gap was +30%. The first re-run omitted `--bare` and cost $2.62.
 
-| Per cell, 3 reps | baseline_stock (Nov 2) | tilth_stock before | tilth_stock after |
-|---|---|---|---|
-| `--bare` | yes | yes | no |
-| Correct | 3/3 | 3/3 | 3/3 |
-| Cost (range) | $2.46 ($2.16–2.80) | $3.19 ($2.82–3.54) | $2.62 ($2.53–2.76) |
-| Context tokens | 4.47M | 6.28M | 5.95M |
-| First API call context | 7.4k | 9.3k | 11.5k |
-| API calls | 51.7 | 56.7 | 60.7 |
-| Actions per tool-using API call | 3.87 | 4.61 | 4.23 |
-| Bash calls | 6.0 | 7.7 | 13.3 |
-| `tilth_write` errors | n/a | 3.00 | 0.33 |
-| Seen-line rejections | n/a | 2.67 | 0.33 |
-| `mode=full` reads | n/a | 7.67 | 0 |
-| Batches killed by a bad pattern | n/a | 2 (total) | 0 |
-| Read result chars | 190k | 209k | 157k |
-| Search result chars | 46k (`Grep`) | 98k | 87k |
+| Per cell, 3 reps | baseline_stock (Nov 2) | tilth_stock before | after, no `--bare` | after, `--bare` |
+|---|---|---|---|---|
+| `--bare` | yes | yes | no | yes |
+| Correct | 3/3 | 3/3 | 3/3 | 3/3 |
+| Cost (range) | $2.46 ($2.16–2.80) | $3.19 ($2.82–3.54) | $2.62 ($2.53–2.76) | $2.17 ($2.03–2.26) |
+| Context tokens | 4.47M | 6.28M | 5.95M | 4.17M |
+| First API call context | 7.4k | 9.3k | 11.5k | 9.3k |
+| API calls | 51.7 | 56.7 | 60.7 | 52.3 |
+| Actions per tool-using API call | 3.87 | 4.61 | 4.23 | 3.03 |
+| Bash calls | 6.0 | 7.7 | 13.3 | 20.3 |
+| `tilth_write` calls | n/a | 15.3 | 13.3 | 5.0 |
+| `tilth_write` errors | n/a | 3.00 | 0.33 | 1.33 |
+| Seen-line rejections | n/a | 2.67 | 0.33 | 0 |
+| `mode=full` reads | n/a | 7.67 | 0 | 0 |
+| Batches killed by a bad pattern | n/a | 2 (total) | 0 | 0 |
+| Read result chars | 190k | 209k | 157k | 139k |
+| Search result chars | 46k (`Grep`) | 98k | 87k | 57k |
 
-- **Batching is not the gap.** Count actions, not tool calls. An action is one read path, search query, edit op, or built-in tool call. Tilth batches inside one call: 2.05 paths per read, 3.07 queries per search and 8.85 ops per write. Baseline sends parallel calls instead. Session analytics `model_turns.tool_calls` counts calls, so its 1.1 against 3.6 hides this.
-- **The re-run used the user's harness.** Without `--bare`, `run.py` does not pass `--setting-sources ""`. The arm then ran the user's SessionStart hooks and loaded `~/.claude/CLAUDE.md`. The tilth prompts grew by 10 bytes, but the first API call grew by 2.2k tokens. Of 40 Bash calls, 28 use `eatmydata`, a rule from that file; the November 2 runs have none. Most of the extra Bash calls run `cargo check` or `cargo test`. They give most of the 9 extra API calls against baseline. Re-run `tilth_stock` with `--bare` for a clean comparison.
-- **Other gap sources.** Tilth search results are about twice the size of `Grep` results. With `--bare`, the tilth tool schemas add about 1.9k tokens to each API call.
-- **Cause 1 is smaller, not gone.** Ambiguous search results fell from 3.67 to 3.00 per cell.
-- **Setup gotchas.** `run.py` keeps only an allowlist of environment keys, so `XDG_STATE_HOME` does not reach tilth. The seen store then writes to `~/.local/state/tilth/seen`, one file per cell checkout. The CLI pin 2.1.310 had to be reinstalled with `mise install aqua:anthropics/claude-code@2.1.310` and passed through `TILTH_BENCH_CLAUDE`. Pass `--bare` to match the stock A/B rows.
-- **Limits.** n=3. The baseline rows come from November 2, not from the same day. The run started before #432, so the `/tmp` aging guard did not apply. Spend: $7.87, budget `litmus-rg-edit-6`.
+- **Tilth is at parity or better.** n=3 and the cost ranges overlap, so the 12% is not significant. Context tokens are 7% below baseline, and API calls are equal.
+- **Two of three `--bare` reps edit through the shell.** Under `--bare` no hook blocks shell edits. In turn 6, the `bool` to `Flow` migration, rep 0 makes 17 `perl -pi` edits and no `tilth_write` call. Rep 2 writes 11 Python edit scripts under `/tmp/mig`. Only rep 1 edits through `tilth_write` (14 calls). It costs $2.23, inside the baseline range. The November 2 tilth rows have no shell edits, and these runs do not show the cause.
+- **Batching is not the gap.** Count actions, not tool calls. An action is one read path, search query, edit op, or built-in tool call. Tilth batches inside one call: 2.05 paths per read, 3.07 queries per search and 8.85 ops per write (no `--bare` run). Baseline sends parallel calls instead. Session analytics `model_turns.tool_calls` counts calls, so its 1.1 against 3.6 hides this. Shell edits count as one action each, so the `--bare` run falls to 3.03.
+- **The first re-run used the user's harness.** Without `--bare`, `run.py` does not pass `--setting-sources ""`. The arm then ran the user's SessionStart hooks and loaded `~/.claude/CLAUDE.md`. Of 40 Bash calls, 28 use `eatmydata`, a rule from that file. Most of the extra Bash calls run `cargo check` or `cargo test`. The `--bare` re-run confirms the confound: the first call falls from 11.5k to 9.3k tokens, and API calls fall from 60.7 to 52.3.
+- **Other gap sources.** Tilth search results are still larger than `Grep` results: 57k against 46k characters per cell. The tilth tool schemas add about 1.9k tokens to each API call.
+- **Cause 1 is smaller, not gone.** Ambiguous search results fell from 3.67 per cell to 3.00 (no `--bare`) and 1.33 (`--bare`).
+- **Setup gotchas.** `run.py` keeps only an allowlist of environment keys, so `XDG_STATE_HOME` does not reach tilth. The seen store then writes to `~/.local/state/tilth/seen`, one file per cell checkout. The CLI pin 2.1.310 had to be reinstalled with `mise install aqua:anthropics/claude-code@2.1.310` and passed through `TILTH_BENCH_CLAUDE`. Pass `--bare` to match the stock A/B rows. `bare` is part of the run key, so a `--bare` run does not reuse rows without it.
+- **Limits.** n=3. The baseline rows come from November 2, not from the same day. The first re-run started before #432, so the `/tmp` aging guard did not apply. Spend: $7.87 (budget `litmus-rg-edit-6`) and $6.52 (budget `litmus-rg-edit-6-bare`).
 
-_Source: stream analysis of `benchmark/results/stock-ab/rows_streams/` (budget `stock-ab-1`), request captures of the four arms' first API call, `chain:rg-edit-6` rep 0 trajectories, the 2026-11-04 litmus streams and rows (`bare`, `git_sha`), and session-analytics `model_turns` · Updated: 2026-11-04 · Supersedes: none_
+_Source: stream analysis of `benchmark/results/stock-ab/rows_streams/` (budget `stock-ab-1`), request captures of the four arms' first API call, `chain:rg-edit-6` rep 0 trajectories, the 2026-11-04 and 2026-11-05 litmus streams and rows (`bare`, `git_sha`), and session-analytics `model_turns` · Updated: 2026-11-05 · Supersedes: none_
