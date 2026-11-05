@@ -16,6 +16,8 @@ import time
 from collections.abc import Callable, Collection, Iterable, Mapping
 from pathlib import Path
 
+import run
+
 DEFAULT_MODEL = "gpt-6-astra"
 DEFAULT_EFFORT = "xhigh"
 DEFAULT_MAX_RUNS = 10
@@ -34,19 +36,30 @@ PROMPT = (
     "expected_calls_saved (a number per run). Name no absolute path."
 )
 
+# The isolation flags of run.py's Codex cells: no host config, rules, hooks, plugins, skill search, apps,
+# sub-agents, MCP servers, or project docs. ``argv`` also turns off each host skill, as the cells do, and
+# ``codex_runner`` gives the run a temp CODEX_HOME, which keeps the host's AGENTS.md out.
+ISOLATION = ("--ephemeral", "--ignore-user-config", "--ignore-rules", "--enable", "skip_host_skill_discovery",
+             "--disable", "skill_search", "--disable", "plugins", "--disable", "hooks", "--disable", "apps",
+             "--disable", "multi_agent", "--disable", "skill_mcp_dependency_install",
+             "-c", "mcp_servers={}", "-c", "project_doc_max_bytes=0")
+
 Runner = Callable[[list[str], float], int]
 
 
 def codex_runner(argv: list[str], timeout: float) -> int:
-    """Run ``argv`` in its own session; kill the whole group on a timeout. Returns the exit code."""
-    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                               start_new_session=True)
-    try:
-        return process.wait(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        os.killpg(process.pid, signal.SIGKILL)
-        process.wait()
-        raise
+    """Run ``argv`` in its own session with the runner env and a temp CODEX_HOME; kill the whole group on a
+    timeout. Returns the exit code."""
+    env = run.build_runner_env("codex", tilth_bin=None)
+    with run.isolated_codex_home(env, "tilth-deepdiag-codex-"):
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, env=env, start_new_session=True)
+        try:
+            return process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            raise
 
 
 def parse_causes(text: str) -> list[dict] | None:
@@ -116,8 +129,10 @@ class DeepDiagnosis:
         return [{"deep_diagnosis": self.memo[cid]}] if self.memo[cid] else []
 
     def argv(self, scratch: Path) -> list[str]:
+        skills_off = run.codex_skills_off(run._codex_skill_paths(scratch, os.environ))
         return ["codex", "exec", "-m", self.model, "-c", f"model_reasoning_effort={self.effort}", "-s", "read-only",
-                "--skip-git-repo-check", "-C", str(scratch), "-o", str(scratch / "answer.txt"), PROMPT]
+                "--skip-git-repo-check", "-C", str(scratch), "-o", str(scratch / "answer.txt"), *ISOLATION,
+                "-c", skills_off, PROMPT]
 
     def _stage(self, scratch: Path, tilth_rows: list[Mapping], baseline_rows: list[Mapping]) -> list[dict]:
         """Copy dev-split trajectories under neutral names and return the summary rows."""

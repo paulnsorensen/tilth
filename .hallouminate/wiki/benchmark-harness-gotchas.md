@@ -257,4 +257,23 @@ Instead, exclude the tree from aging once per host: `echo 'x /tmp/tilth_bench' |
 This rule covers only the default tree. The rg-flow grader uses `$RG_FLOW_TARGET_DIR` instead when it is set (`rg_flow_migration_tasks.py:32`). Exclude that path too, or put it outside an aged directory.
 A grader build failure that is not the agent's fault still reads as a wrong answer. Check `sub_tasks[].reason` before you trust a uniform failure across all arms.
 
-_Source: PR #277 at 411e183; stock-prompt A/B run log, `systemd-tmpfiles-clean` journal (2026-11-02), and the A/B `rows.jsonl` cost sum (local, untracked) · Updated: 2026-11-04 · Supersedes: no historical measurements; narrows general claims to their measured configurations_
+## Host instructions and hooks: capture probe (2026-11-05)
+
+A zero-spend probe ran each agent process's real argv against a local server that saves each request body and refuses it. It searched the bodies for text from `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, and a host SessionStart hook. Versions: Claude Code CLI 2.1.310, codex-cli 0.166.0.
+
+| Process | Result |
+|---|---|
+| Plain `claude -p` and plain `codex exec` (controls) | Both leak the instructions and the hook output, so the probe can see a leak |
+| Evolve Claude cells (`bare=True`, so `--setting-sources ""`) | Clean |
+| Evolve proposer, reflection, and judge | Clean |
+| `--deep-diagnosis` before the fix | Leaks `AGENTS.md`, the hook output, and 86 host skills |
+| `--deep-diagnosis` after the fix | Clean. Only the 4 Codex system skills stay |
+| `run.py` Codex cells | Leak `~/.codex/AGENTS.md`. Hooks stay out. Open |
+
+- `--setting-sources ""` keeps `~/.claude/CLAUDE.md`, user hooks, plugins, and agents out. The init event then lists only `@builtin` plugins.
+- `codex exec --ignore-user-config` skips only `config.toml`. Codex still sends `$CODEX_HOME/AGENTS.md` as a user message, `# AGENTS.md instructions`. `project_doc_max_bytes=0` does not stop it, and no 0.166.0 feature flag does.
+- `skip_host_skill_discovery` does not stop `~/.agents/skills`. Only the per-path `skills.config` entries do (`run.codex_skills_off`).
+- Deep diagnosis now uses the cells' isolation flags and per-path skill switches. It also uses the runner env allowlist and `run.isolated_codex_home`, a temp `CODEX_HOME` that holds only a copy of `auth.json`. A refreshed token goes back to the host file.
+- To probe Codex with no spend, add a provider with `-c model_provider=<name>` and `model_providers.<name>.base_url`, `wire_api="responses"`, and `env_key`. Start the `env_key` name with `OPENAI_`, so the runner env allowlist keeps it.
+
+_Source: PR #277 at 411e183; stock-prompt A/B run log, `systemd-tmpfiles-clean` journal (2026-11-02), and the A/B `rows.jsonl` cost sum (local, untracked); 2026-11-05 capture probe (local, untracked) · Updated: 2026-11-05 · Supersedes: no historical measurements; narrows general claims to their measured configurations_

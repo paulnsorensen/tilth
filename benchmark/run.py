@@ -280,6 +280,28 @@ def isolated_call_target() -> auth.AuthTarget:
     return auth.AuthTarget(cwd=Path(tempfile.gettempdir()), env=env, loads_user_settings=False)
 
 
+@contextmanager
+def isolated_codex_home(env: dict[str, str], prefix: str):
+    """Point ``env`` at a temp CODEX_HOME that holds only a copy of the host's ``auth.json``.
+
+    ``--ignore-user-config`` skips only ``config.toml``. Codex still sends ``$CODEX_HOME/AGENTS.md`` as user
+    instructions, and it finds hooks, rules, plugins, and agents there. A token that Codex refreshes during the
+    call is copied back to the host file.
+    """
+    host_auth = Path(env.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
+    seed = host_auth.read_bytes() if host_auth.is_file() else None
+    with tempfile.TemporaryDirectory(prefix=prefix) as home:
+        call_auth = Path(home) / "auth.json"
+        if seed is not None:
+            _copy_private(host_auth, call_auth)
+        env["CODEX_HOME"] = home
+        try:
+            yield
+        finally:
+            if seed is not None and call_auth.is_file() and call_auth.read_bytes() != seed:
+                _copy_private(call_auth, host_auth)
+
+
 def budget_capped(stream: str) -> bool:
     """True when a claude stream's last result event is ``error_max_budget_usd``: the agent spent its own cap.
 
@@ -388,6 +410,11 @@ def _codex_skill_roots(repo_path: Path, env: Mapping[str, str]) -> list[Path]:
         if path.is_dir():
             roots.add(path.resolve())
     return sorted(roots)
+
+
+def codex_skills_off(skill_paths: list[str]) -> str:
+    """The ``-c`` value that turns off each host skill: Codex lists every skill it finds to the model."""
+    return "skills.config=[" + ",".join(f"{{path={json.dumps(path)},enabled=false}}" for path in skill_paths) + "]"
 
 
 def _codex_skill_paths(repo_path: Path, env: Mapping[str, str]) -> list[str]:
@@ -1380,10 +1407,7 @@ def _codex_command(
         "-c", "project_doc_max_bytes=0",
         "-c", f'projects.{json.dumps(str(repo_path))}.trust_level="untrusted"',
     ]
-    skills_config = ",".join(
-        f'{{path={json.dumps(path)},enabled=false}}' for path in skill_paths
-    )
-    cmd += ["-c", f"skills.config=[{skills_config}]"]
+    cmd += ["-c", codex_skills_off(skill_paths)]
     if mode.prompt_mode == "append_preamble":
         raise ValueError(f"mode '{mode.name}': prompt_mode append_preamble is Claude-only; Codex has no stock prompt to append to")
     if mode.prompt_mode == "preamble":

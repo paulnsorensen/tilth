@@ -4,14 +4,17 @@ No test calls codex: the runner is a stub that writes the answer file named in i
 '''
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import run
 from evolve import candidate as candidates
 from evolve import deepdiag, diagnosis, loop
 from evolve_support import DEV, TEST, build, seed_candidate
@@ -53,7 +56,13 @@ def make(tmp_path: Path, runner, logs: list[str] | None = None, *, forbidden=('s
 # --- the codex call ---
 
 
-def test_the_command_names_the_model_effort_sandbox_and_scratch_dir(tmp_path) -> None:
+def test_the_command_names_the_model_effort_sandbox_and_scratch_dir(tmp_path, monkeypatch) -> None:
+    home = tmp_path / 'home'
+    skill = home / '.agents' / 'skills' / 'mine' / 'SKILL.md'
+    skill.parent.mkdir(parents=True)
+    skill.write_text('---\nname: mine\n---\n')
+    monkeypatch.setenv('HOME', str(home))
+    monkeypatch.setenv('CODEX_HOME', str(home / '.codex'))
     stub = Stub()
     deep = make(tmp_path, stub, model='m-1', effort='high', timeout=42)
 
@@ -64,8 +73,68 @@ def test_the_command_names_the_model_effort_sandbox_and_scratch_dir(tmp_path) ->
     assert argv[:11] == ['codex', 'exec', '-m', 'm-1', '-c', 'model_reasoning_effort=high', '-s', 'read-only',
                          '--skip-git-repo-check', '-C', str(scratch)]
     assert argv[11:13] == ['-o', str(scratch / 'answer.txt')]
-    assert argv[13] == deepdiag.PROMPT
+    assert argv[13:-3] == list(deepdiag.ISOLATION)
+    assert argv[-3:-1] == ['-c', f'skills.config=[{{path="{skill.resolve()}",enabled=false}}]']
+    assert argv[-1] == deepdiag.PROMPT
     assert timeout == 42
+
+
+def _isolation(argv: list[str]) -> set:
+    flags = {arg for arg in argv if arg in ('--ephemeral', '--ignore-user-config', '--ignore-rules')}
+    pairs = {(a, b) for a, b in zip(argv, argv[1:])
+             if a in ('--enable', '--disable') or (a == '-c' and b.startswith(('mcp_servers=', 'project_doc_')))}
+    return flags | pairs
+
+
+def test_the_isolation_flags_match_the_codex_cells() -> None:
+    cell, _ = run._runner_command(SimpleNamespace(prompt='p', hide_git=False), run.MODES['baseline'], 'baseline',
+                                  'gpt5', Path('/w'), bare=True, reasoning_effort=None, max_budget_usd=1.0,
+                                  strict_file_tools=False, skill_paths=[])
+
+    assert _isolation(list(deepdiag.ISOLATION)) == _isolation(cell)
+    assert '--ignore-user-config' in deepdiag.ISOLATION and ('--disable', 'hooks') in _isolation(cell)
+
+
+def _host_codex_home(tmp_path: Path, monkeypatch) -> Path:
+    '''A host CODEX_HOME with the files a user has, and a fake codex that reports what it sees.'''
+    host = tmp_path / 'host-codex'
+    host.mkdir()
+    for name, text in (('auth.json', 'token-1'), ('AGENTS.md', 'user rules'), ('config.toml', 'model = "x"'),
+                       ('hooks.json', '{}')):
+        (host / name).write_text(text)
+    bin_dir = tmp_path / 'bin'
+    bin_dir.mkdir()
+    report = tmp_path / 'report.txt'
+    fake = bin_dir / 'codex'
+    fake.write_text('#!/bin/sh\n'
+                    f'{{ echo "$CODEX_HOME"; ls -A "$CODEX_HOME"; cat "$CODEX_HOME/auth.json"; }} > {report}\n'
+                    'if [ "$1" = refresh ]; then printf token-2 > "$CODEX_HOME/auth.json"; fi\n')
+    fake.chmod(0o755)
+    monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
+    monkeypatch.setenv('CODEX_HOME', str(host))
+    return host
+
+
+def test_the_runner_gives_codex_a_home_with_only_the_auth_copy(tmp_path, monkeypatch) -> None:
+    host = _host_codex_home(tmp_path, monkeypatch)
+    inode = (host / 'auth.json').stat().st_ino
+
+    assert deepdiag.codex_runner(['codex', 'keep'], 10) == 0
+
+    home, *listing, token = (tmp_path / 'report.txt').read_text().splitlines()
+    assert Path(home) != host and not Path(home).exists()
+    assert listing == ['auth.json'] and token == 'token-1'
+    assert (host / 'auth.json').stat().st_ino == inode, 'an unchanged token must not be written back'
+    assert (host / 'AGENTS.md').read_text() == 'user rules'
+
+
+def test_the_runner_copies_a_refreshed_token_back_to_the_host(tmp_path, monkeypatch) -> None:
+    host = _host_codex_home(tmp_path, monkeypatch)
+
+    assert deepdiag.codex_runner(['codex', 'refresh'], 10) == 0
+
+    assert (host / 'auth.json').read_text() == 'token-2'
+    assert oct((host / 'auth.json').stat().st_mode & 0o777) == oct(0o600)
 
 
 def test_defaults_match_the_spec() -> None:
