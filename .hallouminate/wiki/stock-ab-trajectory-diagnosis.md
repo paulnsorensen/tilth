@@ -98,7 +98,7 @@ Ordered by evidence. Prompt steering cannot remove causes 1–5, 7 or 8, so the 
 
 ## Litmus re-run after the fixes (2026-11-04, 2026-11-05)
 
-#433, #434, #435 and #436 fix causes 2, 3, 4, 5 and 8, and narrow cause 1. Two paid re-runs of `chain:rg-edit-6`, `tilth_stock`, 3 reps, at main `a9ab01f4` test them. **With `--bare`, as in the November 2 rows, tilth costs $2.17 per cell against $2.46 for baseline (−12%).** Before the fixes the gap was +30%. The first re-run omitted `--bare` and cost $2.62.
+#433, #434, #435 and #436 fix causes 2, 3, 4, 5 and 8, and narrow cause 1. Two paid re-runs of `chain:rg-edit-6`, `tilth_stock`, 3 reps, at main `a9ab01f4` test them. **With `--bare`, as in the November 2 rows, tilth costs $2.17 per cell against $2.46 for baseline (−12%).** Before the fixes the gap was +30%. These are observed differences, not a measured effect of the fixes: the baseline rows come from November 2, not from the same run. The first re-run omitted `--bare` and cost $2.62.
 
 | Per cell, 3 reps | baseline_stock (Nov 2) | tilth_stock before | after, no `--bare` | after, `--bare` |
 |---|---|---|---|---|
@@ -114,11 +114,11 @@ Ordered by evidence. Prompt steering cannot remove causes 1–5, 7 or 8, so the 
 | `tilth_write` errors | n/a | 3.00 | 0.33 | 1.33 |
 | Seen-line rejections | n/a | 2.67 | 0.33 | 0 |
 | `mode=full` reads | n/a | 7.67 | 0 | 0 |
-| Batches killed by a bad pattern | n/a | 2 (total) | 0 | 0 |
+| Batches killed by a bad pattern | n/a | 2 (total) | 0 (total) | 0 (total) |
 | Read result chars | 190k | 209k | 157k | 139k |
 | Search result chars | 46k (`Grep`) | 98k | 87k | 57k |
 
-- **Tilth is at parity or better.** n=3 and the cost ranges overlap, so the 12% is not significant. Context tokens are 7% below baseline, and API calls are equal.
+- **Tilth is at parity or better.** n=3 and the cost ranges overlap, so these runs do not show whether the 12% difference is significant. Context tokens are 7% below baseline, and API calls are equal.
 - **Two of three `--bare` reps edit through the shell.** Under `--bare` no hook blocks shell edits. In turn 6, the `bool` to `Flow` migration, rep 0 makes 17 `perl -pi` edits and no `tilth_write` call. Rep 2 writes 11 Python edit scripts under `/tmp/mig`. Only rep 1 edits through `tilth_write` (14 calls). It costs $2.23, inside the baseline range. The November 2 tilth rows have no shell edits, and these runs do not show the cause.
 - **Batching is not the gap.** Count actions, not tool calls. An action is one read path, search query, edit op, or built-in tool call. Tilth batches inside one call: 2.05 paths per read, 3.07 queries per search and 8.85 ops per write (no `--bare` run). Baseline sends parallel calls instead. Session analytics `model_turns.tool_calls` counts calls, so its 1.1 against 3.6 hides this. Shell edits count as one action each, so the `--bare` run falls to 3.03.
 - **The first re-run used the user's harness.** Without `--bare`, `run.py` does not pass `--setting-sources ""`. The arm then ran the user's SessionStart hooks and loaded `~/.claude/CLAUDE.md`. Of 40 Bash calls, 28 use `eatmydata`, a rule from that file. Most of the extra Bash calls run `cargo check` or `cargo test`. The `--bare` re-run confirms the confound: the first call falls from 11.5k to 9.3k tokens, and API calls fall from 60.7 to 52.3.
