@@ -27,23 +27,25 @@ from test_evolve_repair import Harness, fixed_patch, repair_records
 SRC = candidates.SRC_PATCH
 HUNG = "mcp::tools::write::tests::rewrite_refused_for_unseen_matches_prints_them_and_retry_applies"
 TIMEOUT_S = 3
-# A stand-in for `just check`: its worktree's src/lib.rs says whether it hangs with libtest's warning, hangs
-# silently, or passes. The noise lines make the output longer than the failure tail.
+# A stand-in for `just check`: its worktree's src/lib.rs says whether it hangs with libtest's warning, hangs after
+# the warned test finished, hangs silently, or passes. The noise lines make the output longer than the failure tail.
 FAKE_GATE = f"""\
 #!/usr/bin/env python3
 import sys, time
 from pathlib import Path
 
 lib = Path("src/lib.rs").read_text() if Path("src/lib.rs").exists() else ""
-if "HUNG" in lib or "SILENT" in lib:
+if any(marker in lib for marker in ("HUNG", "FINISHED", "SILENT")):
     for n in range(150):
         sys.stderr.write(f"   Compiling dep{{n}} v0.{{n}}.0\\n")
     sys.stderr.flush()
-    if "HUNG" in lib:
+    if "HUNG" in lib or "FINISHED" in lib:
         print("running 3 tests")
         print("test edit::fast ... ok")
         print("test {HUNG} has been running for over 60 seconds")
         print("test {HUNG} has been running for over 60 seconds", flush=True)
+    if "FINISHED" in lib:
+        print("test {HUNG} ... ok", flush=True)
     time.sleep(60)
 print("just check: ok")
 """
@@ -87,6 +89,39 @@ def test_hanging_tests_is_empty_without_a_hang_warning() -> None:
                               "test e::f has been running for a while\n") == []
 
 
+@pytest.mark.parametrize("result", ["ok", "FAILED", "ignored", "ok <0.002s>"])
+def test_a_warned_test_that_then_reports_a_result_is_not_hung(result: str) -> None:
+    output = ("test a::slow has been running for over 60 seconds\n"
+              f"test a::slow ... {result}\n")
+
+    assert rust.hanging_tests(output) == []
+
+
+def test_a_should_panic_test_that_finishes_after_its_warning_is_not_hung() -> None:
+    output = ("test a::slow has been running for over 60 seconds\n"
+              "test a::slow - should panic ... ok\n")
+
+    assert rust.hanging_tests(output) == []
+
+
+def test_only_the_warned_tests_with_no_later_result_are_hung() -> None:
+    output = ("running 4 tests\n"
+              "test a::slow has been running for over 60 seconds\n"
+              "test b::stuck has been running for over 60 seconds\n"
+              "test c::stuck has been running for over 60 seconds\n"
+              "test a::slow ... ok\n")
+
+    assert rust.hanging_tests(output) == ["b::stuck", "c::stuck"]
+
+
+def test_a_result_before_the_warning_does_not_clear_it() -> None:
+    # Two test binaries can each have a test of the same name: the first finished, the second hangs.
+    output = ("test tests::slow ... ok\n"
+              "test result: ok. 1 passed; 0 failed\n"
+              "test tests::slow has been running for over 60 seconds\n")
+
+    assert rust.hanging_tests(output) == ["tests::slow"]
+
 # --- the real subprocess: a hang is a verdict, a silent timeout is not ---
 
 
@@ -116,6 +151,16 @@ def test_a_just_check_timeout_without_a_hang_warning_is_still_infrastructure(mon
     monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
     fake_gate(monkeypatch, tmp_path)
     worktree = gate_worktree(tmp_path, "SILENT")
+
+    with pytest.raises(InfrastructureFailure, match=f"just check timed out after {TIMEOUT_S} s"):
+        cli.default_just_check(worktree, timeout_s=TIMEOUT_S)
+
+
+def test_a_just_check_timeout_whose_warned_test_finished_is_still_infrastructure(monkeypatch: pytest.MonkeyPatch,
+                                                                                 tmp_path: Path) -> None:
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+    fake_gate(monkeypatch, tmp_path)
+    worktree = gate_worktree(tmp_path, "FINISHED")
 
     with pytest.raises(InfrastructureFailure, match=f"just check timed out after {TIMEOUT_S} s"):
         cli.default_just_check(worktree, timeout_s=TIMEOUT_S)
