@@ -679,7 +679,7 @@ pub(in crate::mcp) const HOST_VISIBLE_MAX: usize = 40_000;
 
 /// Bytes kept free under [`HOST_VISIBLE_MAX`] for text added after the read:
 /// the nudge tip and the batching note.
-const HOST_CAP_RESERVE: usize = 1_500;
+pub(in crate::mcp) const HOST_CAP_RESERVE: usize = 1_500;
 
 /// Bytes kept free for the continuation line that ends a cut response.
 const CUT_NOTE_RESERVE: usize = 600;
@@ -914,7 +914,7 @@ fn record_shown(session: &Session, shown: &Rendered) {
 /// Length of `text` once JSON-escaped, without the surrounding quotes. It
 /// counts the escapes `serde_json` writes: two bytes for `"`, `\\`, and the
 /// short control escapes, six bytes for any other control byte.
-fn escaped_len(text: &str) -> usize {
+pub(in crate::mcp) fn escaped_len(text: &str) -> usize {
     let mut len = 0;
     for byte in text.bytes() {
         len += match byte {

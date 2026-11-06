@@ -1,10 +1,12 @@
-"""Attack: an unseen-match rejection names one call that unblocks the same retry.
+"""Attack: a refused multi-match edit unblocks the same retry.
 
 Each case reads a small section, sends a multi-match edit that touches unseen
-lines, follows the rejection's hint in the same agent session, and retries the
-same edit with the same tag. The retry must apply. For `replace_text all` and
-`rewrite`, the hint is one batched `tilth_read` of small ranges, one per unseen
-match. A search hint is not used: auto-routing and walker skips can hide matches.
+lines, and retries the same edit with the same tag in the same agent session.
+The retry must apply. For `replace_text all` and `rewrite`, the refusal prints
+every unseen match as `N:content` lines, so the retry needs no read. A refusal
+too large for the host to show prints no lines and names one batched
+`tilth_read` of small ranges instead; a drifted tag gets that read too. A
+search hint is not used: auto-routing and walker skips can hide matches.
 """
 import json
 import os
@@ -24,6 +26,7 @@ def setUpModule():
 
 
 READS = re.compile(r"tilth_read paths (\[.*\]) shows every match range in the current file")
+NUMBERED = re.compile(r"^(\d+):", re.MULTILINE)
 REPLACE_ALL = {"op": "replace_text", "old": "token", "new": "marker", "all": True}
 WRAP = {"op": "rewrite", "pattern": "wrap($A)", "rewrite": "wrapped($A)"}
 BODY = "".join(f"x{i} = {i}\n" for i in range(80))
@@ -44,41 +47,29 @@ class UnseenMatchHint(unittest.TestCase):
         return target
 
     def attack(self, path, source, op, *, target=None):
-        """Return (read paths, file text) after reject -> hinted read -> retry."""
+        """Return (shown line numbers, file text) after refusal -> identical retry."""
         if target is None:
             target = self.write(path, source)
-        read = harness.tools_call_request(
-            2, "tilth_read", {"cwd": self.cwd, "paths": [f"{path}#1-2"]})
-        first = harness.run_mcp([], [harness.initialize_request(), read])
-        text = harness.tool_result_text(first.response_by_id(2))
-        tag = re.search(r"#([0-9A-F]{4})\]", text).group(1)
+        server = harness.Server()
+        self.addCleanup(server.close)
+        read = server.call("tilth_read", {"cwd": self.cwd, "paths": [f"{path}#1-2"]})
+        tag = re.search(r"#([0-9A-F]{4})\]", harness.tool_result_text(read)).group(1)
         edit = {"cwd": self.cwd, "edits": [{"path": path, "tag": tag, "ops": [op]}]}
-        rejected = harness.run_mcp([], [
-            harness.initialize_request(), read,
-            harness.tools_call_request(3, "tilth_write", edit),
-        ]).response_by_id(3)
-        message = harness.tool_result_text(rejected)
-        self.assertEqual(target.read_text(), source, "a rejected edit must not write")
-        found = READS.search(message)
-        self.assertIsNotNone(found, f"rejection names no batched read: {message}")
-        paths = json.loads(found.group(1))
-        self.assertLessEqual(len(paths), 20, "tilth_read takes at most 20 paths")
-        # One agent session: the first read, then the hinted read, then the retry.
-        followed = harness.run_mcp([], [
-            harness.initialize_request(), read,
-            harness.tools_call_request(4, "tilth_read", {"cwd": self.cwd, "paths": paths}),
-            harness.tools_call_request(3, "tilth_write", edit),
-        ])
-        shown = harness.tool_result_text(followed.response_by_id(4))
-        # Single reads flag `"truncated":true`; batched reads print `... truncated`.
-        self.assertNotIn("truncated", shown, "the hinted read must fit its budget")
-        written = followed.response_by_id(3)
+        refused = server.call("tilth_write", edit)
+        message = harness.tool_result_text(refused)
+        self.assertTrue(harness.tool_is_error(refused), message)
+        self.assertEqual(target.read_text(), source, "a refused edit must not write")
+        self.assertIsNone(READS.search(message), f"the refusal must show the matches: {message}")
+        header = f"#{tag}]"
+        self.assertIn(header, message)
+        shown = [int(n) for n in NUMBERED.findall(message.split(header, 1)[1])]
+        written = server.call("tilth_write", edit)
         self.assertFalse(
             harness.tool_is_error(written),
-            f"hint {paths} did not unblock the retry:\n"
-            f"{harness.tool_result_text(written)}\nhinted read said:\n{shown[:1500]}",
+            f"the identical retry did not apply:\n{harness.tool_result_text(written)}\n"
+            f"refusal said:\n{message[:1500]}",
         )
-        return paths, target.read_text()
+        return shown, target.read_text()
 
     def outside_cwd(self, name, source):
         outside = tempfile.TemporaryDirectory()
@@ -192,26 +183,26 @@ class UnseenMatchHint(unittest.TestCase):
         body = "".join(f"x{i} = {i}\n" for i in range(200))
         source = f"a = old_name(1)\n{body}b = old_name(2)\n{body}c = old_name(3)\n"
         op = {"op": "replace_text", "old": "old_name", "new": "new_name", "all": True}
-        paths, text = self.attack("mod.py", source, op)
-        self.assertEqual(paths, ["mod.py#202-202", "mod.py#403-403"])
+        shown, text = self.attack("mod.py", source, op)
+        self.assertEqual(shown, [202, 403])
         self.assertEqual(text, source.replace("old_name", "new_name"))
 
-    def test_replace_all_long_lines_stay_under_the_read_budget(self):
-        # Two unseen occurrences 3000 wide lines apart: one covering span would truncate.
+    def test_replace_all_between_long_lines_shows_only_the_matches(self):
+        # Two unseen occurrences 3000 wide lines apart: the refusal prints two lines.
         wide = "".join(f"x{i} = '{WIDE}'\n" for i in range(3000))
         source = f"x = 0\nx = 1\na = token\n{wide}b = token\n"
-        paths, text = self.attack("wide.py", source, REPLACE_ALL)
-        self.assertEqual(paths, ["wide.py#3-3", "wide.py#3004-3004"])
+        shown, text = self.attack("wide.py", source, REPLACE_ALL)
+        self.assertEqual(shown, [3, 3004])
         self.assertEqual(text.count("marker"), 2)
 
-    @unittest.expectedFailure
     def test_replace_all_more_spread_occurrences_than_read_paths(self):
-        """Known residual (ADR-009 open issue): over 20 spread occurrences merge
-        into wide ranges, and a truncated read still marks them seen. Remove
-        this decorator when tilth_read records only displayed lines."""
+        """Over 20 spread occurrences merge into wide read ranges (ADR-009). The
+        refusal prints only the matched lines, so the retry applies."""
         block = "".join(f"x = '{WIDE}'\n" for _ in range(100))
         source = "x = 0\nx = 1\n" + "".join(f"a = token\n{block}" for _ in range(32))
-        self.attack("spread.py", source, REPLACE_ALL)
+        shown, text = self.attack("spread.py", source, REPLACE_ALL)
+        self.assertEqual(shown, [3 + 101 * i for i in range(32)])
+        self.assertEqual(text.count("marker"), 32)
 
     def test_replace_all_multiline_old(self):
         body = "".join(f"x{i} = {i}\n" for i in range(100))
@@ -250,9 +241,9 @@ class UnseenMatchHint(unittest.TestCase):
         body = "".join(f"    x{i} = {i}\n" for i in range(60))
         source = f"answer = wrap(\n    1,\n)\n{body}other = wrap(\n    2,\n)\n"
         op = {"op": "rewrite", "pattern": "wrap($$$A)", "rewrite": "wrapped($$$A)"}
-        paths, text = self.attack("source.py", source, op)
-        # A rewrite must see each whole match, so the read covers lines 1-3.
-        self.assertEqual(paths, ["source.py#1-3", "source.py#64-66"])
+        shown, text = self.attack("source.py", source, op)
+        # A rewrite must see each whole match, so the refusal prints lines 1-3.
+        self.assertEqual(shown, [1, 2, 3, 64, 65, 66])
         self.assertEqual(text.count("wrapped("), 2, text)
         self.assertIn(body, text)
 
@@ -280,21 +271,21 @@ class UnseenMatchHint(unittest.TestCase):
         for i in range(30):
             self.write(f"d{i}/f.py", "".join(f"v{j} = wrap({j})\n" for j in range(60)))
         source = f"a = wrap(1)\n{BODY}b = wrap(2)\n"
-        paths, text = self.attack("f.py", source, WRAP)
-        self.assertEqual(paths, ["f.py#82-82"])
+        shown, text = self.attack("f.py", source, WRAP)
+        self.assertEqual(shown, [82])
         self.assertEqual(text.count("wrapped("), 2, text)
 
     def test_rewrite_with_many_matches(self):
         source = "".join(f"v{i} = wrap({i})\n" for i in range(1100))
-        _, text = self.attack("lots.py", source, WRAP)
+        shown, text = self.attack("lots.py", source, WRAP)
+        self.assertEqual(shown, list(range(3, 1101)))
         self.assertEqual(text.count("wrapped("), 1100)
 
     def test_rewrite_under_a_symlinked_cwd(self):
         self.symlinked_cwd()
         source = f"a = wrap(1)\n{BODY}b = wrap(2)\n"
-        paths, text = self.attack("linked.py", source, WRAP)
-        self.assertEqual(len(paths), 1)
-        self.assertTrue(paths[0].endswith("linked.py#82-82"), paths)
+        shown, text = self.attack("linked.py", source, WRAP)
+        self.assertEqual(shown, [82])
         self.assertEqual(text.count("wrapped("), 2, text)
 
     def test_rewrite_outside_cwd(self):
@@ -302,6 +293,26 @@ class UnseenMatchHint(unittest.TestCase):
         target = self.outside_cwd("far.py", source)
         _, text = self.attack(str(target), source, WRAP, target=target)
         self.assertEqual(text.count("wrapped("), 2, text)
+
+    # A refusal the host cannot show in full.
+
+    def test_a_refusal_too_large_to_show_names_a_read_and_records_nothing(self):
+        # Printing 600 wide matches would pass the host display limit.
+        source = "x = 0\nx = 1\n" + "".join(f"v{i} = token  # {'z' * 80}\n" for i in range(600))
+        target = self.write("crowded.py", source)
+        server = harness.Server()
+        self.addCleanup(server.close)
+        read = server.call("tilth_read", {"cwd": self.cwd, "paths": ["crowded.py#1-2"]})
+        tag = re.search(r"#([0-9A-F]{4})\]", harness.tool_result_text(read)).group(1)
+        edit = {"cwd": self.cwd, "edits": [{"path": "crowded.py", "tag": tag,
+                                              "ops": [REPLACE_ALL]}]}
+        for attempt in ("first call", "identical retry"):
+            refused = server.call("tilth_write", edit)
+            message = harness.tool_result_text(refused)
+            self.assertTrue(harness.tool_is_error(refused), f"{attempt}: {message}")
+            self.assertEqual(NUMBERED.findall(message), [], f"{attempt} showed lines")
+            self.assertIsNotNone(READS.search(message), f"{attempt}: {message}")
+        self.assertEqual(target.read_text(), source)
 
 
 if __name__ == "__main__":

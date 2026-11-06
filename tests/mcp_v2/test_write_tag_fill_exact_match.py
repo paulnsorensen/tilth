@@ -5,8 +5,9 @@
 2. A tagged `replace_text` whose `old` matches exactly once applies on a line
    that no read displayed.
 
-`all`/`count`, an ambiguous `old`, and a whitespace-normalized match on an
-unread line stay rejected.
+`all`/`count` on an unread line is refused; that refusal shows the match (see
+test_unseen_match_refusal.py). An ambiguous `old` and a whitespace-normalized
+match on an unread line stay rejected.
 """
 import re
 import tempfile
@@ -81,15 +82,17 @@ class WriteTagFillExactMatch(unittest.TestCase):
         self.assertNotEqual(TAG.search(receipt).group(1), tag, "new content, new tag")
         self.assertEqual(self.target.read_text(), BODY.replace("row-040", "ROW-040"))
 
-    def test_all_or_count_on_an_unread_occurrence_stays_rejected(self):
+    def test_all_or_count_on_an_unread_occurrence_is_rejected(self):
         for extra in ({"all": True}, {"count": 1}):
             with self.subTest(extra=extra):
-                self.target.write_text(BODY)
+                # Distinct content per case: a refusal records the lines it shows.
+                source = BODY + f"end-{next(iter(extra))}\n"
+                self.target.write_text(source)
                 read = self.read("f.txt#1-5")
                 op = {"op": "replace_text", "old": "row-040", "new": "ROW-040", **extra}
                 written = self.write_after(
                     [read], {"path": "f.txt", "tag": self.tag_after(read), "ops": [op]})
-                self.assert_rejected(written, BODY)
+                self.assert_rejected(written, source)
                 self.assertIn("never displayed", harness.tool_result_text(written))
 
     def test_ambiguous_old_stays_rejected(self):

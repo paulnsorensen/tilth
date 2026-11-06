@@ -580,6 +580,63 @@ mod tests {
         );
     }
 
+    /// A refusal that shows unseen rewrite matches saves their lines as a
+    /// delivered read does, so a resumed agent session (a new tilth process)
+    /// applies the identical call with no read. Each call waits at most 30 s,
+    /// so a retaken lock fails the test instead of hanging it.
+    #[test]
+    fn a_resumed_session_applies_the_call_that_a_refusal_unblocked() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("repo");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let mut source = String::from(
+            "// Call sites of foo.\n// Each useN calls foo once.\n\nfn foo(x: i32) -> i32 {\n    x\n}\n\n",
+        );
+        for i in 0..14 {
+            let _ = write!(
+                source,
+                "fn use{i}() -> i32 {{\n    let x = {i};\n    let y = x + 1;\n    foo(x) + y\n}}\n\n"
+            );
+        }
+        let path = root.join("f.rs");
+        std::fs::write(&path, &source).unwrap();
+        let state = dir.path().join("state");
+        let process = || {
+            let mut services = Services::new();
+            services.session = Arc::new(Session::with_seen_dir(state.clone()));
+            services
+        };
+        let call = |services: &Services, tool: &str, args: Value| {
+            run_tool_with_timeout(services, tool, &args, std::time::Duration::from_secs(30))
+        };
+
+        let first = process();
+        let read = serde_json::json!({"cwd": root, "paths": ["f.rs#1-5"]});
+        let read = call(&first, "tilth_read", read).unwrap();
+        let tag = read
+            .split("f.rs#")
+            .nth(1)
+            .and_then(|s| s.get(..4))
+            .expect("tag in read output")
+            .to_string();
+        let op = serde_json::json!({"op": "rewrite", "pattern": "foo($A)", "rewrite": "bar($A)"});
+        let edit =
+            serde_json::json!({"cwd": root, "edits": [{"path": "f.rs", "tag": tag, "ops": [op]}]});
+        let refusal = call(&first, "tilth_write", edit.clone()).unwrap_err();
+        assert!(
+            refusal.contains(&format!("[f.rs#{tag}]\n11:    foo(x) + y\n17:")),
+            "{refusal}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+
+        let applied = call(&process(), "tilth_write", edit).unwrap();
+        assert!(applied.contains("applied"), "{applied}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            source.replace("    foo(x) + y", "    bar(x) + y")
+        );
+    }
+
     /// The nudge must ride the REAL dispatch path: two consecutive
     /// single-item reads through `dispatch_tool` end with the tip after
     /// exactly one blank line, whatever trailing newlines the body carries.
