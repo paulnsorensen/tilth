@@ -134,6 +134,27 @@ It passes 20 consecutive runs without changing runtime language selection.[^20]
 [^19]: [Failed PR #280 CI run](https://github.com/paulnsorensen/tilth/actions/runs/36541092921/job/109316414746); `src/overview.rs:35-46,259-354,819-838` at `50300a271a897e88426f5841b948d78639a90e52`. Local reproduction on 2026-09-29 uses five isolated executions of `cargo test -q --lib overview::tests::test_fingerprint_on_tilth -- --exact --nocapture`.
 [^20]: [PR #280 fingerprint fixture correction](https://github.com/paulnsorensen/tilth/pull/280); `src/overview.rs::tests::test_fingerprint_detects_rust_project`. Local verification on 2026-09-29: 20/20 focused executions and all three overview tests pass.
 
+## Freshly written stubs and ETXTBSY
+
+A test that writes an executable stub in-process and then executes it can fail with `Text file busy (os error 26)`.
+The test harness runs tests on parallel threads, and each thread spawns child processes.
+A child that forks while the write handle is open copies that handle and keeps it until its own exec.
+An exec of the stub during that interval fails, even after the writer closed its own handle and set mode `0755`.
+`O_CLOEXEC` does not prevent this, because the copy exists between fork and exec.[^24]
+
+In `tests/launch_cli.rs`, `tilth` reports the failed exec as ``cannot start `claude` `` and exits 1.
+Many tests then fail on a "launch succeeded" check, and some of those checks do not print stderr.
+CI run 41989910123 failed this way at `launch_exit_codes_and_signals_propagate` with `left: Some(1)`, `right: Some(126)`.[^25]
+
+`Sandbox::script` now writes each stub from a `/bin/sh` child process.
+The test process then never holds a write handle to a stub, so a sibling fork cannot copy one.
+`launch_stub_exec_survives_a_concurrent_fork` guards this: it writes and executes 200 stubs while four threads fork without a pause.
+Do not change `Sandbox::script` back to `fs::write`.
+A retry in the launcher does not fix the cause, because the test process creates the race and the launcher reports the exec error correctly.[^25]
+
+[^24]: The kernel refuses `execve` while any open file description has the file open for writing. A forked child shares the parent's file description until exec closes it.
+[^25]: Fix for the PR #440 CI flake on 2026-11-05, base `e6d47cd4`. Running the whole `launch_cli` binary 2,000 times, 24 at once, gives 43 failed runs before the fix and 0 after. In an A/B probe with forking sibling threads, 21 of 900 execs hit ETXTBSY with the in-process writer and 0 of 900 with the child-process writer. The guard fails 20 of 20 runs when `script` uses `fs::write`.
+
 ## macOS temporary-path cache keys
 
 On macOS, `tempfile` paths start with `/var`, but `/var` is a symlink to `/private/var`.
@@ -174,4 +195,4 @@ That description uses an older base and does not describe current `main`.[^1][^3
 [^2]: https://github.com/paulnsorensen/tilth/pull/227
 [^3]: https://github.com/paulnsorensen/tilth/pull/242
 
-_Source: PR #242 review, PR #280 CI diagnosis, MCP acceptance harness code, PR #283 language BDD scope and upstream regressions, PR #287, PR #293, and PR #300 macOS gate runs · Updated: 2026-10-02 · Supersedes: August 2026 local-gate baseline guidance._
+_Source: PR #242 review, PR #280 CI diagnosis, MCP acceptance harness code, PR #283 language BDD scope and upstream regressions, PR #287, PR #293, and PR #300 macOS gate runs, and the PR #440 `launch_cli` ETXTBSY flake · Updated: 2026-11-05 · Supersedes: August 2026 local-gate baseline guidance._
