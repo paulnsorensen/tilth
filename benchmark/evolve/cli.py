@@ -32,7 +32,7 @@ import panels  # noqa: E402
 import run  # noqa: E402
 import tmp_aging  # noqa: E402
 from config import REPO_ROOT  # noqa: E402
-from evolve import deepdiag, diagnosis, directives, failures  # noqa: E402
+from evolve import deepdiag, diagnosis, directives, failures, rust  # noqa: E402
 from evolve.candidate import SeedError, read_seed  # noqa: E402
 from evolve.finish import GitHubPRClient, PRClient  # noqa: E402
 from evolve.gitops import GitError, git  # noqa: E402
@@ -46,10 +46,12 @@ JUST_CHECK_TIMEOUT_S = 1800
 
 
 def _run_in_tree(command: list[str], worktree: Path, env: dict[str, str], timeout_s: int, *,
-                 timeout_raises: bool = False) -> tuple[bool, str]:
+                 timeout_raises: bool = False, hang_verdict: bool = False) -> tuple[bool, str]:
     """Run ``command`` in ``worktree`` with ``<worktree>/target`` linked to the shared candidate target dir.
 
     A timeout returns ``(False, message)``, or raises ``InfrastructureFailure`` when ``timeout_raises``.
+    With ``hang_verdict``, a timeout whose output names hung libtest tests (``rust.hanging_tests``) is a verdict:
+    it returns ``(False, output)``, and the last line of that output names the hung tests.
 
     A symlink, not CARGO_TARGET_DIR: tests/mcp_v2 reads ``<repo>/target/debug/tilth``, and the root .gitignore
     ``/target`` matches a symlink.
@@ -66,24 +68,32 @@ def _run_in_tree(command: list[str], worktree: Path, env: dict[str, str], timeou
         stdout, stderr = process.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired as error:
         os.killpg(process.pid, signal.SIGKILL)
-        process.communicate()
+        # A second communicate returns all the output, also the part read before the timeout.
+        stdout, stderr = process.communicate()
+        output = stdout + stderr
         message = f"{' '.join(command[:2])} timed out after {timeout_s} s"
+        if hang_verdict and (hung := rust.hanging_tests(output)):
+            # An `error:` line, so `failures.first_error` names the hang in the failed-patch record.
+            return False, (f"{output.rstrip()}\nerror: {message}; these tests hung: {', '.join(hung)}. "
+                           "The change likely deadlocks or loops forever.")
         if timeout_raises:
             raise InfrastructureFailure(message) from error
         return False, message
     return process.returncode == 0, stdout + stderr
 
 
-def default_just_check(worktree: Path) -> tuple[bool, str]:
-    """Run ``just check`` in an allowlisted env.
+def default_just_check(worktree: Path, *, timeout_s: int | None = None) -> tuple[bool, str]:
+    """Run ``just check`` in an allowlisted env, for ``timeout_s`` seconds (default ``JUST_CHECK_TIMEOUT_S``).
 
     The env sets ``PHRASE_PIN_EXEMPT_ENV``, so the Rust tests skip their prompt phrase pins and a candidate can
     reword ``prompts/``. CI does not set it, so the winner PR must re-pin them (``finish.REPIN_NOTE``).
-    A timeout raises ``InfrastructureFailure``: it is no verdict on the candidate.
+    A timeout raises ``InfrastructureFailure``: it is no verdict on the candidate. A timeout whose output names
+    hung tests is the exception: the candidate fails ``just check``, as a hang is most likely its own deadlock.
     """
     touch_sources(worktree)
     return _run_in_tree(["just", "check"], worktree, {**run.build_tool_env(), PHRASE_PIN_EXEMPT_ENV: "1"},
-                        JUST_CHECK_TIMEOUT_S, timeout_raises=True)
+                        JUST_CHECK_TIMEOUT_S if timeout_s is None else timeout_s, timeout_raises=True,
+                        hang_verdict=True)
 
 
 def default_cargo(worktree: Path, args: list[str]) -> tuple[bool, str]:

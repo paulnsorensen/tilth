@@ -10,8 +10,10 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 import baselines
 import run
 from evolve import cli, engine
+from evolve.candidate import content_id
 from evolve_support import (
-    MODEL, TEST, build, child, deps, evolve_args, main, make_world, mcp, scripted_engine, seed_candidate, seed_files,
+    MODEL, TEST, build, child, deps, evolve_args, log_text, main, make_world, mcp, scripted_engine, seed_candidate,
+    seed_files,
 )
 from spend import SpendLedger
 
@@ -214,3 +216,29 @@ def test_run_plan_estimate_defaults_to_the_budget(world_factory) -> None:
 
     assert stopped.value.reason == "ceiling" and "$3.0000 estimated" in str(stopped.value)
     assert world.calls == []
+
+
+# --- a candidate tier the budget cannot finish buys none of its cells ---
+
+
+@pytest.mark.parametrize(("headroom", "bought"), [
+    (0.25, [("cheap_a", 0)]),
+    (0.45, [("cheap_a", 0), ("dev_a", 0), ("dev_b", 0)]),
+], ids=["dev-tier", "admission-reruns"])
+def test_a_candidate_tier_over_the_headroom_buys_none_of_its_cells(world_factory, headroom: float,
+                                                                   bought: list[tuple[str, int]]) -> None:
+    world = world_factory()
+    evo = build(world)
+    assert evo.preflight() is None and evo.buy_baselines() is None
+    evo.evaluate(evo.seed, "dev_a")
+    assert evo.results[evo.seed_id].accepted
+    # Every candidate cell costs $0.10: the cheap tier is 1 cell, the dev tier 2, and admission re-runs 2 more.
+    evo.ledger.charge(evo.ledger.headroom() - headroom, source="search")
+    candidate = child(evo.seed, dev_a="1", dev_b="1", cheap_a="1")
+
+    assert evo.evaluate(candidate, "dev_a") == (0.0, {"stopped": "ceiling"})
+
+    sha = evo.results[content_id(candidate)].sha
+    assert sorted((task, rep) for task, _mode, rep, called in world.calls if called == sha) == bought
+    assert evo.stop.reason == "ceiling"
+    assert "estimated for the whole plan" in log_text(world)

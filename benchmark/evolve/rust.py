@@ -30,6 +30,8 @@ _MODIFIERS = re.compile(r"(?:\b(?:pub(?:\s*\([^)]*\))?|async|const|unsafe)\s+)*$
 _ATTRIBUTES = re.compile(r"(?:#\s*\[(?:[^\[\]]|\[[^\]]*\])*\]\s*)+$")
 _TEST_ATTR = re.compile(r"\btest\b")
 _FAILED_NAME = re.compile(r"\s{4}(\S+)")
+# Not anchored at the line start: with one test thread, libtest prints it after the `test NAME ... ` it began.
+_HUNG_NAME = re.compile(r"\btest (\S+) has been running for over \d+ seconds")
 _ATTRIBUTE = re.compile(r"#\s*\[((?:[^\[\]]|\[[^\]]*\])*)\]")
 _TEST_ATTRIBUTE = re.compile(r"(?:\w+::)*test(?:\(.*\))?", re.S)
 _GUARD_ATTRIBUTE = re.compile(r"(?:ignore|should_panic|cfg|cfg_attr)\b")
@@ -297,6 +299,13 @@ def failing_tests(output: str) -> list[str]:
             if listed is not None and listed[1] not in names:
                 names.append(listed[1])
     return names
+
+
+def hanging_tests(output: str) -> list[str]:
+    """The test names in libtest's ``test NAME has been running for over N seconds`` lines, in order and without
+    repeats. libtest prints that line once for each test that runs past its warning time.
+    """
+    return list(dict.fromkeys(match[1] for match in _HUNG_NAME.finditer(output)))
 
 
 def test_weakening(old: str, new: str) -> str | None:

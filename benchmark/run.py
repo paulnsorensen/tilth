@@ -2299,6 +2299,7 @@ def run_plan(
     strict_file_tools: bool = False,
     hook_sha: str | None = None,
     preamble: bool = False,
+    whole_plan: bool = False,
 ) -> list[dict]:
     """Run ``cells`` for one panel, answering each from the result store when it can.
 
@@ -2313,6 +2314,8 @@ def run_plan(
     the baseline runs the hook built at ``hook_sha`` (a commit of ``repo``), and that hook replays every Bash call.
     ``preamble`` gives every tilth arm ``prompts/preamble.md`` as its system prompt, read at ``candidate_sha``
     (or from the ``repo`` checkout when ``candidate_sha`` is None).
+    ``whole_plan`` buys no cell unless the ledger covers the summed estimate of every cell the plan must buy, so a
+    plan that cannot finish spends nothing; without it, the ceiling is checked one cell at a time.
 
     Raises ``CandidateBuildFailed`` when ``candidate_sha`` or ``hook_sha`` does not build, ``hook_sha`` has no
     ``src/hook``, or ``preamble`` finds no preamble file; its subclass ``HookProbeFailed`` when a strict hook binary fails the allow/deny probe.
@@ -2363,7 +2366,8 @@ def run_plan(
         return _run_plan(cells, panel=panel, ledger=ledger, refreeze_baselines=refreeze_baselines, output=output,
                          cell_estimate_usd=max_budget_usd if cell_estimate_usd is None else cell_estimate_usd,
                          max_budget_usd=max_budget_usd, store_only=store_only,
-                         strict_file_tools=strict_file_tools, hook_sha=hook_sha, hook_repo=repo)
+                         strict_file_tools=strict_file_tools, hook_sha=hook_sha, hook_repo=repo,
+                         whole_plan=whole_plan)
     finally:
         MODES.update(saved)
 
@@ -2371,7 +2375,7 @@ def run_plan(
 def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_baselines: bool,
               output: Path | None, cell_estimate_usd: float, max_budget_usd: float, store_only: bool,
               strict_file_tools: bool = False, hook_sha: str | None = None,
-              hook_repo: Path | None = None) -> list[dict]:
+              hook_repo: Path | None = None, whole_plan: bool = False) -> list[dict]:
     planned = [(cell, planned_identity(cell, max_budget_usd=max_budget_usd, strict_file_tools=strict_file_tools,
                                        hook_sha=hook_sha, hook_repo=hook_repo)) for cell in cells]
     store_path = RESULTS_DIR / baselines.STORE_FILENAME
@@ -2406,6 +2410,20 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         baselines.store(row, path=store_path)
         history.append(row)
         emit(row)
+
+    if whole_plan and pending and not store_only:
+        total = sum(estimate_cell_cost(history, task=cell.task, mode=cell.mode, model=MODELS[cell.model],
+                                       run_max_cost=None,
+                                       fallback=cell_estimate_usd * getattr(TASKS[cell.task], "size", 1))
+                    for cell, _identity in pending)
+        try:
+            crossing = ledger.would_cross(total)
+        except ValueError as error:
+            raise PlanStopped("ceiling", str(error), rows) from error
+        if crossing:
+            raise PlanStopped("ceiling", f"${ledger.spent:.4f} spent + ${total:.4f} estimated for the whole plan "
+                                         f"({len(pending)} cell(s) to buy) + ${ledger.reserve:.4f} reserved exceeds "
+                                         f"${ledger.max_usd}", rows)
 
     for cell, identity in planned:
         task = TASKS[cell.task]
