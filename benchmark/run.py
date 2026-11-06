@@ -280,14 +280,23 @@ def isolated_call_target() -> auth.AuthTarget:
     return auth.AuthTarget(cwd=Path(tempfile.gettempdir()), env=env, loads_user_settings=False)
 
 
+def _is_json(data: bytes) -> bool:
+    try:
+        json.loads(data)
+    except ValueError:
+        return False
+    return True
+
+
 @contextmanager
 def isolated_codex_home(env: dict[str, str], prefix: str):
     """Point ``env`` at a temp CODEX_HOME that holds only a copy of the host's ``auth.json``.
 
     ``--ignore-user-config`` skips only ``config.toml``. Codex still sends ``$CODEX_HOME/AGENTS.md`` as user
     instructions, and it finds hooks, rules, plugins, and agents there. A token that Codex refreshes during the
-    call is copied back to the host file, unless the host file changed during the call: another Codex process
-    then refreshed it, and its newer token stays.
+    call is copied back to the host file, also after a failed or killed call. It is not copied back when it is
+    not valid JSON (a kill during the refresh can truncate it), or when the host file changed during the call:
+    another Codex process then refreshed it, and its newer token stays.
     """
     host_auth = Path(env.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
     seed = host_auth.read_bytes() if host_auth.is_file() else None
@@ -299,9 +308,9 @@ def isolated_codex_home(env: dict[str, str], prefix: str):
         try:
             yield
         finally:
-            if seed is not None and call_auth.is_file() and call_auth.read_bytes() != seed:
+            if seed is not None and call_auth.is_file() and (refreshed := call_auth.read_bytes()) != seed:
                 current = host_auth.read_bytes() if host_auth.is_file() else None
-                if current == seed:
+                if current == seed and _is_json(refreshed):
                     _copy_private(call_auth, host_auth)
 
 
