@@ -35,9 +35,19 @@ impl Sandbox {
         }
     }
 
+    /// Write an executable stub at `bin/<name>`.
+    /// A child process writes it, so this process never holds a write handle to the file.
+    /// A sibling test thread that forks while this process holds one copies that handle,
+    /// and an exec of the stub then fails with ETXTBSY ("Text file busy").
     fn script(&self, name: &str, body: &str) {
         let path = self.bin.join(name);
-        fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        let status = Command::new("/bin/sh")
+            .args(["-c", "printf '%s' \"$1\" > \"$2\"", "sh"])
+            .arg(format!("#!/bin/sh\n{body}\n"))
+            .arg(&path)
+            .status()
+            .unwrap();
+        assert!(status.success(), "write {}: {status}", path.display());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
@@ -588,13 +598,51 @@ fn launch_exit_codes_and_signals_propagate() {
             let sb = Sandbox::new();
             sb.fake(harness, code);
             let out = sb.cmd(harness, &["-p"]).output().unwrap();
-            assert_eq!(out.status.code(), Some(code), "{harness}");
+            assert_eq!(out.status.code(), Some(code), "{harness}: {out:?}");
         }
         let sb = Sandbox::new();
         sb.script(harness, "kill -TERM $$");
         let out = sb.cmd(harness, &["-p"]).output().unwrap();
         assert_eq!(out.status.signal(), Some(15), "{harness}: {:?}", out.status);
     }
+}
+
+/// Other threads fork without a pause while `Sandbox::script` writes stubs.
+/// Every stub must still run: a write handle copied into a child would make the exec fail with ETXTBSY.
+#[test]
+fn launch_stub_exec_survives_a_concurrent_fork() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Stops the fork threads on scope exit, also when the scope panics.
+    struct StopOnDrop<'a>(&'a AtomicBool);
+    impl Drop for StopOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    let sb = Sandbox::new();
+    let stop = AtomicBool::new(false);
+    let mut failures = Vec::new();
+    std::thread::scope(|s| {
+        let _stop = StopOnDrop(&stop);
+        for _ in 0..4 {
+            s.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = Command::new("/bin/sh").args(["-c", ":"]).status();
+                }
+            });
+        }
+        for i in 0..200 {
+            let name = format!("stub{i}");
+            sb.script(&name, "exit 7");
+            match Command::new(sb.bin.join(&name)).status() {
+                Ok(st) if st.code() == Some(7) => {}
+                other => failures.push(format!("{name}: {other:?}")),
+            }
+        }
+    });
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 #[test]
