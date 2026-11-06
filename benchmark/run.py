@@ -286,7 +286,8 @@ def isolated_codex_home(env: dict[str, str], prefix: str):
 
     ``--ignore-user-config`` skips only ``config.toml``. Codex still sends ``$CODEX_HOME/AGENTS.md`` as user
     instructions, and it finds hooks, rules, plugins, and agents there. A token that Codex refreshes during the
-    call is copied back to the host file.
+    call is copied back to the host file, unless the host file changed during the call: another Codex process
+    then refreshed it, and its newer token stays.
     """
     host_auth = Path(env.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
     seed = host_auth.read_bytes() if host_auth.is_file() else None
@@ -299,7 +300,9 @@ def isolated_codex_home(env: dict[str, str], prefix: str):
             yield
         finally:
             if seed is not None and call_auth.is_file() and call_auth.read_bytes() != seed:
-                _copy_private(call_auth, host_auth)
+                current = host_auth.read_bytes() if host_auth.is_file() else None
+                if current == seed:
+                    _copy_private(call_auth, host_auth)
 
 
 def budget_capped(stream: str) -> bool:

@@ -108,7 +108,9 @@ def _host_codex_home(tmp_path: Path, monkeypatch) -> Path:
     fake = bin_dir / 'codex'
     fake.write_text('#!/bin/sh\n'
                     f'{{ echo "$CODEX_HOME"; ls -A "$CODEX_HOME"; cat "$CODEX_HOME/auth.json"; }} > {report}\n'
-                    'if [ "$1" = refresh ]; then printf token-2 > "$CODEX_HOME/auth.json"; fi\n')
+                    'if [ "$1" = refresh ]; then printf token-2 > "$CODEX_HOME/auth.json"; fi\n'
+                    f'if [ "$1" = race ]; then printf token-3 > {host / "auth.json"}; '
+                    'printf token-2 > "$CODEX_HOME/auth.json"; fi\n')
     fake.chmod(0o755)
     monkeypatch.setenv('PATH', f'{bin_dir}{os.pathsep}{os.environ["PATH"]}')
     monkeypatch.setenv('CODEX_HOME', str(host))
@@ -135,6 +137,14 @@ def test_the_runner_copies_a_refreshed_token_back_to_the_host(tmp_path, monkeypa
 
     assert (host / 'auth.json').read_text() == 'token-2'
     assert oct((host / 'auth.json').stat().st_mode & 0o777) == oct(0o600)
+
+
+def test_the_runner_keeps_a_host_token_another_process_refreshed(tmp_path, monkeypatch) -> None:
+    host = _host_codex_home(tmp_path, monkeypatch)
+
+    assert deepdiag.codex_runner(['codex', 'race'], 10) == 0
+
+    assert (host / 'auth.json').read_text() == 'token-3', 'a concurrent host refresh must not be overwritten'
 
 
 def test_defaults_match_the_spec() -> None:
