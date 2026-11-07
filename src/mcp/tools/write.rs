@@ -11,6 +11,7 @@
 //! `apply_ops`.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,7 @@ use crate::edit::json::{lower_edits, teaching_error_for_string};
 use crate::edit::mismatch::MismatchError;
 use crate::edit::parser::{Op, Section};
 use crate::edit::recovery::{
-    check_seen_lines, current_match_ranges, gated_apply, try_recover, EditError,
+    check_seen_lines, current_match_ranges, gated_apply, try_recover, unseen_match_spans, EditError,
 };
 use crate::edit::snapshots::{Snapshot, SnapshotStore};
 use crate::edit::tag::{compute_file_hash, format_header};
@@ -78,8 +79,10 @@ pub(crate) fn tool_write(
         session,
         cache,
         show_diff,
+        shown: RefCell::new(None),
     };
     let mut results: Vec<String> = Vec::with_capacity(sections.len());
+    let mut shown: Vec<(usize, Shown)> = Vec::new();
     let mut seen_paths: HashSet<String> = HashSet::new();
     let mut any_ok = false;
     for section in &sections {
@@ -90,8 +93,12 @@ pub(crate) fn tool_write(
             }
             Err(block) => results.push(block),
         }
+        if let Some(refusal) = ctx.shown.take() {
+            shown.push((results.len() - 1, refusal));
+        }
     }
-    let joined = results.join("\n\n---\n\n");
+    settle_shown(&mut results, shown, session);
+    let joined = results.join(SECTION_SEPARATOR);
     // Surface `isError: true` only when EVERY section failed — a mixed call
     // keeps `isError: false` with per-section `error:` lines. All-failed calls
     // were previously invisible to dashboards that key on the MCP error flag.
@@ -102,13 +109,56 @@ pub(crate) fn tool_write(
     }
 }
 
+/// The separator between the section blocks of a `tilth_write` response.
+const SECTION_SEPARATOR: &str = "\n\n---\n\n";
+
+/// Record the printed lines of each refusal in `shown` as displayed, in the
+/// store that reads use, so that the same call applies, also from a resumed
+/// tilth process. A host shows no text past its limit, so while the response
+/// does not fit, the last printed refusal reverts to its plain form and
+/// records nothing. A file over the tag cap mints no tag and reverts too.
+fn settle_shown(results: &mut [String], mut shown: Vec<(usize, Shown)>, session: &Session) {
+    if shown.is_empty() {
+        return;
+    }
+    let limit = super::read::HOST_VISIBLE_MAX - super::read::HOST_CAP_RESERVE;
+    while super::read::escaped_len(&results.join(SECTION_SEPARATOR)) > limit {
+        let Some((i, refusal)) = shown.pop() else {
+            break;
+        };
+        results[i] = refusal.fallback;
+    }
+    for (i, refusal) in shown {
+        if session
+            .record_snapshot(&refusal.path, &refusal.text, refusal.lines)
+            .is_none()
+        {
+            results[i] = refusal.fallback;
+        }
+    }
+}
+
 /// Shared per-call context threaded through the section pipeline: the caller's
-/// cwd (anchor root for relative paths), the session store, and the diff flag.
+/// cwd (anchor root for relative paths), the session store, the diff flag, and
+/// the printed unseen-match refusal of the current section, if any.
 struct SectionCtx<'a> {
     cwd: &'a Path,
     session: &'a Session,
     cache: &'a OutlineCache,
     show_diff: bool,
+    shown: RefCell<Option<Shown>>,
+}
+
+/// A refusal that printed its unseen matches. Its lines count as displayed
+/// only after [`settle_shown`] knows that the whole response fits what the
+/// host shows.
+struct Shown {
+    path: PathBuf,
+    text: String,
+    lines: Vec<u32>,
+    /// The section block with the plain refusal, for when the lines cannot
+    /// count as displayed.
+    fallback: String,
 }
 
 /// Resolve, confine, verify, apply, and commit one `[path#TAG]` section. Always
@@ -136,11 +186,12 @@ fn apply_section(
 
     match commit_section(section, &path, ctx) {
         Ok(block) => Ok(block),
-        Err(e) => Err(format!(
-            "## {}\nerror: {e}",
-            crate::format::display_path(&path)
-        )),
+        Err(e) => Err(error_block(&path, &e)),
     }
+}
+
+fn error_block(path: &Path, e: &TilthError) -> String {
+    format!("## {}\nerror: {e}", crate::format::display_path(path))
 }
 
 /// The per-section egress: read live content, verify/recover against the tag,
@@ -181,7 +232,8 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     let section = fill_live_tag(section, path, session, &live);
     let section: &Section = &section;
     let (new_text, file_op, normalized, written) =
-        resolve_edit(section, path, session, &live, ctx.cwd)?;
+        resolve_edit(section, path, session, &live, ctx.cwd)
+            .map_err(|e| show_unseen_matches(e, section, path, &live, ctx))?;
 
     // File ops take precedence over an in-place write.
     if let Some(op) = file_op {
@@ -268,6 +320,67 @@ fn map_edit_error(e: EditError, path: &Path, tag: u16) -> TilthError {
     e.into()
 }
 
+/// Turn a refusal whose only reason is unseen `rewrite` or `replace_text
+/// all|count` matches into one that prints each match as `N:content` lines
+/// under `[path#TAG]`, so that the same call applies once those lines count
+/// as displayed. [`settle_shown`] records them after the whole response is
+/// built. Every other refusal, a drifted or tag-collided section included,
+/// passes through unchanged.
+fn show_unseen_matches(
+    e: TilthError,
+    section: &Section,
+    path: &Path,
+    live: &str,
+    ctx: &SectionCtx,
+) -> TilthError {
+    let multi_match = section
+        .ops
+        .iter()
+        .any(|op| matches!(op, Op::TextSwapAll { .. } | Op::Rewrite { .. }));
+    let Some(tag) = section
+        .tag
+        .filter(|&tag| multi_match && tag == compute_file_hash(live))
+    else {
+        return e;
+    };
+    let key = crate::edit::normalize_path_key(path);
+    let Some(spans) = gate_snapshot(ctx.session, &key, tag, live, ctx.cwd)
+        .and_then(|snap| unseen_match_spans(&snap, path, &section.ops))
+    else {
+        return e;
+    };
+    let mut lines: Vec<u32> = spans.iter().flat_map(|&(lo, hi)| lo..=hi).collect();
+    lines.sort_unstable();
+    lines.dedup();
+    let rows: Vec<&str> = live.split('\n').collect();
+    let p = crate::format::display_path(path);
+    let matches = match spans.len() {
+        1 => "1 match was".to_string(),
+        n => format!("{n} matches were"),
+    };
+    let mut out = format!(
+        "Edit rejected for {p}: {matches} never displayed under this tag, so nothing was \
+         applied. The lines below show them, and they now count as displayed. Send the same \
+         call again unchanged to apply it.\n{}",
+        format_header(&p, tag)
+    );
+    for &n in &lines {
+        let row = (n as usize)
+            .checked_sub(1)
+            .and_then(|i| rows.get(i))
+            .copied()
+            .unwrap_or_default();
+        let _ = write!(out, "\n{n}:{}", row.strip_suffix('\r').unwrap_or(row));
+    }
+    ctx.shown.replace(Some(Shown {
+        path: path.to_path_buf(),
+        text: live.to_string(),
+        lines,
+        fallback: error_block(path, &e),
+    }));
+    TilthError::EditRejected(out)
+}
+
 /// The edited text, any file op, whether a `replace_text` resolved through
 /// whitespace normalization, and the lines the apply wrote. The last is `None`
 /// after a 3-way merge, which cannot say where this section's lines landed.
@@ -350,23 +463,10 @@ fn resolve_edit(
         // whose text differs would silently overwrite the live drift, so route
         // it through recovery instead.
         Some(tag) if tag == live_tag => {
-            let store = session.snapshots();
-            if let Some(mut snap) = store.by_tag(&key, tag) {
-                if snap.text == live {
-                    // A resumed agent session runs in a new tilth process.
-                    snap.seen_lines
-                        .extend(session.persisted_seen(cwd, &key, tag, live));
-                    let r = gated_apply(&snap, path, &section.ops)
-                        .map_err(|e| map_edit_error(e, path, tag))?;
-                    return Ok((r.text, r.file_op, r.normalized_swap, Some(r.written)));
-                }
+            let Some(snap) = gate_snapshot(session, &key, tag, live, cwd) else {
+                let store = session.snapshots();
                 return recover_edit(&store, section, path, &key, tag, live);
-            }
-            // The read's snapshot was evicted, or another tilth process made
-            // it: preserve the tag and source text, and authorize only the
-            // lines that the seen store saved for this exact content.
-            let mut snap = synthetic_snapshot(&key, live, tag);
-            snap.seen_lines = session.persisted_seen(cwd, &key, tag, live);
+            };
             let r =
                 gated_apply(&snap, path, &section.ops).map_err(|e| map_edit_error(e, path, tag))?;
             Ok((r.text, r.file_op, r.normalized_swap, Some(r.written)))
@@ -757,6 +857,30 @@ fn render_bounded_diff(before: Option<&str>, after: &str) -> String {
         "{prefix}... truncated ({remaining}) — use shell `git diff` to review Git changes; it may differ from this write patch."
     )
 }
+/// The snapshot that the seen-lines gate checks when a section's `tag` matches
+/// `live`: the recorded version of `live`, or a synthetic one when that version
+/// was evicted or another tilth process recorded it. It also holds the lines
+/// that the seen store saved for `live` in the checkout of `cwd`, because a
+/// resumed agent session runs in a new tilth process. `None` when the recorded
+/// version differs from `live`: a 16-bit tag collision, which recovery handles.
+fn gate_snapshot(
+    session: &Session,
+    key: &str,
+    tag: u16,
+    live: &str,
+    cwd: &Path,
+) -> Option<Snapshot> {
+    let recorded = session.snapshots().by_tag(key, tag);
+    let mut snap = match recorded {
+        Some(snap) if snap.text == live => snap,
+        Some(_) => return None,
+        None => synthetic_snapshot(key, live, tag),
+    };
+    snap.seen_lines
+        .extend(session.persisted_seen(cwd, key, tag, live));
+    Some(snap)
+}
+
 /// A synthetic snapshot preserves the tag and full source after provenance
 /// eviction, but it marks no source lines as displayed.
 fn synthetic_snapshot(key: &str, text: &str, tag: u16) -> Snapshot {
@@ -926,21 +1050,14 @@ mod tests {
         let spec = format!("{}#1-5", path.to_str().unwrap());
         let tag = read_tag(dir.path(), &spec, "r.go#", &session, &cache);
         let unseen = run(json!([{"path": path.to_str().unwrap(), "tag": tag, "ops": op}]));
+        // The refusal itself displays the unseen match, so no re-read is needed.
         assert!(
-            unseen.contains("never displayed") && unseen.contains('8'),
+            unseen.contains("1 match was never displayed")
+                && unseen.contains("same call again unchanged")
+                && unseen.contains(&format!("[r.go#{tag}]\n8:\ty := t.inner.Render(q.Z())")),
             "{unseen}"
         );
-        // The fix is one batched read of each unseen match span, not a whole-file re-read.
-        let Some((reads, _)) = unseen
-            .split_once("tilth_read paths ")
-            .and_then(|(_, rest)| rest.split_once(" shows"))
-        else {
-            panic!("no batched read hint: {unseen}");
-        };
-        assert_eq!(
-            serde_json::from_str::<Value>(reads).unwrap(),
-            json!(["r.go#8-8"]),
-        );
+        assert!(!unseen.contains("tilth_read paths"), "{unseen}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), GO_SRC);
 
         let txt_tag = read_tag(
@@ -970,6 +1087,308 @@ mod tests {
         let msg = super::tool_write(&args, &session, &bloom, &cache).unwrap_err();
         assert!(msg.contains("never displayed"), "{msg}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+    }
+
+    /// Run `tool_write` on its own thread and wait at most 30 s, so a retaken
+    /// snapshots lock fails the test instead of hanging the suite.
+    fn write_bounded(
+        args: &Value,
+        session: &Arc<Session>,
+        cache: &Arc<OutlineCache>,
+    ) -> Result<String, String> {
+        let (done, result) = std::sync::mpsc::channel();
+        let (args, session, cache) = (args.clone(), Arc::clone(session), Arc::clone(cache));
+        std::thread::spawn(move || {
+            let bloom = Arc::new(BloomFilterCache::new());
+            let _ = done.send(super::tool_write(&args, &session, &bloom, &cache));
+        });
+        result
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("tool_write did not return within 30 s: a lock was taken twice")
+    }
+
+    /// The `N:content` lines of a write response.
+    fn numbered(out: &str) -> Vec<(u32, &str)> {
+        out.lines()
+            .filter_map(|line| {
+                let (n, content) = line.split_once(':')?;
+                Some((n.parse().ok()?, content))
+            })
+            .collect()
+    }
+
+    const CALL: &str = "    foo(x) + y";
+
+    /// A Rust file with 14 `foo(x)` call sites, one in each 6-line function,
+    /// on lines 11, 17, ..., 89. A read of lines 1-5 displays none of them.
+    fn calls_source() -> String {
+        let mut source = String::from(
+            "// Call sites of foo.\n// Each useN calls foo once.\n\nfn foo(x: i32) -> i32 {\n    x\n}\n\n",
+        );
+        for i in 0..14 {
+            let _ = write!(
+                source,
+                "fn use{i}() -> i32 {{\n    let x = {i};\n    let y = x + 1;\n{CALL}\n}}\n\n"
+            );
+        }
+        source
+    }
+
+    fn call_lines() -> Vec<u32> {
+        (0..14).map(|i| 11 + 6 * i).collect()
+    }
+
+    /// The calls fixture in a session that read only its lines 1-5.
+    struct Calls {
+        dir: tempfile::TempDir,
+        path: PathBuf,
+        session: Arc<Session>,
+        cache: Arc<OutlineCache>,
+        tag: String,
+    }
+
+    impl Calls {
+        fn read_head() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("calls.rs");
+            std::fs::write(&path, calls_source()).unwrap();
+            let session = Arc::new(Session::new());
+            let cache = Arc::new(OutlineCache::new());
+            let spec = format!("{}#1-5", path.to_str().unwrap());
+            let tag = read_tag(dir.path(), &spec, "calls.rs#", &session, &cache);
+            Self {
+                dir,
+                path,
+                session,
+                cache,
+                tag,
+            }
+        }
+
+        fn write(&self, ops: &Value) -> Result<String, String> {
+            let args = json!({"cwd": self.dir.path(), "edits": [{
+                "path": self.path.to_str().unwrap(), "tag": self.tag, "ops": ops}]});
+            write_bounded(&args, &self.session, &self.cache)
+        }
+
+        fn text(&self) -> String {
+            std::fs::read_to_string(&self.path).unwrap()
+        }
+
+        /// Send `ops` twice: both calls are refused with `expected`, show no
+        /// lines, and leave the file as `source`.
+        fn assert_stays_refused(&self, ops: &Value, source: &str, expected: &str) {
+            for attempt in ["first call", "identical retry"] {
+                let refusal = self.write(ops).unwrap_err();
+                assert!(refusal.contains(expected), "{attempt}: {refusal}");
+                assert_eq!(numbered(&refusal), Vec::new(), "{attempt}: {refusal}");
+                assert_eq!(self.text(), source, "{attempt} must not write");
+            }
+        }
+    }
+
+    #[test]
+    fn unseen_rewrite_matches_are_shown_and_the_same_call_applies() {
+        let calls = Calls::read_head();
+        let source = calls.text();
+        let ops = json!([{"op": "rewrite", "pattern": "foo($A)", "rewrite": "bar($A)"}]);
+        let refusal = calls.write(&ops).unwrap_err();
+        assert_eq!(calls.text(), source, "a refused call applies nothing");
+        let header = format!("[calls.rs#{}]", calls.tag);
+        let (head, shown) = refusal
+            .split_once(&header)
+            .unwrap_or_else(|| panic!("no {header} header: {refusal}"));
+        assert!(
+            head.contains("14 matches were never displayed")
+                && head.contains("Send the same call again unchanged"),
+            "{refusal}"
+        );
+        let expected: Vec<(u32, &str)> = call_lines().into_iter().map(|n| (n, CALL)).collect();
+        assert_eq!(numbered(shown), expected);
+        let applied = calls.write(&ops).expect("the identical call applies");
+        assert!(applied.contains("applied"), "{applied}");
+        assert_eq!(calls.text(), source.replace(CALL, "    bar(x) + y"));
+    }
+
+    #[test]
+    fn unseen_replace_text_matches_are_shown_and_the_same_call_applies() {
+        for extra in [json!({"all": true}), json!({"count": 14})] {
+            let calls = Calls::read_head();
+            let source = calls.text();
+            let mut op = json!({"op": "replace_text", "old": "foo(x) + y", "new": "bar(x) + y"});
+            op.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let ops = json!([op]);
+            let refusal = calls.write(&ops).unwrap_err();
+            assert_eq!(
+                calls.text(),
+                source,
+                "{extra}: a refused call applies nothing"
+            );
+            let shown: Vec<u32> = numbered(&refusal).into_iter().map(|(n, _)| n).collect();
+            assert_eq!(shown, call_lines(), "{extra}: {refusal}");
+            calls.write(&ops).expect("the identical call applies");
+            assert_eq!(calls.text(), source.replace(CALL, "    bar(x) + y"));
+        }
+    }
+
+    #[test]
+    fn a_refusal_records_exactly_the_printed_lines_as_seen() {
+        let calls = Calls::read_head();
+        let source = calls.text();
+        let key = crate::edit::normalize_path_key(&calls.path);
+        let tag = crate::edit::tag::parse_tag(&calls.tag).unwrap();
+        let seen = || {
+            calls
+                .session
+                .snapshots()
+                .by_tag(&key, tag)
+                .map(|snap| snap.seen_lines)
+                .unwrap_or_default()
+        };
+        let before = seen();
+        let ops = json!([{"op": "rewrite", "pattern": "foo($A)", "rewrite": "bar($A)"}]);
+        calls.write(&ops).unwrap_err();
+        let added: std::collections::BTreeSet<u32> = seen().difference(&before).copied().collect();
+        assert_eq!(added, call_lines().into_iter().collect());
+        assert_eq!(calls.text(), source);
+    }
+
+    #[test]
+    fn other_refusals_show_no_lines_and_stay_refused() {
+        let calls = Calls::read_head();
+        let source = calls.text();
+        let rewrite = json!({"op": "rewrite", "pattern": "foo($A)", "rewrite": "bar($A)"});
+        let on_call =
+            json!({"op": "replace", "start": 41, "end": 41, "content": "    bar(x) + y\n"});
+        let cases = [
+            (
+                "a line op on an undisplayed line",
+                json!([on_call]),
+                "never displayed",
+            ),
+            (
+                "a single-match replace_text",
+                json!([{"op": "replace_text", "old": "let x =  7;", "new": "let x = 70;"}]),
+                "never displayed",
+            ),
+            (
+                "a count mismatch",
+                json!([{"op": "replace_text", "old": "foo(x) + y", "new": "bar(x) + y", "count": 5}]),
+                "expected 5 matches",
+            ),
+            (
+                "a rewrite beside a line op on an undisplayed line",
+                json!([rewrite, {"op": "replace", "start": 12, "end": 12, "content": "}\n"}]),
+                "never displayed",
+            ),
+            (
+                "a rewrite beside a line op inside an unseen match",
+                json!([rewrite, on_call]),
+                "never displayed",
+            ),
+        ];
+        for (case, ops, expected) in cases {
+            eprintln!("case: {case}");
+            calls.assert_stays_refused(&ops, &source, expected);
+        }
+    }
+
+    #[test]
+    fn a_drifted_tag_rewrite_keeps_its_refusal() {
+        let calls = Calls::read_head();
+        let drifted = format!("// drift\n{}", calls.text());
+        std::fs::write(&calls.path, &drifted).unwrap();
+        let ops = json!([{"op": "rewrite", "pattern": "foo($A)", "rewrite": "bar($A)"}]);
+        calls.assert_stays_refused(&ops, &drifted, "file changed since the read");
+    }
+
+    #[test]
+    fn a_file_over_the_tag_cap_keeps_its_refusal() {
+        let calls = Calls::read_head();
+        // No read can tag a file over the cap, so the test hashes it itself.
+        let big = format!(
+            "a = token\n{}b = token\n",
+            "x\n".repeat(crate::edit::snapshots::DEFAULT_PER_FILE_CAP / 2 + 1)
+        );
+        let path = calls.dir.path().join("big.txt");
+        std::fs::write(&path, &big).unwrap();
+        let tag = format!("{:04X}", compute_file_hash(&big));
+        let args = json!({"cwd": calls.dir.path(), "edits": [{"path": path.to_str().unwrap(), "tag": tag,
+            "ops": [{"op": "replace_text", "old": "token", "new": "marker", "all": true}]}]});
+        for attempt in ["first call", "identical retry"] {
+            let refusal = write_bounded(&args, &calls.session, &calls.cache).unwrap_err();
+            assert!(refusal.contains("never displayed"), "{attempt}: {refusal}");
+            assert_eq!(numbered(&refusal), Vec::new(), "{attempt}: {refusal}");
+            assert!(
+                std::fs::read_to_string(&path).unwrap() == big,
+                "{attempt} must not write"
+            );
+        }
+    }
+
+    /// Unseen matches whose lines exceed what a host shows in one response.
+    fn too_many_to_show() -> String {
+        let pad = "z".repeat(80);
+        let mut source = String::from("x = 0\nx = 1\n");
+        for i in 0..600 {
+            let _ = writeln!(source, "v{i} = token // {pad}");
+        }
+        source
+    }
+
+    #[test]
+    fn a_refusal_too_large_for_the_host_shows_no_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.txt");
+        let source = too_many_to_show();
+        std::fs::write(&path, &source).unwrap();
+        let session = Arc::new(Session::new());
+        let cache = Arc::new(OutlineCache::new());
+        let spec = format!("{}#1-2", path.to_str().unwrap());
+        let tag = read_tag(dir.path(), &spec, "wide.txt#", &session, &cache);
+        let args = json!({"cwd": dir.path(), "edits": [{"path": path.to_str().unwrap(), "tag": tag,
+            "ops": [{"op": "replace_text", "old": "token", "new": "marker", "all": true}]}]});
+        for attempt in ["first call", "identical retry"] {
+            let refusal = write_bounded(&args, &session, &cache).unwrap_err();
+            assert!(refusal.contains("tilth_read paths"), "{attempt}: {refusal}");
+            assert_eq!(numbered(&refusal), Vec::new(), "{attempt}: {refusal}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+        }
+    }
+
+    #[test]
+    fn a_batch_keeps_the_shown_refusals_that_fit_and_reverts_the_rest() {
+        let calls = Calls::read_head();
+        let source = calls.text();
+        let wide = calls.dir.path().join("wide.txt");
+        std::fs::write(&wide, too_many_to_show()).unwrap();
+        let spec = format!("{}#1-2", wide.to_str().unwrap());
+        let wide_tag = read_tag(
+            calls.dir.path(),
+            &spec,
+            "wide.txt#",
+            &calls.session,
+            &calls.cache,
+        );
+        let rewrite = json!([{"op": "rewrite", "pattern": "foo($A)", "rewrite": "bar($A)"}]);
+        let replace = json!([{"op": "replace_text", "old": "token", "new": "marker", "all": true}]);
+        let args = json!({"cwd": calls.dir.path(), "edits": [
+            {"path": calls.path.to_str().unwrap(), "tag": calls.tag, "ops": rewrite},
+            {"path": wide.to_str().unwrap(), "tag": wide_tag, "ops": replace},
+        ]});
+        let refusal = write_bounded(&args, &calls.session, &calls.cache).unwrap_err();
+        let (first, second) = refusal.split_once(SECTION_SEPARATOR).unwrap();
+        let shown: Vec<u32> = numbered(first).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(shown, call_lines(), "{first}");
+        assert!(second.contains("tilth_read paths"), "{second}");
+        assert_eq!(numbered(second), Vec::new(), "{second}");
+        // The first section's lines now count as displayed; the second's do not.
+        let out = write_bounded(&args, &calls.session, &calls.cache).unwrap();
+        assert!(out.contains("applied") && out.contains("error:"), "{out}");
+        assert_eq!(calls.text(), source.replace(CALL, "    bar(x) + y"));
+        assert_eq!(std::fs::read_to_string(&wide).unwrap(), too_many_to_show());
     }
 
     #[test]

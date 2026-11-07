@@ -194,46 +194,99 @@ fn check_text_swap_overlap(
                 }
             }
         }
-        // all/count: every occurrence must overlap a seen line, not just one.
-        if let Op::TextSwapAll { old, count, .. } = op {
-            if let Ok(spans) = find_all_text_spans(&snapshot.text, old, *count) {
-                let unseen: Vec<(u32, u32)> = spans
-                    .iter()
-                    .map(|&(start, end)| lines.content_line_span(start, end))
-                    .filter(|&(lo, hi)| !span_overlaps_seen(snapshot, lo, hi))
-                    .collect();
-                if let Some(&(lo, hi)) = unseen.first() {
-                    // One displayed line per occurrence passes the overlap gate.
-                    let reads = unseen.iter().map(|&(lo, _)| (lo, lo)).collect();
-                    return Err(with_reads(
-                        unseen_anchor(snapshot, lo, (lo, hi)),
-                        merge_ranges(reads),
-                    ));
-                }
-            }
+        let unseen = unseen_matches(snapshot, &lines, path, op);
+        let Some(&(lo, hi)) = unseen.first() else {
+            continue;
+        };
+        if matches!(op, Op::Rewrite { .. }) {
+            let line = (lo..=hi)
+                .find(|l| !snapshot.seen_lines.contains(l))
+                .unwrap_or(lo);
+            return Err(with_reads(
+                unseen_anchor(snapshot, line, (lo, hi)),
+                merge_ranges(unseen),
+            ));
         }
-        // rewrite: `$$$` captures can span lines the agent never typed, so
-        // every line of every ast-grep match must have been displayed.
-        if let Op::Rewrite { pattern, count, .. } = op {
-            if let Ok(spans) = rewrite_match_spans(path, &snapshot.text, pattern, *count) {
-                let unseen: Vec<(u32, u32)> = spans
-                    .iter()
-                    .map(|&(start, end)| lines.content_line_span(start, end))
-                    .filter(|&(lo, hi)| (lo..=hi).any(|l| !snapshot.seen_lines.contains(&l)))
-                    .collect();
-                if let Some(&(lo, hi)) = unseen.first() {
-                    let line = (lo..=hi)
-                        .find(|l| !snapshot.seen_lines.contains(l))
-                        .unwrap_or(lo);
-                    return Err(with_reads(
-                        unseen_anchor(snapshot, line, (lo, hi)),
-                        merge_ranges(unseen),
-                    ));
-                }
-            }
-        }
+        // One displayed line per occurrence passes the overlap gate.
+        let reads = unseen.iter().map(|&(lo, _)| (lo, lo)).collect();
+        return Err(with_reads(
+            unseen_anchor(snapshot, lo, (lo, hi)),
+            merge_ranges(reads),
+        ));
     }
     Ok(())
+}
+
+/// The line spans of the `replace_text all|count` or `rewrite` matches of `op`
+/// that the gate refuses as never displayed. An all/count match needs one
+/// displayed line. A rewrite match needs every line, because `$$$` captures
+/// can span lines the agent never typed. Other ops, and an `old` or pattern
+/// that does not resolve, give no spans: `apply_ops` reports the real failure.
+fn unseen_matches(
+    snapshot: &Snapshot,
+    lines: &NewlineIndex,
+    path: &Path,
+    op: &Op,
+) -> Vec<(u32, u32)> {
+    let (spans, every_line) = match op {
+        Op::TextSwapAll { old, count, .. } => {
+            (find_all_text_spans(&snapshot.text, old, *count), false)
+        }
+        Op::Rewrite { pattern, count, .. } => (
+            rewrite_match_spans(path, &snapshot.text, pattern, *count),
+            true,
+        ),
+        _ => return Vec::new(),
+    };
+    let Ok(spans) = spans else {
+        return Vec::new();
+    };
+    spans
+        .into_iter()
+        .map(|(start, end)| lines.content_line_span(start, end))
+        .filter(|&(lo, hi)| {
+            if every_line {
+                (lo..=hi).any(|l| !snapshot.seen_lines.contains(&l))
+            } else {
+                !span_overlaps_seen(snapshot, lo, hi)
+            }
+        })
+        .collect()
+}
+
+/// The full line spans of the unseen `rewrite` and `replace_text all|count`
+/// matches when they are the only reason that [`gated_apply`] refuses `ops`:
+/// the other ops pass the gate on the displayed lines alone, and once the
+/// spans count as displayed, every op applies. `None` for every other refusal
+/// and for ops that the gate accepts.
+pub(crate) fn unseen_match_spans(
+    snapshot: &Snapshot,
+    path: &Path,
+    ops: &[Op],
+) -> Option<Vec<(u32, u32)>> {
+    let lines = NewlineIndex::new(&snapshot.text);
+    let spans: Vec<(u32, u32)> = ops
+        .iter()
+        .flat_map(|op| unseen_matches(snapshot, &lines, path, op))
+        .collect();
+    if spans.is_empty() {
+        return None;
+    }
+    // A match span must not authorize a single-match swap or a line op that
+    // happens to anchor inside it: those keep their own refusal.
+    let single: Vec<Op> = ops
+        .iter()
+        .filter(|op| matches!(op, Op::TextSwap { .. }))
+        .cloned()
+        .collect();
+    check_text_swap_overlap(snapshot, path, &single, ExactSwap::Exempt).ok()?;
+    check_strict_anchors(snapshot, path, ops).ok()?;
+    let mut shown = snapshot.clone();
+    shown
+        .seen_lines
+        .extend(spans.iter().flat_map(|&(lo, hi)| lo..=hi));
+    gated_apply(&shown, path, ops).ok()?;
+    Some(spans)
 }
 
 fn span_overlaps_seen(snapshot: &Snapshot, lo: u32, hi: u32) -> bool {

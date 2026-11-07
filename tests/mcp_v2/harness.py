@@ -2,9 +2,11 @@
 import atexit
 import json
 import os
+import selectors
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -116,3 +118,60 @@ def tool_result_text(response):
 
 def tool_is_error(response):
     return response["result"].get("isError", False)
+
+
+class Server:
+    """One `tilth --mcp` process: the server of one agent session.
+
+    Each call waits at most `timeout` seconds, so a hung server fails the test
+    instead of hanging it.
+    """
+
+    def __init__(self, env=None, cwd=None, timeout=30):
+        self.timeout = timeout
+        self.next_id = 1
+        self.pending = bytearray()
+        self.proc = subprocess.Popen(
+            [str(BIN), "--mcp"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            env=env,
+            cwd=cwd or REPO_ROOT,
+        )
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(self.proc.stdout, selectors.EVENT_READ)
+        self.request(initialize_request(self.next_id))
+
+    def request(self, request):
+        self.proc.stdin.write((json.dumps(request) + "\n").encode())
+        self.proc.stdin.flush()
+        deadline = time.monotonic() + self.timeout
+        while b"\n" not in self.pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self.selector.select(remaining):
+                raise TimeoutError(f"MCP response timed out for {request['id']}")
+            chunk = os.read(self.proc.stdout.fileno(), 65536)
+            if not chunk:
+                raise EOFError(f"MCP closed before response {request['id']}")
+            self.pending.extend(chunk)
+        line, _, rest = self.pending.partition(b"\n")
+        self.pending = bytearray(rest)
+        return json.loads(line)
+
+    def call(self, name, arguments):
+        self.next_id += 1
+        return self.request(tools_call_request(self.next_id, name, arguments))
+
+    def close(self):
+        if self.proc.poll() is None:
+            try:
+                self.proc.stdin.close()
+            except BrokenPipeError:
+                pass
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait(timeout=5)
+        self.selector.close()
+        self.proc.stdout.close()
