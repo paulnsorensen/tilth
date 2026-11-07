@@ -174,6 +174,42 @@ def test_run_plan_stops_before_crossing_ceiling(world) -> None:
     assert ledger.spent == pytest.approx(0.1)
 
 
+@pytest.mark.parametrize("whole_plan", [True, False])
+def test_a_whole_plan_over_the_ceiling_buys_no_cell(world, whole_plan: bool) -> None:
+    ledger = SpendLedger(0.15)
+    with pytest.raises(run.PlanStopped) as stopped:
+        plan(world, cells(*DEV), ledger=ledger, cell_estimate_usd=0.1, whole_plan=whole_plan)
+
+    assert stopped.value.reason == "ceiling"
+    if whole_plan:
+        assert "$0.2000 estimated for the whole plan (2 cell(s) to buy)" in str(stopped.value)
+        assert world.runner_calls() == [] and world.stored() == [] and stopped.value.rows == []
+        assert ledger.spent == 0.0
+    else:
+        # Cell by cell, as before: the first cell fits and is bought, then the plan stops.
+        assert len(world.runner_calls()) == 1 and ledger.spent == pytest.approx(0.1)
+
+
+def test_a_whole_plan_within_the_ceiling_buys_every_cell(world) -> None:
+    ledger = SpendLedger(0.25)
+    rows = plan(world, cells(*DEV), ledger=ledger, cell_estimate_usd=0.1, whole_plan=True)
+
+    assert [row["task"] for row in rows] == list(DEV) and len(world.runner_calls()) == len(DEV)
+    assert ledger.spent == pytest.approx(0.2)
+
+
+def test_a_whole_plan_sums_only_the_cells_it_must_buy(world, tmp_path: Path) -> None:
+    plan(world, cells("dev_a"))
+    output = tmp_path / "out.jsonl"
+    ledger = SpendLedger(0.15)
+
+    rows = plan(world, cells(*DEV), ledger=ledger, cell_estimate_usd=0.1, whole_plan=True, output=output)
+
+    assert [(row["task"], row["reused"]) for row in rows] == [("dev_a", True), ("dev_b", False)]
+    assert ledger.spent == pytest.approx(0.1)
+    # A store-only plan buys nothing, so its unstored cells meet no ceiling.
+    assert plan(world, cells(*DEV, reps=(1,)), ledger=SpendLedger(0.01), whole_plan=True, store_only=True) == []
+
 def test_run_plan_stops_on_quota(world, monkeypatch: pytest.MonkeyPatch) -> None:
     def quota(*args, **kwargs):
         world.calls.append(args)

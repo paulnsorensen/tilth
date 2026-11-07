@@ -445,13 +445,15 @@ class Evolution:
         reps = list(reps)
         return [run.CellSpec(task, mode, self.settings.model, rep) for task in tasks for rep in reps]
 
-    def _plan(self, cells: list[run.CellSpec], sha: str | None, *, store_only: bool = False) -> list[dict]:
+    def _plan(self, cells: list[run.CellSpec], sha: str | None, *, store_only: bool = False,
+              whole_plan: bool = False) -> list[dict]:
         """Run ``cells`` once, then re-run each cell that did not complete up to ``cell_retries`` more times.
 
         The newest attempt's row replaces the cell's earlier row. A stop during a retry keeps the rows so far.
-        A store-only plan never retries.
+        A store-only plan never retries. With ``whole_plan``, the first pass buys no cell unless the ledger covers
+        all the cells it must buy (``run.run_plan``). A retry buys one cell at a time: each cell it completes counts.
         """
-        rows = self._plan_once(cells, sha, store_only=store_only)
+        rows = self._plan_once(cells, sha, store_only=store_only, whole_plan=whole_plan)
         retries = 0 if store_only else self.settings.cell_retries
         for attempt in range(1, retries + 1):
             failed = {_cell_of(row) for row in rows if not baselines.is_completed(row)}
@@ -467,13 +469,15 @@ class Evolution:
             rows = [again.get(_cell_of(row), row) if not baselines.is_completed(row) else row for row in rows]
         return rows
 
-    def _plan_once(self, cells: list[run.CellSpec], sha: str | None, *, store_only: bool = False) -> list[dict]:
+    def _plan_once(self, cells: list[run.CellSpec], sha: str | None, *, store_only: bool = False,
+                   whole_plan: bool = False) -> list[dict]:
         try:
             with self._spending("cells"):
                 rows = run.run_plan(cells, panel=self.panel, ledger=self.ledger, candidate_sha=sha,
                                     refreeze_baselines=self.settings.refreeze_baselines, output=self.rows_path,
                                     cell_estimate_usd=self.settings.cell_estimate_usd,
                                     max_budget_usd=self.settings.cell_budget_usd, store_only=store_only,
+                                    whole_plan=whole_plan,
                                     repo=self.settings.repo, preamble=self.settings.preamble,
                                     **self._strict_plan_kwargs())
         except run.PlanStopped as stopped:
@@ -793,7 +797,7 @@ class Evolution:
                 if ok:
                     sound, output = self._integrity(result, worktree)
             except InfrastructureFailure as fault:
-                # A `just check` timeout has no verdict: keep nothing, so the same patch is checked again.
+                # A `just check` timeout with no hung test has no verdict: keep nothing, so the patch is checked again.
                 self.results.pop(result.cid, None)
                 return self._fail(result, "just check infra", tail(str(fault)))
             finally:
@@ -922,10 +926,13 @@ class Evolution:
             self.log(f"candidate {result.cid[:12]}: could not clear its build: {error}")
 
     def _tiers(self, result: Cascade) -> Cascade:
-        """The cheap (when the panel has one) and paid tiers; the first cell of either builds the candidate binary."""
+        """The cheap (when the panel has one) and paid tiers; the first cell of either builds the candidate binary.
+
+        Each tier is a whole plan: it buys no cell unless the ledger covers the whole tier, as a part tier is no score.
+        """
         if self.panel.cheap:
             if result.cheap_score is None:
-                rows = self._plan(self._cells(self.panel.cheap, CANDIDATE_MODE, [0]), result.sha)
+                rows = self._plan(self._cells(self.panel.cheap, CANDIDATE_MODE, [0]), result.sha, whole_plan=True)
                 result.cheap_rows = rows
                 result.cheap_scores = {task: self._task_mean(rows, task) for task in self.panel.cheap}
                 result.cheap_score = mean(result.cheap_scores.values()) if result.cheap_scores else 0.0
@@ -937,7 +944,7 @@ class Evolution:
                     result.cheap_records = [record for task in self.panel.cheap for record in records.get(task, [])]
                     return self._fail(result, "cheap tier")
         if not result.scores:
-            rows = self._plan(self._cells(self.panel.dev, CANDIDATE_MODE, [0]), result.sha)
+            rows = self._plan(self._cells(self.panel.dev, CANDIDATE_MODE, [0]), result.sha, whole_plan=True)
             records = self._records(rows)
             result.rows = rows
             result.records = {task: records.get(task, []) for task in self.panel.dev}
@@ -1006,7 +1013,9 @@ class Evolution:
             self.log(f"candidate {result.cid[:12]}: dominated after one rollout; not re-run")
             self._discard_build(result)
             return
-        reruns = self._plan(self._cells(dev, CANDIDATE_MODE, range(1, self.settings.reruns + 1)), result.sha)
+        # A whole plan, as in `_tiers`: a part re-run cannot accept the candidate, so its spend would be lost.
+        reruns = self._plan(self._cells(dev, CANDIDATE_MODE, range(1, self.settings.reruns + 1)), result.sha,
+                            whole_plan=True)
         records = self._records(reruns)
         for task in dev:
             result.records[task] = result.records.get(task, []) + records.get(task, [])

@@ -30,6 +30,10 @@ _MODIFIERS = re.compile(r"(?:\b(?:pub(?:\s*\([^)]*\))?|async|const|unsafe)\s+)*$
 _ATTRIBUTES = re.compile(r"(?:#\s*\[(?:[^\[\]]|\[[^\]]*\])*\]\s*)+$")
 _TEST_ATTR = re.compile(r"\btest\b")
 _FAILED_NAME = re.compile(r"\s{4}(\S+)")
+# Not anchored at the line start: with one test thread, libtest prints it after the `test NAME ... ` it began.
+_HUNG_NAME = re.compile(r"\btest (\S+) has been running for over \d+ seconds")
+# libtest's result line, also with a mode (`test NAME - should panic ... ok`) or a time (`ok <0.002s>`).
+_FINISHED_NAME = re.compile(r"test (\S+) +(?:- .+? )?\.\.\. (?:ok|FAILED|ignored)\b")
 _ATTRIBUTE = re.compile(r"#\s*\[((?:[^\[\]]|\[[^\]]*\])*)\]")
 _TEST_ATTRIBUTE = re.compile(r"(?:\w+::)*test(?:\(.*\))?", re.S)
 _GUARD_ATTRIBUTE = re.compile(r"(?:ignore|should_panic|cfg|cfg_attr)\b")
@@ -297,6 +301,22 @@ def failing_tests(output: str) -> list[str]:
             if listed is not None and listed[1] not in names:
                 names.append(listed[1])
     return names
+
+
+def hanging_tests(output: str) -> list[str]:
+    """The test names in libtest's ``test NAME has been running for over N seconds`` lines, in order and without
+    repeats. libtest prints that line once for each test that runs past its warning time.
+
+    A test can finish after its warning: a later ``test NAME ... ok``, ``FAILED``, or ``ignored`` line removes
+    its name. A result line before the warning does not, as another test binary can have a test of that name.
+    """
+    hung: dict[str, None] = {}
+    for line in output.splitlines():
+        if finished := _FINISHED_NAME.match(line):
+            hung.pop(finished[1], None)
+        for warned in _HUNG_NAME.finditer(line):
+            hung.setdefault(warned[1])
+    return list(hung)
 
 
 def test_weakening(old: str, new: str) -> str | None:

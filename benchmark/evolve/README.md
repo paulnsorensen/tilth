@@ -58,6 +58,11 @@ cheap and dev tiers, admission re-runs, and finish. Each attempt is charged to t
 names each retry. The ledger ceiling still applies, and a stop during a retry keeps the rows so far. `--reruns` is a
 different setting: it counts the extra repetitions that admission and finish run, not retries.
 
+The cheap tier, the dev tier, and the admission re-runs are each a whole plan (`run.run_plan(whole_plan=True)`).
+Before the first cell, the plan sums the estimate of every cell it must buy, by the same rule as one cell, but
+without the run maximum. When the sum crosses the ceiling, the plan buys no cell and stops with `ceiling`: a part
+tier gives no score, so its spend would be lost. Retries, baselines, and finish check the ceiling one cell at a time.
+
 If cells are still incomplete after the retries, finish drops each test task with an incomplete cell for the winner,
 the seed, or the baseline. It compares the finalists on the remaining tasks, paired. The log names the dropped cells,
 and the verdict line and the PR body end with `dropped incomplete: <tasks>`. The dev mean still picks the winner, and
@@ -173,6 +178,12 @@ repair before it. `--no-repair` turns off both. The directive is claimed once an
 hypothesis stays on the final child. Each repair call is billed as `proposer` spend. Text components are never
 repaired. `--no-repair` turns the repair off.
 
+A `just check` timeout whose output has libtest's `test NAME has been running for over N seconds` line is a verdict:
+the candidate fails at `just check`, and the tail ends with an `error:` line that names the hung tests. The verdict
+is memoized and repaired like any `just check` failure. A hung test is not a failing test, so it grants no test
+edit. A timeout without that line fails at `just check infra`. A cargo timeout in the integrity stage is always an
+infrastructure fault.
+
 A long failure tail keeps the compiler, clippy, test, or fmt error blocks that cargo printed before its closing
 `build failed` lines, plus the last ten lines.
 
@@ -182,9 +193,10 @@ A candidate that failed a deterministic gate (`apply`, `just check`, `integrity`
 failure, kept in `Evolution.failed` (`evolve/failures.py`) by the first 12 characters of its content id. A
 cheap-tier or paid-tier loss is a score, not a known failure. A build that cannot run (a timeout, a full disk, a
 cache or network fault, the seed's hook build) fails at `build infra`, not `build`, and a `just check` timeout fails
-at `just check infra`: neither says anything about the patch, so the memory skips them and `--avoid-failures-from`
-does not read them. A log from before `just check infra` existed records a `just check` timeout at `just check`, with
-`just check timed out after N s` as its whole tail; the log reader skips that entry too. Only a nonzero
+at `just check infra` (a hang is the exception, see Proposer repair): neither says anything about the patch, so the
+memory skips them and `--avoid-failures-from` does not read them. A log from before `just check infra` existed
+records a `just check` timeout at `just check`, with `just check timed out after N s` as its whole tail; the log
+reader skips that entry too. Only a nonzero
 `cargo build` exit at the candidate's own commit is `build`. A `build infra` fault also keeps nothing in the run's
 own memo, so a later evaluation of the same patch builds it again.
 
