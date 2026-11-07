@@ -1,4 +1,5 @@
 //! The canonical `tilth_search` engine: deterministic query routing (path ->
+//! Go signature -> declaration shape (`pub fn run(&self)`, `Owner::name`) ->
 //! regex -> signature-prefix normalization -> filename-shaped miss ->
 //! symbol/ambiguous -> literal -> miss) with bounded definition enrichment on
 //! unique hits, plus a `follow` branch that executes the continuation hints a
@@ -802,11 +803,14 @@ fn none_tier(base: &Value, counts: &FileCounts) -> Option<Value> {
     Some(none)
 }
 
-/// Route one query through the deterministic precedence: path -> regex ->
-/// signature-prefix normalization -> filename-shaped miss -> symbol/ambiguous
-/// -> literal -> miss. Returns the result record, the resolved route name
-/// (for telemetry), any hints emitted for it, and an optional normalization
+/// One routed query: the result record, the resolved route name (for
+/// telemetry), any hints emitted for it, and an optional normalization
 /// diagnostic when the query was rewritten before routing.
+type Routed = (Value, String, Vec<Value>, Option<Value>);
+
+/// Route one query through the deterministic precedence: path -> Go
+/// signature -> declaration shape -> regex -> signature-prefix normalization
+/// -> filename-shaped miss -> symbol/ambiguous -> literal -> miss.
 fn route_query(
     query: &str,
     glob: Option<&str>,
@@ -814,7 +818,7 @@ fn route_query(
     cache: &OutlineCache,
     session: &Session,
     budget: u64,
-) -> Result<(Value, String, Vec<Value>, Option<Value>), crate::error::TilthError> {
+) -> Result<Routed, crate::error::TilthError> {
     session.record_search(query);
 
     // 1. path — existing file or dir, resolved relative to cwd (or as-is if absolute).
@@ -881,6 +885,21 @@ fn route_query(
         return Ok((result, route, hints, Some(diag)));
     }
 
+    // 1c. declaration shape — a pasted declaration line (`pub fn run(&self)`,
+    // `def get(self, key):`) or a qualified name (`Owner::name`, `Owner.name`).
+    // Parentheses would route it to regex and miss; a qualifier would miss
+    // the identifier route. A dotted file name waits for the file-name route.
+    let declaration = declaration_shape(query);
+    if let Some(shape) = declaration
+        .as_ref()
+        .filter(|shape| !is_file_name_shape(query, shape))
+    {
+        let routed = route_declaration(query, shape, false, glob, cwd, cache, session, budget)?;
+        if let Some(routed) = routed {
+            return Ok(routed);
+        }
+    }
+
     // 2. regex — contains a regex metacharacter (`.` and `/` don't count).
     // A glob naming one exact existing file is single-file-bounded by
     // `search::exact_glob_target` inside the walker — no separate short-circuit needed here.
@@ -934,6 +953,18 @@ fn route_query(
         }
     }
 
+    // 4b. a dotted file name that names no file (`Logger.log`) resolves only
+    // to the definitions its owner holds.
+    if let Some(shape) = declaration
+        .as_ref()
+        .filter(|shape| is_file_name_shape(query, shape))
+    {
+        let routed = route_declaration(query, shape, true, glob, cwd, cache, session, budget)?;
+        if let Some(routed) = routed {
+            return Ok(routed);
+        }
+    }
+
     // 5. symbol / ambiguous — bare identifier: prefer definitions, then reuse
     // usage matches or search literal content when no symbols were found.
     if is_identifier(query) {
@@ -969,25 +1000,70 @@ fn route_identifier(
     // The receiver filter runs inside the walk, so the hit cap counts only the
     // scoped methods. A file defining the method on that receiver names the
     // receiver type, so files without it are never parsed.
-    let sym_result = match receiver_scope {
-        Some((receiver_type, _)) => {
-            let keep = |m: &Match| is_method_on(m, receiver_type);
-            let filter = crate::search::DefinitionFilter {
-                required_text: receiver_type,
-                keep: &keep,
-            };
-            crate::search::search_symbol_raw_filtered(query, cwd, glob, cache, budget, &filter)?
+    let keep =
+        |m: &Match| receiver_scope.is_some_and(|(receiver_type, _)| is_method_on(m, receiver_type));
+    let filter = receiver_scope.map(|(receiver_type, _)| crate::search::DefinitionFilter {
+        required_text: receiver_type,
+        keep: &keep,
+    });
+    let found = code_definitions(query, filter.as_ref(), keyword, glob, cwd, cache, budget)?;
+    if let Some((_, signature_text)) = receiver_scope {
+        if found.defs.is_empty() {
+            let (mut result, route) =
+                content_route(signature_text, glob, cwd, cache, session, None, budget)?;
+            if found.partial {
+                mark_partial(&mut result);
+            }
+            return Ok((result, route, Vec::new()));
+        }
+    }
+    if let Some(hit) = definitions_result(query, &found, glob, cwd, cache, session, budget)? {
+        return Ok(hit);
+    }
+    if found.walk.total_found > 0 {
+        let mut result = raw_result(query, "literal", &found.walk);
+        set_preview(
+            &mut result,
+            crate::search::format_raw_result_deferred(&found.walk, cache, session, budget)?,
+        );
+        return Ok((result, "literal".to_string(), Vec::new()));
+    }
+    let (mut result, route) = content_route(query, glob, cwd, cache, session, None, budget)?;
+    if found.walk.files_unreadable > 0 {
+        mark_partial(&mut result);
+    }
+    Ok((result, route, Vec::new()))
+}
+
+/// The code definitions one symbol walk finds, and the walk itself.
+struct CodeDefinitions {
+    walk: crate::types::SearchResult,
+    /// Code definitions in source order, narrowed by the declaration keyword.
+    defs: Vec<Match>,
+    /// The walk missed a file or stopped before it saw every definition.
+    partial: bool,
+}
+
+/// Walk for definitions of `query`, keep the code ones, and narrow them to
+/// `keyword` when at least one has that kind. `filter` runs inside the walk.
+fn code_definitions(
+    query: &str,
+    filter: Option<&crate::search::DefinitionFilter<'_>>,
+    keyword: Option<&str>,
+    glob: Option<&str>,
+    cwd: &Path,
+    cache: &OutlineCache,
+    budget: u64,
+) -> Result<CodeDefinitions, crate::error::TilthError> {
+    let walk = match filter {
+        Some(filter) => {
+            crate::search::search_symbol_raw_filtered(query, cwd, glob, cache, budget, filter)?
         }
         None => crate::search::search_symbol_raw_for_budget(query, cwd, glob, cache, budget)?,
     };
-    let discovery_partial = sym_result.files_unreadable > 0
-        || sym_result.definitions
-            > sym_result
-                .matches
-                .iter()
-                .filter(|m| m.is_definition)
-                .count();
-    let all_code_defs: Vec<&Match> = sym_result
+    let partial = walk.files_unreadable > 0
+        || walk.definitions > walk.matches.iter().filter(|m| m.is_definition).count();
+    let all_code_defs: Vec<&Match> = walk
         .matches
         .iter()
         .filter(|m| {
@@ -998,7 +1074,7 @@ fn route_identifier(
                 )
         })
         .collect();
-    let mut code_defs: Vec<Match> = keyword
+    let mut defs: Vec<Match> = keyword
         .map(|keyword| declared_as(&all_code_defs, keyword))
         .filter(|kept| !kept.is_empty())
         .unwrap_or_else(|| {
@@ -1008,7 +1084,7 @@ fn route_identifier(
                 .map(|m| (*m).clone())
                 .collect()
         });
-    code_defs.sort_by(|a, b| {
+    defs.sort_by(|a, b| {
         a.path
             .cmp(&b.path)
             .then(a.line.cmp(&b.line))
@@ -1016,7 +1092,7 @@ fn route_identifier(
             // Prefer the innermost declaration when a wrapper and its body share a span.
             .then(b.def_byte_range.cmp(&a.def_byte_range))
     });
-    code_defs.dedup_by(|a, b| {
+    defs.dedup_by(|a, b| {
         let overlapping_occurrence = match (a.def_byte_range, b.def_byte_range) {
             (Some((a_start, a_end)), Some((b_start, b_end))) => a_start < b_end && b_start < a_end,
             _ => a.def_byte_range == b.def_byte_range,
@@ -1030,59 +1106,129 @@ fn route_identifier(
             false
         }
     });
-    if let Some((_, signature_text)) = receiver_scope {
-        if code_defs.is_empty() {
-            let (mut result, route) =
-                content_route(signature_text, glob, cwd, cache, session, None, budget)?;
-            if discovery_partial {
-                mark_partial(&mut result);
-            }
-            return Ok((result, route, Vec::new()));
+    Ok(CodeDefinitions {
+        walk,
+        defs,
+        partial,
+    })
+}
+
+/// The unique hit or the ambiguous candidate list for found definitions, or
+/// `None` when there are none.
+fn definitions_result(
+    query: &str,
+    found: &CodeDefinitions,
+    glob: Option<&str>,
+    cwd: &Path,
+    cache: &OutlineCache,
+    session: &Session,
+    budget: u64,
+) -> Result<Option<(Value, String, Vec<Value>)>, crate::error::TilthError> {
+    let (mut result, route, hints) = match found.defs.as_slice() {
+        [] => return Ok(None),
+        [target] => {
+            let (result, hints) = unique_hit(
+                query,
+                "symbol",
+                &target.path,
+                target.line,
+                target.def_range.map(|(_, end)| end),
+                target.def_byte_range,
+                cwd,
+                glob,
+                cache,
+                session,
+                budget,
+            )?;
+            (result, "symbol", hints)
         }
-    }
-    if code_defs.len() == 1 {
-        let target = &code_defs[0];
-        let (mut result, hints) = unique_hit(
-            query,
-            "symbol",
-            &target.path,
-            target.line,
-            target.def_range.map(|(_, end)| end),
-            target.def_byte_range,
-            cwd,
-            glob,
-            cache,
-            session,
-            budget,
-        )?;
-        if discovery_partial {
-            mark_partial(&mut result);
+        defs => {
+            // The candidates are the answer. A content search of the bare name
+            // would preview unrelated lines and skew completeness.
+            let mut result = base_result(query, "ambiguous", "ambiguous");
+            result["candidates"] = json!(candidates(defs, cwd));
+            (result, "ambiguous", Vec::new())
         }
-        return Ok((result, "symbol".to_string(), hints));
-    }
-    if code_defs.len() > 1 {
-        // The candidates are the answer. A content search of the bare name
-        // would preview unrelated lines and skew completeness.
-        let mut result = base_result(query, "ambiguous", "ambiguous");
-        result["candidates"] = json!(candidates(&code_defs, cwd));
-        if discovery_partial {
-            mark_partial(&mut result);
-        }
-        return Ok((result, "ambiguous".to_string(), Vec::new()));
-    }
-    if sym_result.total_found > 0 {
-        let mut result = raw_result(query, "literal", &sym_result);
-        set_preview(
-            &mut result,
-            crate::search::format_raw_result_deferred(&sym_result, cache, session, budget)?,
-        );
-        return Ok((result, "literal".to_string(), Vec::new()));
-    }
-    let (mut result, route) = content_route(query, glob, cwd, cache, session, None, budget)?;
-    if sym_result.files_unreadable > 0 {
+    };
+    if found.partial {
         mark_partial(&mut result);
     }
-    Ok((result, route, Vec::new()))
+    Ok(Some((result, route.to_string(), hints)))
+}
+
+/// Resolve a pasted declaration line or a qualified name to the definitions
+/// of its last path segment. A qualifier keeps the definitions its owner
+/// holds. When it keeps none, every definition of the name returns, and the
+/// diagnostic names the owners found. `strict` drops that fallback. `None`
+/// hands the query back to the later routes: a bare qualified name with no
+/// definition (`os.path.join`), or a strict query whose owner holds none.
+fn route_declaration(
+    query: &str,
+    shape: &DeclarationShape<'_>,
+    strict: bool,
+    glob: Option<&str>,
+    cwd: &Path,
+    cache: &OutlineCache,
+    session: &Session,
+    budget: u64,
+) -> Result<Option<Routed>, crate::error::TilthError> {
+    let mut diag = json!({"query": query, "normalized_to": shape.name});
+    if let Some(keyword) = shape.keyword {
+        diag["stripped_keyword"] = json!(keyword);
+    }
+    if let Some(owner) = shape.owner {
+        diag["owner"] = json!(owner);
+        // The owner's name is in every file that holds one of its definitions.
+        let keep = |m: &Match| is_owned_by(m, owner, cache);
+        let filter = crate::search::DefinitionFilter {
+            required_text: owner,
+            keep: &keep,
+        };
+        let found = code_definitions(
+            shape.name,
+            Some(&filter),
+            shape.keyword,
+            glob,
+            cwd,
+            cache,
+            budget,
+        )?;
+        if let Some((mut result, route, hints)) =
+            definitions_result(shape.name, &found, glob, cwd, cache, session, budget)?
+        {
+            result["query"] = json!(query);
+            return Ok(Some((result, route, hints, Some(diag))));
+        }
+        if strict {
+            return Ok(None);
+        }
+    }
+    let found = code_definitions(shape.name, None, shape.keyword, glob, cwd, cache, budget)?;
+    let Some((mut result, route, hints)) =
+        definitions_result(shape.name, &found, glob, cwd, cache, session, budget)?
+    else {
+        if shape.bare || strict {
+            return Ok(None);
+        }
+        let (mut result, route) = content_route(query, glob, cwd, cache, session, None, budget)?;
+        if found.walk.files_unreadable > 0 {
+            mark_partial(&mut result);
+        }
+        return Ok(Some((result, route, Vec::new(), Some(diag))));
+    };
+    if shape.owner.is_some() {
+        let mut owners: Vec<String> = found
+            .defs
+            .iter()
+            .filter_map(|m| definition_owner(m, cache))
+            .collect();
+        owners.sort_unstable();
+        owners.dedup();
+        diag["owner_matched"] = json!(false);
+        diag["owners_found"] = json!(owners);
+    }
+    result["query"] = json!(query);
+    Ok(Some((result, route, hints, Some(diag))))
 }
 
 /// The literal-content tail shared by every route that ends in a content
@@ -1167,6 +1313,268 @@ fn strip_signature_prefix(query: &str) -> Option<(&str, &str)> {
     } else {
         None
     }
+}
+
+/// A pasted declaration line or a qualified name, reduced to the name to
+/// resolve: `pub fn run(&self) -> Guard`, `def get(self, key):`,
+/// `public void close()`, `Owner::name`, `Owner.name`.
+#[derive(Debug, PartialEq, Eq)]
+struct DeclarationShape<'a> {
+    keyword: Option<&'a str>,
+    /// The path segment before the name: `Owner` in `a::Owner::name`.
+    owner: Option<&'a str>,
+    name: &'a str,
+    /// A qualified name alone, with no modifier, keyword, or parameter list.
+    bare: bool,
+}
+
+const DECLARATION_MODIFIERS: &[&str] = &[
+    "pub",
+    "pub(crate)",
+    "pub(super)",
+    "pub(self)",
+    "async",
+    "static",
+    "export",
+    "public",
+    "private",
+    "protected",
+    "final",
+    "abstract",
+    "unsafe",
+    "const",
+];
+
+const DECLARATION_KEYWORDS: &[&str] = &[
+    "fn",
+    "def",
+    "function",
+    "func",
+    "class",
+    "struct",
+    "enum",
+    "trait",
+    "interface",
+    "type",
+];
+
+/// Parse `query` as modifier words, an optional keyword, a name or qualified
+/// name, and an optional balanced parameter list with an optional return
+/// type. Type words may precede a parameter list (`public void close()`).
+/// Regex syntax (`\`, `[`, `|`, `+`, `?`, `^`, `$`, `.*`) or a brace other than
+/// a final body opener means the query is a pattern. A bare identifier and
+/// `keyword name` stay with the identifier and signature-prefix routes.
+fn declaration_shape(query: &str) -> Option<DeclarationShape<'_>> {
+    let text = query.trim();
+    if text.contains(['\\', '[', ']', '|', '+', '?', '^', '$']) || text.contains(".*") {
+        return None;
+    }
+    let text = text.strip_suffix('{').map_or(text, str::trim_end);
+    if text.contains(['{', '}']) {
+        return None;
+    }
+    let (head, has_params) = match parameter_list_start(text) {
+        Some(open) => {
+            let after = &text[open + 1..];
+            let close = matching_close(after, '(', ')')?;
+            if !is_declaration_tail(&after[close + 1..]) {
+                return None;
+            }
+            // The name touches its parameter list or its generic parameters.
+            (without_trailing_generics(&text[..open])?, true)
+        }
+        None => (text, false),
+    };
+    if head.ends_with(char::is_whitespace) || head.matches('<').count() != head.matches('>').count()
+    {
+        return None;
+    }
+    let mut words: Vec<&str> = head.split_whitespace().collect();
+    let name_word = words.pop()?;
+    // A C pointer or reference return type touches the name.
+    let path = if has_params {
+        name_word.trim_start_matches(['*', '&'])
+    } else {
+        name_word
+    };
+    let segments: Vec<&str> = path.split("::").flat_map(|part| part.split('.')).collect();
+    if !segments.iter().all(|segment| is_identifier(segment)) {
+        return None;
+    }
+    let name = *segments.last()?;
+    let owner = segments.len().checked_sub(2).map(|index| segments[index]);
+    let mut keyword = None;
+    let mut modifiers = 0usize;
+    for word in words {
+        if DECLARATION_MODIFIERS.contains(&word) {
+            modifiers += 1;
+        } else if DECLARATION_KEYWORDS.contains(&word) {
+            keyword = Some(word);
+        } else if !(has_params && is_type_word(word)) {
+            return None;
+        }
+    }
+    if !(has_params || owner.is_some() || (keyword.is_some() && modifiers > 0)) {
+        return None;
+    }
+    Some(DeclarationShape {
+        keyword,
+        owner,
+        name,
+        bare: !has_params && keyword.is_none() && modifiers == 0,
+    })
+}
+
+/// Byte index of the `(` that opens a parameter list. The group of a
+/// `pub(crate)`, `pub(super)`, or `pub(self)` visibility does not count.
+fn parameter_list_start(text: &str) -> Option<usize> {
+    text.match_indices('(')
+        .map(|(index, _)| index)
+        .find(|&index| {
+            let after_pub = text[..index]
+                .strip_suffix("pub")
+                .is_some_and(|before| before.is_empty() || before.ends_with(char::is_whitespace));
+            let visibility = after_pub
+                && ["(crate)", "(super)", "(self)"]
+                    .iter()
+                    .any(|group| text[index..].starts_with(group));
+            !visibility
+        })
+}
+
+/// What may follow a parameter list: nothing, a return type (`-> T`, `: T`,
+/// ` T`), a Python colon, or a semicolon. Text that touches the `)` is a regex group.
+fn is_declaration_tail(tail: &str) -> bool {
+    let balanced = tail.matches('(').count() == tail.matches(')').count();
+    balanced && (tail.is_empty() || tail.starts_with([' ', '\t', ':', '-', ';']))
+}
+
+/// `parse<T: Into<U>>` -> `parse`; text without trailing generics is unchanged.
+fn without_trailing_generics(head: &str) -> Option<&str> {
+    let Some(body) = head.strip_suffix('>') else {
+        return Some(head);
+    };
+    let mut depth = 1usize;
+    for (index, c) in body.char_indices().rev() {
+        if c == '>' {
+            depth += 1;
+        } else if c == '<' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(&body[..index]);
+            }
+        }
+    }
+    None
+}
+
+/// A type before a C-family name: `void`, `List<T>`, `std::string`, `*const`.
+fn is_type_word(word: &str) -> bool {
+    word.chars().any(char::is_alphanumeric)
+        && word
+            .chars()
+            .all(|c| c.is_alphanumeric() || "_<>,:&*.'".contains(c))
+}
+
+/// A bare dotted name that is also a file name with a known type
+/// (`config.json`, `main.rs`). The file-name route sees it first.
+fn is_file_name_shape(query: &str, shape: &DeclarationShape<'_>) -> bool {
+    let path = Path::new(query);
+    shape.bare
+        && path.extension().is_some()
+        && !matches!(
+            crate::lang::detect_file_type(path),
+            crate::types::FileType::Other
+        )
+}
+
+/// Whether `owner` holds the definition `m`: see `definition_owner`.
+fn is_owned_by(m: &Match, owner: &str, cache: &OutlineCache) -> bool {
+    definition_owner(m, cache).as_deref() == Some(owner)
+}
+
+/// The owner of the definition `m`: its Go receiver type, the class an
+/// out-of-line C++ method spells (`void Widget::draw()`), or the name of the
+/// nearest class, struct, interface, enum, trait, impl block, or module in
+/// its file outline. Generic parameters are removed: `impl<T> Foo<T>` -> `Foo`.
+fn definition_owner(m: &Match, cache: &OutlineCache) -> Option<String> {
+    if let Some((Some(receiver), _)) = go_func_head(m.text.trim()) {
+        return Some(go_receiver_type(receiver).to_string());
+    }
+    let name = m.def_name.as_deref()?;
+    if let Some(owner) = declarator_owner(&m.text, name) {
+        return Some(owner);
+    }
+    let entries = if let Some(parsed) = cache.get_or_parse(&m.path) {
+        crate::lang::outline::deep_outline_for_path(&m.path, parsed.content(), Some(parsed.tree()))?
+    } else {
+        let content = std::fs::read_to_string(&m.path).ok()?;
+        crate::lang::outline::deep_outline_for_path(&m.path, &content, None)?
+    };
+    enclosing_owner(&entries, name, m.line)
+}
+
+/// The qualifier of a declarator that spells `Owner::name` before its
+/// parameter list: `void Widget<T>::draw() {` -> `Widget`.
+fn declarator_owner(line: &str, name: &str) -> Option<String> {
+    let head = line.split('(').next()?.trim_end();
+    let qualifier = head.strip_suffix(name)?.strip_suffix("::")?;
+    let qualifier = without_trailing_generics(qualifier)?;
+    let start = qualifier
+        .char_indices()
+        .rev()
+        .find(|&(_, c)| c != '_' && !c.is_ascii_alphanumeric())
+        .map_or(0, |(index, c)| index + c.len_utf8());
+    let owner = &qualifier[start..];
+    is_identifier(owner).then(|| owner.to_string())
+}
+
+/// The owner name of the nearest container around the entry `name` that
+/// starts at `line`.
+fn enclosing_owner(
+    entries: &[crate::types::OutlineEntry],
+    name: &str,
+    line: u32,
+) -> Option<String> {
+    use crate::types::OutlineKind;
+    let mut pending: Vec<(&crate::types::OutlineEntry, Option<&str>)> =
+        entries.iter().map(|entry| (entry, None)).collect();
+    while let Some((entry, owner)) = pending.pop() {
+        if !(entry.span_start_line..=entry.end_line).contains(&line) {
+            continue;
+        }
+        if entry.start_line == line && entry.name == name {
+            return owner.and_then(owner_name);
+        }
+        let container = matches!(
+            entry.kind,
+            OutlineKind::Class
+                | OutlineKind::Struct
+                | OutlineKind::Interface
+                | OutlineKind::Enum
+                | OutlineKind::Module
+        );
+        let owner = if container {
+            Some(entry.name.as_str())
+        } else {
+            owner
+        };
+        pending.extend(entry.children.iter().map(|child| (child, owner)));
+    }
+    None
+}
+
+/// The type name in an outline container name: `impl Foo<T>` -> `Foo`,
+/// `impl &'a mut Foo` -> `Foo`, `MyApp.Store` -> `Store`. A synthetic name
+/// such as `<module>` has none.
+fn owner_name(entry_name: &str) -> Option<String> {
+    let name = entry_name.strip_prefix("impl ").unwrap_or(entry_name);
+    let name = name.split('<').next()?.split_whitespace().last()?;
+    let name = name
+        .trim_start_matches(['&', '*'])
+        .rsplit(['.', ':'])
+        .next()?;
+    is_identifier(name).then(|| name.to_string())
 }
 
 struct GoSignature<'a> {
@@ -3365,6 +3773,333 @@ mod tests {
         }
     }
 
+    fn shape<'a>(
+        keyword: Option<&'a str>,
+        owner: Option<&'a str>,
+        name: &'a str,
+        bare: bool,
+    ) -> Option<DeclarationShape<'a>> {
+        Some(DeclarationShape {
+            keyword,
+            owner,
+            name,
+            bare,
+        })
+    }
+
+    #[test]
+    fn declaration_shape_parses_declaration_lines_and_qualified_names() {
+        for (query, expected) in [
+            (
+                "pub fn snapshots(&self) -> Guard",
+                shape(Some("fn"), None, "snapshots", false),
+            ),
+            (
+                "async fn run(&mut self)",
+                shape(Some("fn"), None, "run", false),
+            ),
+            (
+                "pub(crate) unsafe fn run(&mut self) {",
+                shape(Some("fn"), None, "run", false),
+            ),
+            (
+                "pub fn parse<T: Into<String>>(value: T) -> Option<T>",
+                shape(Some("fn"), None, "parse", false),
+            ),
+            (
+                "def get(self, key):",
+                shape(Some("def"), None, "get", false),
+            ),
+            (
+                "function render(a, b)",
+                shape(Some("function"), None, "render", false),
+            ),
+            (
+                "export async function render<T>(a: T): Promise<void>",
+                shape(Some("function"), None, "render", false),
+            ),
+            ("public void close()", shape(None, None, "close", false)),
+            (
+                "public static <T> List<T> of(T... items);",
+                shape(None, None, "of", false),
+            ),
+            (
+                "char *strdup(const char *s)",
+                shape(None, None, "strdup", false),
+            ),
+            (
+                "pub struct Snapshot",
+                shape(Some("struct"), None, "Snapshot", false),
+            ),
+            ("Beta::run", shape(None, Some("Beta"), "run", true)),
+            (
+                "crate::store::Store::get",
+                shape(None, Some("Store"), "get", true),
+            ),
+            ("Store.get", shape(None, Some("Store"), "get", true)),
+            (
+                "fn Beta::run(&self)",
+                shape(Some("fn"), Some("Beta"), "run", false),
+            ),
+            (
+                "void Widget::draw(int x) const",
+                shape(None, Some("Widget"), "draw", false),
+            ),
+        ] {
+            assert_eq!(declaration_shape(query), expected, "{query}");
+        }
+    }
+
+    #[test]
+    fn declaration_shape_leaves_patterns_phrases_and_bare_names_alone() {
+        for query in [
+            "run",
+            "fn run",
+            "static analysis",
+            "see Beta::run",
+            "foo|bar",
+            r"fn\s+run",
+            "run(a)+",
+            "Store.get?",
+            "^run",
+            "run$",
+            "items[0]",
+            "impl.* Matcher for",
+            "foo(bar)baz",
+            "get (self)",
+            "a{2}(x)",
+            "fn foo<F: Fn() -> T>(f: F)",
+            "DO NOT re-read expanded search content",
+            "v1.2",
+        ] {
+            assert!(declaration_shape(query).is_none(), "{query}");
+        }
+    }
+
+    #[test]
+    fn owner_name_drops_impl_generics_references_and_paths() {
+        for (entry, owner) in [
+            ("impl Alpha", Some("Alpha")),
+            ("impl Holder<T>", Some("Holder")),
+            ("impl &'a mut Holder<T>", Some("Holder")),
+            ("impl crate::store::Store", Some("Store")),
+            ("MyApp.Store", Some("Store")),
+            ("Store", Some("Store")),
+            ("<module>", None),
+        ] {
+            assert_eq!(owner_name(entry).as_deref(), owner, "{entry}");
+        }
+    }
+
+    #[test]
+    fn declarator_owner_reads_an_out_of_line_qualifier() {
+        for (line, owner) in [
+            ("void Widget::draw() {", Some("Widget")),
+            ("void ns::Widget<T>::draw(int x) const {", Some("Widget")),
+            ("void éWidget::draw()", Some("Widget")),
+            ("pub fn draw(&self) {", None),
+            ("void draw() { Widget::draw(); }", None),
+        ] {
+            assert_eq!(declarator_owner(line, "draw").as_deref(), owner, "{line}");
+        }
+    }
+
+    #[test]
+    fn cpp_qualifier_picks_in_class_and_out_of_line_methods() {
+        let tmp = source_dir(&[(
+            "w.cpp",
+            "class Widget {\npublic:\n    void draw();\n    int size() { return 1; }\n};\n\n\
+             class Panel {\npublic:\n    void draw();\n    int size() { return 2; }\n};\n\n\
+             void Widget::draw() {\n}\n\nvoid Panel::draw() {\n}\n",
+        )]);
+        assert_resolves_to(tmp.path(), "Widget::size", "w.cpp", 4);
+        assert_resolves_to(tmp.path(), "Panel::size", "w.cpp", 10);
+        assert_resolves_to(tmp.path(), "Widget::draw", "w.cpp", 13);
+        let response = assert_resolves_to(tmp.path(), "void Panel::draw()", "w.cpp", 16);
+        let diag = normalization_for(&response, "void Panel::draw()");
+        assert!(diag.get("owner_matched").is_none(), "{diag}");
+    }
+
+    fn source_dir(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, source) in files {
+            let path = tmp.path().join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, source).unwrap();
+        }
+        tmp
+    }
+
+    fn search_query(dir: &Path, query: &str) -> Value {
+        call(&json!({"cwd": dir, "queries": [{"query": query}]})).unwrap()
+    }
+
+    fn assert_resolves_to(dir: &Path, query: &str, path: &str, line: u32) -> Value {
+        let response = search_query(dir, query);
+        let result = &response["results"][0];
+        assert_eq!(result["resolved_as"], "symbol", "{query}: {response}");
+        assert_eq!(result["target"]["path"], path, "{query}: {response}");
+        assert_eq!(result["target"]["line"], line, "{query}: {response}");
+        assert_eq!(result["query"], query);
+        response
+    }
+
+    fn normalization_for(response: &Value, query: &str) -> Value {
+        response["diagnostics"]["normalizations"]
+            .as_array()
+            .and_then(|all| all.iter().find(|n| n["query"] == query))
+            .cloned()
+            .unwrap_or_else(|| panic!("no normalization for {query}: {response}"))
+    }
+
+    const RUST_OWNERS: &str = "pub struct Alpha;\npub struct Beta;\npub struct Holder<T>(T);\n\n\
+        impl Alpha {\n    pub fn run(&self) -> u8 {\n        1\n    }\n}\n\n\
+        impl Beta {\n    pub fn run(&self) -> u8 {\n        2\n    }\n}\n\n\
+        impl<T: Clone> Holder<T> {\n    pub fn run(&self) -> u8 {\n        3\n    }\n}\n\n\
+        impl std::fmt::Display for Beta {\n    \
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {\n        \
+        write!(f, \"beta\")\n    }\n}\n";
+
+    #[test]
+    fn rust_qualifier_picks_the_impl_block_of_its_owner() {
+        let tmp = source_dir(&[("owners.rs", RUST_OWNERS)]);
+        for (query, line) in [
+            ("Alpha::run", 6),
+            ("Beta::run", 12),
+            ("Holder::run", 18),
+            ("crate::owners::Beta::run", 12),
+            ("Beta::fmt", 24),
+            ("pub fn Beta::run(&self) -> u8 {", 12),
+        ] {
+            let response = assert_resolves_to(tmp.path(), query, "owners.rs", line);
+            let diag = normalization_for(&response, query);
+            assert!(diag.get("owner_matched").is_none(), "{diag}");
+        }
+        let response = assert_resolves_to(tmp.path(), "Beta::run", "owners.rs", 12);
+        assert_eq!(
+            normalization_for(&response, "Beta::run"),
+            json!({"query": "Beta::run", "normalized_to": "run", "owner": "Beta"})
+        );
+    }
+
+    #[test]
+    fn class_qualifier_picks_the_method_of_its_class() {
+        let java = source_dir(&[(
+            "Shapes.java",
+            "class Store {\n    String get(String key) {\n        return key;\n    }\n}\n\n\
+             class Cache {\n    String get(String key) {\n        return null;\n    }\n\n    \
+             public void close() {\n    }\n}\n",
+        )]);
+        assert_resolves_to(java.path(), "Store.get", "Shapes.java", 2);
+        assert_resolves_to(java.path(), "Cache.get", "Shapes.java", 8);
+        assert_resolves_to(java.path(), "public void close()", "Shapes.java", 12);
+        let python = source_dir(&[(
+            "store.py",
+            "import os\n\n\nclass Store:\n    def get(self, key):\n        \
+             return os.path.join(key)\n\n\nclass Cache:\n    def get(self, key):\n        \
+             return None\n",
+        )]);
+        assert_resolves_to(python.path(), "Store.get", "store.py", 5);
+        assert_resolves_to(python.path(), "Cache.get", "store.py", 10);
+        // The dotted call names no `join` definition, so it stays a literal search.
+        let response = search_query(python.path(), "os.path.join");
+        assert_eq!(
+            response["results"][0]["resolved_as"], "literal",
+            "{response}"
+        );
+        assert_eq!(response["diagnostics"], json!({}), "{response}");
+    }
+
+    #[test]
+    fn dotted_go_receiver_picks_its_method() {
+        let tmp = source_dir(&[(
+            "srv.go",
+            "package srv\n\ntype Server struct{}\ntype Client struct{}\n\n\
+             func (s *Server) Run() error {\n\treturn nil\n}\n\n\
+             func (c *Client) Run() error {\n\treturn nil\n}\n",
+        )]);
+        assert_resolves_to(tmp.path(), "Server.Run", "srv.go", 6);
+        assert_resolves_to(tmp.path(), "Client.Run", "srv.go", 10);
+    }
+
+    #[test]
+    fn declaration_lines_resolve_instead_of_missing_as_regex() {
+        let tmp = source_dir(&[
+            ("owners.rs", RUST_OWNERS),
+            ("view.js", "function render(a, b) {\n  return a + b;\n}\n"),
+        ]);
+        assert_resolves_to(tmp.path(), "function render(a, b)", "view.js", 1);
+        for query in ["pub fn run(&self) -> u8", "async fn run(&mut self)"] {
+            let response = search_query(tmp.path(), query);
+            let result = &response["results"][0];
+            assert_eq!(result["resolved_as"], "ambiguous", "{query}: {response}");
+            assert_eq!(result["candidates"].as_array().unwrap().len(), 3, "{query}");
+            let diag = normalization_for(&response, query);
+            assert_eq!(diag["normalized_to"], "run", "{diag}");
+            assert_eq!(diag["stripped_keyword"], "fn", "{diag}");
+        }
+        // A declaration of a name with no definition searches the line literally.
+        let response = search_query(tmp.path(), "pub fn missing_fn(&self)");
+        assert_eq!(response["results"][0]["resolved_as"], "miss", "{response}");
+        assert_eq!(
+            normalization_for(&response, "pub fn missing_fn(&self)")["normalized_to"],
+            "missing_fn"
+        );
+    }
+
+    #[test]
+    fn unknown_owner_returns_every_definition_and_names_the_owners() {
+        let tmp = source_dir(&[("owners.rs", RUST_OWNERS)]);
+        let response = search_query(tmp.path(), "Gamma::run");
+        let result = &response["results"][0];
+        assert_eq!(result["resolved_as"], "ambiguous", "{response}");
+        assert_eq!(result["query"], "Gamma::run");
+        assert_eq!(result["candidates"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            normalization_for(&response, "Gamma::run"),
+            json!({
+                "query": "Gamma::run",
+                "normalized_to": "run",
+                "owner": "Gamma",
+                "owner_matched": false,
+                "owners_found": ["Alpha", "Beta", "Holder"],
+            })
+        );
+    }
+
+    #[test]
+    fn patterns_file_names_and_bare_names_keep_their_routes() {
+        let tmp = source_dir(&[
+            ("owners.rs", RUST_OWNERS),
+            ("config/config.json", "{}\n"),
+            (
+                "response.py",
+                "class Response:\n    def json(self):\n        return {}\n",
+            ),
+        ]);
+        for query in ["run|walk", r"fn\s+run", "run(a)+"] {
+            let response = search_query(tmp.path(), query);
+            assert_eq!(response["results"][0]["resolved_as"], "regex", "{query}");
+            assert_eq!(response["diagnostics"], json!({}), "{query}");
+        }
+        // A dotted file name stays a file name although `json` has a definition.
+        let response = search_query(tmp.path(), "config.json");
+        assert_eq!(response["results"][0]["resolved_as"], "path", "{response}");
+        assert_eq!(
+            response["results"][0]["candidates"][0]["path"],
+            "config/config.json"
+        );
+        // One that names no file resolves to the definition its owner holds.
+        assert_resolves_to(tmp.path(), "Response.json", "response.py", 2);
+        let response = search_query(tmp.path(), "run");
+        assert_eq!(response["results"][0]["resolved_as"], "ambiguous");
+        assert_eq!(response["diagnostics"], json!({}));
+        let response = search_query(tmp.path(), "fn run");
+        assert_eq!(
+            normalization_for(&response, "fn run"),
+            json!({"query": "fn run", "normalized_to": "run", "stripped_keyword": "fn"})
+        );
+    }
     #[test]
     fn regex_absence_and_noncode_references_have_exact_status() {
         let tmp = tempfile::tempdir().unwrap();
