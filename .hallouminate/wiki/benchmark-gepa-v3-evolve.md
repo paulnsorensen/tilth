@@ -190,11 +190,79 @@ The paired deltas come from `benchmark/paired.py`. The task is the sampling unit
 - `benchmark/analyze.py` stops with `no pricing entry for model 'claude-sonnet-5-5'`. The tables come from `jq` over the local `rows.jsonl` and from `paired.py`.
 - The run resumed after four stops: a CLI version change, a full disk, the first $130 cap, and 12 `chain:rg-edit-6` cells that a corrupt grader cache failed. See [Benchmark harness gotchas](benchmark-harness-gotchas.md).
 
+## tools-sonnet-r1 evolve round (`tools-r1.json` directives)
+
+The tools-sonnet-r1 evolve run tested four tool directives on sonnet from 2026-11-05 to 2026-11-06.
+Its winner was a `prompts/tools/write.md` rewrite, not a directive. The paired test interval includes 0, so no PR shipped.
+The harness gaps and monitoring gotchas from this run are on [Benchmark GEPA overhaul gotchas](benchmark-gepa-gotchas.md#tools-sonnet-r1-harness-gaps-and-monitoring).
+
+### tools-sonnet-r1 setup
+
+The tools-sonnet-r1 run started from seed main `e6d47cd4`, which holds the #433-#436 tool fixes.
+
+- Panel `benchmark/panels/gepa-v3-long-3.json`, model sonnet.
+- Flags: `--max-usd 200 --max-metric-calls 60 --cell-budget-usd 3 --cell-estimate-usd 1.1 --directives benchmark/evolve/directives/tools-r1.json --deep-diagnosis --replay-diagnostic 2 --budget-id evolve-tools-r1`.
+- Deep diagnosis ran with the isolation of PR #440: no host `CLAUDE.md`, hooks, or skills.
+- A first launch did not pass `--model`, so it ran haiku, the evolve default. It stopped after $0.19. Always pass `--model`.
+- #431 added `autoMemoryEnabled: false` to the append-mode settings. That changed `harness_digest`, so the run bought every baseline cell again.
+- The run exited 0 at 2026-11-06T00:32:56Z. Ledger spend was $174.88 of $200.
+
+### tools-sonnet-r1 directive outcomes
+
+The tools-sonnet-r1 run seeded the four directives in `benchmark/evolve/directives/tools-r1.json`. Two src_patch directives were never measured.
+
+| Directive | Component | Outcome | Cause |
+|---|---|---|---|
+| `search-qualified-and-declaration-queries` | src_patch | never measured | The proposer changed the signature of `route_identifier`, which seed `#[test]` fns call. `just check` failed at compile, with no test grant. The repair edited the seed test, and the materializer refused that edit at apply. |
+| `search-compact-usage-hits` | src_patch | accepted, dev mean 0.914 against seed 0.905 | Search result characters fell only 6%. The gain is noise. |
+| `rewrite-refusal-shows-unseen-matches` | src_patch | never measured | The patch deadlocked. See the next list. |
+| `prompt-earlier-lines-stay-editable` | `prompts/mcp.md` | accepted, dev mean 0.898 | No effect. Reads rose 5%. |
+
+- The `rewrite-refusal-shows-unseen-matches` patch took the session snapshots mutex twice and deadlocked.
+- libtest printed "has been running for over 60 seconds" for 3 `mcp::tools::write` tests.
+- At the 1800 s `just check` timeout, the stage raised `InfrastructureFailure`. The stage "just check infra" memoizes nothing, so `just check` ran again for each dev task.
+- The operator killed the hung test binary. That turned the result into a memoized `just check` failure, and no repair followed.
+
+### tools-sonnet-r1 winner and finish verdict
+
+The tools-sonnet-r1 winner is candidate `389b6e02d7ac` (commit `508c1471`). The selector picked a rewrite of `prompts/tools/write.md`; no directive asked for it.
+The rewrite tells the agent these rules:
+
+- Read small files whole once, and make all edits in one `tilth_write` call.
+- Prefer `replace_text` or block ops over counted line ranges.
+- Ops on lines that no result displayed are rejected, so read the range first.
+- The shell blocks grep, cat, sed, wc, and inline python, so create scripts with `tilth_write` in a `mktemp -d` dir.
+
+The winner's dev mean was 0.964, and its calls per cell fell 15% on dev.
+Proposal 6 (`prompts/tools/search.md`) ran 39 of 40 dev cells. Then the run stopped at the spend ceiling, so the proposal got no score and its spend gave no result.
+
+The finish ran the test split with 8 tasks and 4 reps:
+
+- Means: winner 0.938, seed 0.812. Paired delta +0.081, 95% CI [-0.057, 0.220].
+- Pass rate: winner 30/32, seed 26/32, baseline 32/32.
+- No PR, because the interval includes 0.
+
+| Test task | Baseline | Winner | Seed |
+|---|---|---|---|
+| ripgrep-2209 | 4/4 $0.083 | 3/4 $0.090 | 1/4 $0.065 |
+| coreutils-6682 | 4/4 $0.045 | 3/4 $0.045 | 2/4 $0.039 |
+| vuejs-11739 | 4/4 $0.407 | 4/4 $0.367 | 3/4 $0.400 |
+| chain:rg-edit-6 | 4/4 $2.51 | 4/4 $2.42 | 4/4 $2.45 |
+| chain:express-edit-6 | 4/4 $1.24 | 4/4 $1.44 | 4/4 $1.40 |
+| rg_edit_flow_migration | 4/4 $1.05 | 4/4 $0.95 | 4/4 $1.01 |
+| express_edit_example_start | 4/4 $0.31 | 4/4 $0.39 | 4/4 $0.29 |
+| caddy-6350 | 4/4 $0.08 | 4/4 $0.08 | 4/4 $0.08 |
+
+- The seed misses on ripgrep-2209 and coreutils-6682 were wrong 2-7 line patches that failed F2P. They were not harness faults.
+- The other inspected misses (tokio-4867, axios, terraform, caddy, vuejs) were also wrong agent patches.
+- Follow-up: a $100 A/B (budget id `ab-write-md`) adds reps 4-11 for the winner and the seed on the test split. Its run keys match the finish cells, so it reuses reps 0-3.
+
 ## Spend
 
 Evolve spend totals about $487: r1 $99, baseline buy $32, r2 $45, r3 $161, r4 $12, r5 $48, r6 $89.
 The preamble rounds add $306: preamble-r1 $128 and preamble-r2 $178.
 The stock-prompt A/B adds $168.39 of its $170 cap (budget `stock-ab-1`). That includes about $35 for the 12 `chain:rg-edit-6` cells that the corrupt grader cache failed, and about $35 to re-run them.
+The tools-sonnet-r1 round adds $174.88 of its $200 cap (budget `evolve-tools-r1`).
 The finish reserve is about $40 whenever the seed commit changes, because `git_sha` is in every tilth cell's run key.
 
 ## Ideas to push cost per correct lower
@@ -217,4 +285,4 @@ The stock-prompt A/B at `aec0efd4` changes the priority. There tilth made only 2
 - A per-cell `TMPDIR` for scratch isolation, which does not change run keys.
 - Measurement: more reps or more test tasks, so evolve can see 5% effects; about $100 or more per comparison.
 
-_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412; PR #413 review fixes (r2 note, call-count labels, call-gap source copy); panel-health pass over r1-r6, gepa-v3-baselines and preamble-r1 with `benchmark/panel_health.py`; preamble-r1 and preamble-r2 run logs (`benchmark/results/evolve/preamble-r{1,2}/log.txt`); stock-prompt A/B rows and streams (`benchmark/results/stock-ab/`, local and untracked, budget `stock-ab-1`) · Updated: 2026-11-04 · Supersedes: the 2026-11-02 A/B note that read `num_turns` as API calls and its conflict note on the Ideas section_
+_Source: gepa-v3 evolve session, runs gepa-v3-r1 through gepa-v3-r6 and PRs #396-#412; PR #413 review fixes (r2 note, call-count labels, call-gap source copy); panel-health pass over r1-r6, gepa-v3-baselines and preamble-r1 with `benchmark/panel_health.py`; preamble-r1 and preamble-r2 run logs (`benchmark/results/evolve/preamble-r{1,2}/log.txt`); stock-prompt A/B rows and streams (`benchmark/results/stock-ab/`, local and untracked, budget `stock-ab-1`); tools-sonnet-r1 run notes (2026-11-06, budget `evolve-tools-r1`) · Updated: 2026-11-06 · Supersedes: the 2026-11-02 A/B note that read `num_turns` as API calls and its conflict note on the Ideas section_

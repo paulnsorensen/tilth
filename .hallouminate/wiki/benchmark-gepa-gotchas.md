@@ -54,6 +54,24 @@ The gepa-v3 rounds (October 2026, runs gepa-v3-r1 to r6) hit these failures; eac
 - A fastapi local task had no agent venv, so the agent fought missing pytest and argon2 until the 600 s timeout, and one incomplete seed cell stopped the run (#407).
 - Text rules cannot guard test integrity. Reviews broke them with a macro on the attribute line, `fn r#name`, `#[cfg(any())]` above the test module, and fn-body and macro wrapping. Use the behavioral integrity stage (#412).
 
+## tools-sonnet-r1 harness gaps and monitoring
+
+The tools-sonnet-r1 evolve run (2026-11-05 to 2026-11-06) found three evolve harness gaps and four monitoring gotchas.
+The fixes for the gaps are in a separate PR, branch `fix/evolve-hang-verdict-budget`. The run state is on [gepa-v3 evolve campaign state](benchmark-gepa-v3-evolve.md).
+
+The harness gaps are:
+
+1. A candidate test that hangs until the `just check` timeout gets the infra label. The stage memoizes nothing, so `just check` repeats for each dev task, and no repair starts.
+2. The proposer cannot repair a compile error in a seed test, because it has no test grant. The proposer must keep the signatures that seed tests call.
+3. A dev tier that the budget cannot finish still starts. Its spend gives no score.
+
+The monitoring gotchas apply to anyone who watches an evolve run:
+
+- `cut` block-buffers its output in a pipe. Use `awk '{...; fflush()}'` or a polling loop.
+- Anchor the end-of-run regexes, for example `^=== exit` and `^Traceback \(most recent`. Attribution records in `log.txt` contain the word "Traceback".
+- Reused rows repeat `total_cost_usd`. To get spend, sum `charged_usd` or read the ledger, not `total_cost_usd`.
+- ENOSPC (a full disk) truncated `result_store` line 194 on 2026-11-02. The load skips that line.
+
 ## Symptoms and first checks
 
 Use this list to route a failure to the right section above.
@@ -70,5 +88,7 @@ Use this list to route a failure to the right section above.
 - Every stored cell drifts at once. Check `cli_version` against `benchmark/claude-cli.version` first, then the hook source key.
 - An evolve run stops at its ceiling with no candidate scored. Check whether the finish reserve plus the seed rescore exceeds `--max-usd`.
 - A wait loop reports the evolve run exited while it still runs. Check the python pid, not the wrapper pid or a `pgrep -f` self-match.
+- An evolve run repeats `just check` for each dev task. Check for a candidate test that hangs until the `just check` timeout.
+- A spend total from result rows is too high. Sum `charged_usd`, not `total_cost_usd`.
 
-_Source: PR #312 session archive (closed unmerged; work lands as #313-#319); gepa and data gotchas from specs at `9e84659` (`refs/pull/312/head`); code verified at the layer 6 head of PR #319 after the PR #318 cure; gepa-v3 section from runs gepa-v3-r1 to r6 and PRs #396-#412 · Updated: 2026-10-29_
+_Source: PR #312 session archive (closed unmerged; work lands as #313-#319); gepa and data gotchas from specs at `9e84659` (`refs/pull/312/head`); code verified at the layer 6 head of PR #319 after the PR #318 cure; gepa-v3 section from runs gepa-v3-r1 to r6 and PRs #396-#412; tools-sonnet-r1 section from the run notes of 2026-11-06 · Updated: 2026-11-06_
