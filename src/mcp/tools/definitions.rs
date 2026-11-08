@@ -42,7 +42,7 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
                                     "properties": {
                                         "follow": {
                                             "type": "object",
-                                            "description": "One unchanged server-emitted continuation hint.",
+                                            "description": "A fetch kind with one result's own `target`, unchanged.",
                                             "required": ["kind", "target"],
                                             "additionalProperties": false,
                                             "properties": {
@@ -57,6 +57,7 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
                                                         "line": {"type": "integer", "minimum": 1, "maximum": 4_294_967_295_u64},
                                                         "name": {"type": "string", "minLength": 1},
                                                         "glob": {"type": ["string", "null"]},
+                                                        "tag": {"type": "string"},
                                                         "occurrence": {"type": "array", "items": {"type": "integer", "minimum": 0}, "minItems": 2, "maxItems": 2}
                                                     }
                                                 }

@@ -6,7 +6,7 @@ DO NOT omit `cwd`: set it to the absolute checkout directory on every call. Rela
 
 BATCH related work; array parameters never accept singular values:
 
-- `queries: [{query: "foo"}, {query: "bar", glob: "*.rs"}]` or `[{follow: hint}]`
+- `queries: [{query: "foo"}, {query: "bar", glob: "*.rs"}]` or `[{follow: {kind, target}}]` with a result's own `target`
 - `paths: ["src/a.rs#12-40", "src/b.rs#parse"]`
 
 Multi-file edit pattern (2 calls, no re-read; the receipt returns new tags):

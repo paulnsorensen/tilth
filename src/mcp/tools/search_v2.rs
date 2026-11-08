@@ -202,7 +202,6 @@ fn run_search_v2(
         }
     }
     let mut results: Vec<(Value, Option<FileCounts>)> = Vec::with_capacity(entries.len());
-    let mut hints = Vec::new();
     let mut pending_seen = Vec::new();
     let mut routes_tried = Vec::with_capacity(entries.len());
     let mut normalizations = Vec::new();
@@ -211,17 +210,17 @@ fn run_search_v2(
     let entry_budget = budget / entries.len().max(1) as u64;
     for ((entry, follow), pattern_error) in entries.iter().zip(&follows).zip(&pattern_errors) {
         let mut counts = None;
-        let (mut result, route, mut entry_hints, diagnostic) = if let Some(follow) = follow {
+        let (mut result, route, diagnostic) = if let Some(follow) = follow {
             session.record_follow();
             match follow.execute(cwd, bloom, cache) {
-                Ok(result) => (result, follow.kind.clone(), Vec::new(), None),
+                Ok(result) => (result, follow.kind.clone(), None),
                 Err(message) => {
                     let mut result = base_result(follow.query(), "error", "error");
                     result["error"] = json!(message);
                     result["completeness"] = json!("partial");
                     failed += 1;
                     first_failure.get_or_insert(SearchFailure::new(message, "route_error"));
-                    (result, "error".to_string(), Vec::new(), None)
+                    (result, "error".to_string(), None)
                 }
             }
         } else if let Some(pattern) = entry.get("pattern").and_then(Value::as_str) {
@@ -248,7 +247,7 @@ fn run_search_v2(
                 };
                 first_failure.get_or_insert(SearchFailure::new(message, class));
             }
-            (result, route, Vec::new(), None)
+            (result, route, None)
         } else {
             let query = entry["query"].as_str().unwrap();
             match route_query(
@@ -267,12 +266,11 @@ fn run_search_v2(
                     result["completeness"] = json!("partial");
                     failed += 1;
                     first_failure.get_or_insert(SearchFailure::new(message, "route_error"));
-                    (result, "error".to_string(), Vec::new(), None)
+                    (result, "error".to_string(), None)
                 }
             }
         };
         routes_tried.push(route);
-        hints.append(&mut entry_hints);
         pending_seen.extend(take_pending_seen(&mut result, results.len()));
         results.push((result, counts));
         if let Some(diagnostic) = diagnostic {
@@ -293,7 +291,7 @@ fn run_search_v2(
     } else {
         json!({"normalizations": normalizations})
     };
-    let (mut output, budget_limited) = reduce_response(results, &hints, &diagnostics, budget)
+    let (mut output, budget_limited) = reduce_response(results, &diagnostics, budget)
         .map_err(|e| SearchFailure::new(e, "budget_error"))?;
     if !pending_seen.is_empty() && output.len() <= super::read::HOST_VISIBLE_MAX {
         let response: Value = serde_json::from_str(&output)
@@ -454,17 +452,16 @@ const REMOVABLE: [(Option<&str>, &str); 4] = [
 /// size). Structural `items` are narrowed last by `narrow_structural` against
 /// the length the other drops left, and re-serialized per narrowed result.
 /// Length is tracked by exact deltas, so the whole response is serialized once
-/// more at the end. Entries and hints are never removed, so a budget too small
+/// more at the end. Entries are never removed, so a budget too small
 /// for the required metadata returns them over budget, every result flagged
 /// `budget_limited`. Returns the output and whether any result was budget-limited.
 fn reduce_response(
     results: Vec<(Value, Option<FileCounts>)>,
-    hints: &[Value],
     diagnostics: &Value,
     budget: u64,
 ) -> Result<(String, bool), String> {
     let (results, counts): (Vec<Value>, Vec<Option<FileCounts>>) = results.into_iter().unzip();
-    let mut response = json!({"results": results, "hints": hints, "diagnostics": diagnostics});
+    let mut response = json!({"results": results, "diagnostics": diagnostics});
     let output = serde_json::to_string(&response).map_err(|e| e.to_string())?;
     let mut len = output.len();
     if crate::types::estimate_tokens(len as u64) <= budget {
@@ -565,7 +562,7 @@ fn reduce_response(
         }
     }
     if crate::types::estimate_tokens(len as u64) > budget {
-        // Entries and hints are required metadata, so a budget below their size
+        // Entries are required metadata, so a budget below their size
         // cannot be honored. Return them, flagged, instead of failing the call.
         for result in response["results"].as_array_mut().into_iter().flatten() {
             result["budget_limited"] = json!(true);
@@ -804,9 +801,9 @@ fn none_tier(base: &Value, counts: &FileCounts) -> Option<Value> {
 }
 
 /// One routed query: the result record, the resolved route name (for
-/// telemetry), any hints emitted for it, and an optional normalization
-/// diagnostic when the query was rewritten before routing.
-type Routed = (Value, String, Vec<Value>, Option<Value>);
+/// telemetry), and an optional normalization diagnostic when the query was
+/// rewritten before routing.
+type Routed = (Value, String, Option<Value>);
 
 /// Route one query through the deterministic precedence: path -> Go
 /// signature -> declaration shape -> regex -> signature-prefix normalization
@@ -830,7 +827,7 @@ fn route_query(
                 crate::types::FileType::Code(_)
             ) {
                 let target_spec = format!("{query}:1");
-                let (mut result, hints) = unique_hit(
+                let mut result = unique_hit(
                     &target_spec,
                     "path",
                     &candidate,
@@ -844,14 +841,14 @@ fn route_query(
                     budget,
                 )?;
                 result["query"] = json!(query);
-                return Ok((result, "path".to_string(), hints, None));
+                return Ok((result, "path".to_string(), None));
             }
             let (result, route) =
                 content_route(query, glob, cwd, cache, session, Some("path"), budget)?;
-            return Ok((result, route, Vec::new(), None));
+            return Ok((result, route, None));
         }
         let result = base_result(query, "path", "ok");
-        return Ok((result, "path".to_string(), Vec::new(), None));
+        return Ok((result, "path".to_string(), None));
     }
 
     // 1b. Go declaration signature — `func (r *T) Name(...)` carries `(`, `*`
@@ -863,7 +860,7 @@ fn route_query(
         let receiver_scope = signature
             .receiver
             .map(|receiver| (go_receiver_type(receiver), query));
-        let (mut result, route, hints) = route_identifier(
+        let (mut result, route) = route_identifier(
             signature.name,
             receiver_scope,
             None,
@@ -882,7 +879,7 @@ fn route_query(
         if let Some(receiver) = signature.receiver {
             diag["receiver"] = json!(receiver);
         }
-        return Ok((result, route, hints, Some(diag)));
+        return Ok((result, route, Some(diag)));
     }
 
     // 1c. declaration shape — a pasted declaration line (`pub fn run(&self)`,
@@ -910,7 +907,7 @@ fn route_query(
             &mut result,
             crate::search::format_raw_result_deferred(&search_result, cache, session, budget)?,
         );
-        return Ok((result, "regex".to_string(), Vec::new(), None));
+        return Ok((result, "regex".to_string(), None));
     }
 
     // 3. signature-prefix normalization — strip a leading declaration keyword
@@ -919,7 +916,7 @@ fn route_query(
     // narrows the definitions to that kind.
     if let Some((kw, ident)) = strip_signature_prefix(query) {
         if is_identifier(ident) {
-            let (mut result, route, hints) =
+            let (mut result, route) =
                 route_identifier(ident, None, Some(kw), glob, cwd, cache, session, budget)?;
             result["query"] = json!(query);
             let diag = json!({
@@ -927,7 +924,7 @@ fn route_query(
                 "normalized_to": ident,
                 "stripped_keyword": kw,
             });
-            return Ok((result, route, hints, Some(diag)));
+            return Ok((result, route, Some(diag)));
         }
     }
 
@@ -948,7 +945,7 @@ fn route_query(
                     .iter()
                     .map(|p| json!({"path": p}))
                     .collect::<Vec<_>>());
-                return Ok((result, "path".to_string(), Vec::new(), None));
+                return Ok((result, "path".to_string(), None));
             }
         }
     }
@@ -968,14 +965,14 @@ fn route_query(
     // 5. symbol / ambiguous — bare identifier: prefer definitions, then reuse
     // usage matches or search literal content when no symbols were found.
     if is_identifier(query) {
-        let (result, route, hints) =
+        let (result, route) =
             route_identifier(query, None, None, glob, cwd, cache, session, budget)?;
-        return Ok((result, route, hints, None));
+        return Ok((result, route, None));
     }
 
     // 6. literal — content search (non-identifier phrases only).
     let (result, route) = content_route(query, glob, cwd, cache, session, None, budget)?;
-    Ok((result, route, Vec::new(), None))
+    Ok((result, route, None))
 }
 
 /// Route a bare identifier through the definitions-first symbol cascade:
@@ -996,7 +993,7 @@ fn route_identifier(
     cache: &OutlineCache,
     session: &Session,
     budget: u64,
-) -> Result<(Value, String, Vec<Value>), crate::error::TilthError> {
+) -> Result<(Value, String), crate::error::TilthError> {
     // The receiver filter runs inside the walk, so the hit cap counts only the
     // scoped methods. A file defining the method on that receiver names the
     // receiver type, so files without it are never parsed.
@@ -1014,7 +1011,7 @@ fn route_identifier(
             if found.partial {
                 mark_partial(&mut result);
             }
-            return Ok((result, route, Vec::new()));
+            return Ok((result, route));
         }
     }
     if let Some(hit) = definitions_result(query, &found, glob, cwd, cache, session, budget)? {
@@ -1026,13 +1023,13 @@ fn route_identifier(
             &mut result,
             crate::search::format_raw_result_deferred(&found.walk, cache, session, budget)?,
         );
-        return Ok((result, "literal".to_string(), Vec::new()));
+        return Ok((result, "literal".to_string()));
     }
     let (mut result, route) = content_route(query, glob, cwd, cache, session, None, budget)?;
     if found.walk.files_unreadable > 0 {
         mark_partial(&mut result);
     }
-    Ok((result, route, Vec::new()))
+    Ok((result, route))
 }
 
 /// The code definitions one symbol walk finds, and the walk itself.
@@ -1123,11 +1120,11 @@ fn definitions_result(
     cache: &OutlineCache,
     session: &Session,
     budget: u64,
-) -> Result<Option<(Value, String, Vec<Value>)>, crate::error::TilthError> {
-    let (mut result, route, hints) = match found.defs.as_slice() {
+) -> Result<Option<(Value, String)>, crate::error::TilthError> {
+    let (mut result, route) = match found.defs.as_slice() {
         [] => return Ok(None),
         [target] => {
-            let (result, hints) = unique_hit(
+            let result = unique_hit(
                 query,
                 "symbol",
                 &target.path,
@@ -1140,20 +1137,20 @@ fn definitions_result(
                 session,
                 budget,
             )?;
-            (result, "symbol", hints)
+            (result, "symbol")
         }
         defs => {
             // The candidates are the answer. A content search of the bare name
             // would preview unrelated lines and skew completeness.
             let mut result = base_result(query, "ambiguous", "ambiguous");
             result["candidates"] = json!(candidates(defs, cwd));
-            (result, "ambiguous", Vec::new())
+            (result, "ambiguous")
         }
     };
     if found.partial {
         mark_partial(&mut result);
     }
-    Ok(Some((result, route.to_string(), hints)))
+    Ok(Some((result, route.to_string())))
 }
 
 /// Resolve a pasted declaration line or a qualified name to the definitions
@@ -1193,18 +1190,18 @@ fn route_declaration(
             cache,
             budget,
         )?;
-        if let Some((mut result, route, hints)) =
+        if let Some((mut result, route)) =
             definitions_result(shape.name, &found, glob, cwd, cache, session, budget)?
         {
             result["query"] = json!(query);
-            return Ok(Some((result, route, hints, Some(diag))));
+            return Ok(Some((result, route, Some(diag))));
         }
         if strict {
             return Ok(None);
         }
     }
     let found = code_definitions(shape.name, None, shape.keyword, glob, cwd, cache, budget)?;
-    let Some((mut result, route, hints)) =
+    let Some((mut result, route)) =
         definitions_result(shape.name, &found, glob, cwd, cache, session, budget)?
     else {
         if shape.bare || strict {
@@ -1214,7 +1211,7 @@ fn route_declaration(
         if found.walk.files_unreadable > 0 {
             mark_partial(&mut result);
         }
-        return Ok(Some((result, route, Vec::new(), Some(diag))));
+        return Ok(Some((result, route, Some(diag))));
     };
     if shape.owner.is_some() {
         let mut owners: Vec<String> = found
@@ -1228,7 +1225,7 @@ fn route_declaration(
         diag["owners_found"] = json!(owners);
     }
     result["query"] = json!(query);
-    Ok(Some((result, route, hints, Some(diag))))
+    Ok(Some((result, route, Some(diag))))
 }
 
 /// The literal-content tail shared by every route that ends in a content
@@ -1851,7 +1848,7 @@ fn unique_hit(
     cache: &OutlineCache,
     session: &Session,
     budget: u64,
-) -> Result<(Value, Vec<Value>), crate::error::TilthError> {
+) -> Result<Value, crate::error::TilthError> {
     let (source_path, line, name, body, core_partial, shown, content, construct_end) =
         if resolved_as == "path" {
             let content = std::fs::read_to_string(target_path).map_err(|source| {
@@ -1925,7 +1922,7 @@ fn unique_hit(
         glob: glob.map(str::to_string),
     };
     if glob.is_some() && !target.allows(&source_path, cwd) {
-        return Ok((base_result(query, resolved_as, "no_match"), Vec::new()));
+        return Ok(base_result(query, resolved_as, "no_match"));
     }
     let mut result = base_result(query, resolved_as, "ok");
     result["core"] = json!(redact_secret_text(&source_path, body));
@@ -1941,8 +1938,7 @@ fn unique_hit(
         result["core_end"] = json!(construct_end);
         result["continue"] = json!(format!("{}#{}-{}", target.path, shown.1 + 1, construct_end));
     }
-    let hints = target.hints();
-    Ok((result, hints))
+    Ok(result)
 }
 
 /// Lines of a function or method printed even when the budget is tiny; every
@@ -2086,8 +2082,19 @@ mod tests {
             .iter()
             .map(|result| (result.clone(), None))
             .collect();
-        let hints = response["hints"].as_array().unwrap().clone();
-        reduce_response(results, &hints, &response["diagnostics"], budget)
+        reduce_response(results, &response["diagnostics"], budget)
+    }
+
+    const FOLLOW_KINDS: [&str; 4] = [
+        "fetch_callers",
+        "fetch_callees",
+        "fetch_siblings",
+        "fetch_tests",
+    ];
+
+    /// A follow query built from a result's own `target`, as an agent sends it.
+    fn follow_of(result: &Value, kind: &str) -> Value {
+        json!({"kind": kind, "target": result["target"]})
     }
 
     fn structural_record(items: &Value) -> Value {
@@ -2160,7 +2167,7 @@ mod tests {
             (plain, None),
             (structural_record(&json!(groups)), Some(counts)),
         ];
-        let (output, limited) = reduce_response(results, &[], &json!({}), 300).unwrap();
+        let (output, limited) = reduce_response(results, &json!({}), 300).unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
         assert!(limited);
         assert!(parsed["results"][0].get("preview").is_none());
@@ -2173,7 +2180,7 @@ mod tests {
         std::fs::write(tmp.path().join("a.rs"), "fn root() {}\n").unwrap();
         std::fs::write(tmp.path().join("unreadable.rs"), [0xff, 0xfe]).unwrap();
         let (cache, session, _bloom) = components();
-        let (result, route, hints) = route_identifier(
+        let (result, route) = route_identifier(
             "root",
             None,
             None,
@@ -2188,7 +2195,6 @@ mod tests {
         assert_eq!(result["status"], "partial");
         assert_eq!(result["completeness"], "partial");
         assert_eq!(result["core"], "fn root() {}");
-        assert_eq!(hints.len(), 4);
     }
 
     #[test]
@@ -2197,7 +2203,7 @@ mod tests {
         let path = tmp.path().join("a.rs");
         std::fs::write(&path, "fn root() {}\n\nfn decoy() {}\n").unwrap();
 
-        let (result, hints) = unique_hit(
+        let result = unique_hit(
             "root",
             "symbol",
             &path,
@@ -2215,7 +2221,6 @@ mod tests {
         assert_eq!(result["core"], "fn root() {}");
         assert_eq!(result["target"]["line"], 1);
         assert_eq!(result["target"]["name"], "root");
-        assert_eq!(hints.len(), 4);
     }
 
     #[test]
@@ -2311,24 +2316,16 @@ mod tests {
         }
         std::fs::write(tmp.path().join("a.rs"), &content).unwrap();
         let initial = call(&json!({"cwd": tmp.path(), "queries": [{"query": "root"}]})).unwrap();
-        let hint = initial["hints"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|h| h["kind"] == "fetch_siblings")
-            .unwrap();
+        let hint = follow_of(&initial["results"][0], "fetch_siblings");
         let result = call(&json!({"cwd": tmp.path(), "queries": [{"follow": hint}]})).unwrap();
         assert_eq!(result["results"][0]["status"], "partial");
         assert_eq!(result["results"][0]["completeness"], "partial");
         assert_eq!(result["results"][0]["items"].as_array().unwrap().len(), 30);
-        assert_eq!(
-            result["hints"].as_array().unwrap().as_slice(),
-            [] as [serde_json::Value; 0]
-        );
+        assert!(result.get("hints").is_none());
         let response = json!({"results": [
             {"query": "one", "resolved_as": "literal", "status": "ok", "completeness": "complete", "preview": "\\\"".repeat(100_000)},
             {"query": "two", "resolved_as": "literal", "status": "ok", "completeness": "complete", "preview": "second"}
-        ], "hints": [], "diagnostics": {}});
+        ], "diagnostics": {}});
         for budget in [crate::budget::DEFAULT_BUDGET, 150] {
             let (output, _) = reduce(&response, budget).unwrap();
             assert!(crate::types::estimate_tokens(output.len() as u64) <= budget);
@@ -2343,7 +2340,7 @@ mod tests {
     fn budget_trim_keeps_ambiguous_status() {
         let response = json!({"results": [{"query": "root", "resolved_as": "ambiguous",
             "status": "ambiguous", "completeness": "complete",
-            "candidates": [{"path": "x".repeat(5000)}]}], "hints": [], "diagnostics": {}});
+            "candidates": [{"path": "x".repeat(5000)}]}], "diagnostics": {}});
         let (output, _) = reduce(&response, 100).unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["results"][0]["status"], "ambiguous");
@@ -2493,15 +2490,9 @@ mod tests {
             call(&json!({"cwd": tmp.path(), "queries": [{"query": "a.rs", "glob": "*.ts"}]}))
                 .unwrap();
         assert_eq!(excluded["results"][0]["status"], "no_match");
-        assert_eq!(
-            excluded["hints"].as_array().unwrap().as_slice(),
-            [] as [serde_json::Value; 0]
-        );
+        assert!(excluded.get("hints").is_none());
         let initial = call(&json!({"cwd": tmp.path(), "queries": [{"query": "a.rs"}]})).unwrap();
-        assert_eq!(
-            initial["hints"].as_array().unwrap().as_slice(),
-            [] as [serde_json::Value; 0]
-        );
+        assert!(initial.get("hints").is_none());
     }
 
     fn repo_root() -> PathBuf {
@@ -2935,15 +2926,21 @@ mod tests {
     }
 
     #[test]
-    fn hint_scope_is_dot_and_echoes_round_trip() {
+    fn target_scope_is_dot_and_echoes_round_trip() {
         let (tmp, initial) = continuation_fixture();
         let cwd = tmp.path().to_str().unwrap();
-        let hints = initial["hints"].as_array().unwrap();
-        assert_eq!(hints.len(), 4, "{initial}");
-        for hint in hints {
+        assert!(initial.get("hints").is_none(), "{initial}");
+        for kind in [
+            "fetch_callers",
+            "fetch_callees",
+            "fetch_siblings",
+            "fetch_tests",
+        ] {
+            let hint = follow_of(&initial["results"][0], kind);
             let target = hint["target"].as_object().unwrap();
             assert_eq!(target["scope"], ".", "{hint}");
             assert!(target.values().all(|v| !v.is_null()), "{hint}");
+            assert!(target.contains_key("tag"), "{hint}");
             let followed = call(&json!({"cwd": cwd, "queries": [{"follow": hint}]})).unwrap();
             assert_eq!(followed["results"][0]["status"], "ok", "{followed}");
         }
@@ -3242,32 +3239,17 @@ mod tests {
     }
 
     #[test]
-    fn unique_symbol_hit_carries_core_and_hints() {
+    fn unique_symbol_hit_carries_core_and_target_without_hints() {
         let resp = single_query("detect_file_type").expect("symbol query succeeds");
         let result = &resp["results"][0];
         assert!(result["core"].is_string(), "unique hit must carry core");
 
-        let hint_kinds: Vec<&str> = resp["hints"]
-            .as_array()
-            .expect("hints array")
-            .iter()
-            .map(|h| h["kind"].as_str().expect("kind is a string"))
-            .collect();
-        for expected in [
-            "fetch_callers",
-            "fetch_callees",
-            "fetch_siblings",
-            "fetch_tests",
-        ] {
-            assert!(
-                hint_kinds.contains(&expected),
-                "missing hint kind {expected}: {hint_kinds:?}"
-            );
-        }
+        assert!(result["target"].is_object(), "{result}");
+        assert!(resp.get("hints").is_none(), "{resp}");
     }
 
     #[test]
-    fn ambiguous_hit_carries_multiple_candidates_no_core_and_disambiguate_hint() {
+    fn ambiguous_hit_carries_multiple_candidates_and_no_core() {
         let resp = single_query("run").expect("ambiguous query succeeds");
         let result = &resp["results"][0];
         assert!(
@@ -3277,13 +3259,7 @@ mod tests {
         let candidates = result["candidates"].as_array().expect("candidates array");
         assert!(candidates.len() > 1, "ambiguous must have >1 candidates");
 
-        let hint_kinds: Vec<&str> = resp["hints"]
-            .as_array()
-            .expect("hints array")
-            .iter()
-            .map(|h| h["kind"].as_str().expect("kind is a string"))
-            .collect();
-        assert_eq!(hint_kinds, [] as [&str; 0]);
+        assert!(resp.get("hints").is_none(), "{resp}");
     }
 
     #[test]
@@ -3550,15 +3526,14 @@ mod tests {
     }
 
     #[test]
-    fn hint_echo_round_trip_returns_expected_identity_for_every_kind() {
+    fn target_echo_round_trip_returns_expected_identity_for_every_kind() {
         let (tmp, initial) = continuation_fixture();
         let cwd = tmp.path().to_str().unwrap();
-        let hints = initial["hints"].as_array().unwrap();
-        assert_eq!(hints.len(), 4, "{initial}");
-        for hint in hints {
+        for kind in FOLLOW_KINDS {
+            let hint = follow_of(&initial["results"][0], kind);
             let followed = call(&json!({"cwd": cwd, "queries": [{"follow": hint}]})).unwrap();
             let result = &followed["results"][0];
-            let expected = expected_identity_for_kind(hint["kind"].as_str().unwrap());
+            let expected = expected_identity_for_kind(kind);
             assert_eq!(result["status"], "ok", "{followed}");
             let identities = identities_from_result(result);
             assert!(identities.iter().any(|s| s == expected), "{followed}");
@@ -3566,21 +3541,18 @@ mod tests {
                 !identities.iter().any(|s| s == "wrong_caller"),
                 "{followed}"
             );
-            assert_eq!(
-                followed["hints"].as_array().unwrap().as_slice(),
-                [] as [serde_json::Value; 0]
-            );
+            assert!(followed.get("hints").is_none(), "{followed}");
         }
-        assert_eq!(hints[0]["target"]["line"], 2);
-        assert_eq!(hints[0]["target"]["path"], "fixture.ts");
+        assert_eq!(initial["results"][0]["target"]["line"], 2);
+        assert_eq!(initial["results"][0]["target"]["path"], "fixture.ts");
     }
 
     #[test]
     fn followed_result_has_canonical_payload_without_preview() {
         let (tmp, initial) = continuation_fixture();
         let cwd = tmp.path().to_str().unwrap();
-        let hints = initial["hints"].as_array().unwrap();
-        for hint in hints {
+        for kind in FOLLOW_KINDS {
+            let hint = follow_of(&initial["results"][0], kind);
             let followed = call(&json!({"cwd": cwd, "queries": [{"follow": hint}]})).unwrap();
             let result = &followed["results"][0];
             // The duplicate preview payload is gone; identities live only in
@@ -3602,9 +3574,9 @@ mod tests {
     fn mixed_query_and_follow_entries_preserve_order() {
         let (tmp, initial) = continuation_fixture();
         let cwd = tmp.path().to_str().unwrap();
-        let hints = initial["hints"].as_array().unwrap();
+        let hint = follow_of(&initial["results"][0], "fetch_callers");
         let mixed = call(&json!({"cwd": cwd, "queries": [
-            {"query": "^absent$"}, {"follow": hints[0]}, {"query": "root"}
+            {"query": "^absent$"}, {"follow": hint}, {"query": "root"}
         ]}))
         .unwrap();
         assert_eq!(mixed["results"][0]["status"], "no_match");
@@ -3615,7 +3587,7 @@ mod tests {
     #[test]
     fn stale_follow_does_not_abort_valid_query() {
         let (tmp, initial) = continuation_fixture();
-        let hint = initial["hints"][0].clone();
+        let hint = follow_of(&initial["results"][0], "fetch_callers");
         std::fs::remove_file(tmp.path().join("fixture.ts")).unwrap();
         std::fs::write(tmp.path().join("valid.rs"), "fn alive() {}\n").unwrap();
         let args = json!({"cwd": tmp.path(), "queries": [
@@ -3636,7 +3608,7 @@ mod tests {
     fn malformed_follow_target_is_rejected() {
         let (tmp, initial) = continuation_fixture();
         let cwd = tmp.path().to_str().unwrap();
-        let hints = initial["hints"].as_array().unwrap();
+        let hint = follow_of(&initial["results"][0], "fetch_callers");
         for (key, value) in [
             ("name", json!("wrong")),
             ("line", json!(0)),
@@ -3646,7 +3618,7 @@ mod tests {
             ("glob", json!("other.rs")),
             ("path", json!("../fixture.rs")),
         ] {
-            let mut bad = hints[0].clone();
+            let mut bad = hint.clone();
             bad["target"][key] = value;
             assert!(
                 call(&json!({"cwd": cwd, "queries": [{"follow": bad}]})).is_err(),
@@ -3674,14 +3646,12 @@ mod tests {
     }
 
     #[test]
-    fn no_match_is_explicit_and_disambiguation_has_no_unexecutable_hint() {
+    fn no_match_is_explicit_and_responses_carry_no_hints() {
         let miss = single_query(&absent_query()).expect("miss query");
         assert_eq!(miss["results"][0]["status"], "no_match");
         let ambiguous = single_query("run").expect("ambiguous query");
-        assert_eq!(
-            ambiguous["hints"].as_array().expect("hints").as_slice(),
-            [] as [serde_json::Value; 0]
-        );
+        assert!(ambiguous.get("hints").is_none());
+        assert!(miss.get("hints").is_none());
     }
 
     #[test]
@@ -3708,9 +3678,9 @@ mod tests {
         let response = call(&args).unwrap();
         assert_eq!(response["results"][0]["status"], "partial");
         let mut small_args = args.clone();
-        small_args["budget"] = json!(450);
+        small_args["budget"] = json!(250);
         let small = call(&small_args).unwrap();
-        assert!(crate::types::estimate_tokens(small.to_string().len() as u64) <= 450);
+        assert!(crate::types::estimate_tokens(small.to_string().len() as u64) <= 250);
         assert_eq!(small["results"][0]["status"], "partial");
         assert!(small["results"][0].get("core").is_none());
         assert!(small["results"][0].get("continue").is_none());
@@ -3723,7 +3693,7 @@ mod tests {
             "query": "root", "resolved_as": "symbol", "status": "partial",
             "completeness": "partial", "core": "let _value = 1;\n".repeat(400),
             "core_end": 3002, "continue": "root.rs#61-3002",
-        }], "hints": [], "diagnostics": {}});
+        }], "diagnostics": {}});
         let (output, limited) = reduce(&response, 100).unwrap();
         let parsed: Value = serde_json::from_str(&output).unwrap();
         assert!(limited);
@@ -4287,7 +4257,7 @@ mod tests {
         let args = json!({
             "cwd": root.path(),
             "queries": [{"query": "detect_file_type"}, {"query": "detect_file_type"}],
-            "budget": 900,
+            "budget": 500,
         });
         let mut output = String::new();
         for _ in 0..2 {
