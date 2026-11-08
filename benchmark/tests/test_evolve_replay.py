@@ -351,3 +351,93 @@ def test_seed_on_seed_compare_matches_files_and_sizes(fixture_repo, tmp_path) ->
     assert result["new_error_tools"] == []
     assert result["coverage"] == 1.0
     assert result["result_chars_delta_by_tool"]["tilth_write"] == 0
+
+
+# --- chain rows, tilth arms, build Bash ---
+
+
+def make_chain_row(tmp_path: Path, turns: list[list[dict]]) -> dict:
+    stem = "abc_chain_synthetic_tilth_forced_rep0"
+    for number, calls in enumerate(turns, 1):
+        (tmp_path / f"{stem}.turn{number}.trajectory.jsonl").write_text("".join(json.dumps(call) + "\n" for call in calls))
+        (tmp_path / f"{stem}.turn{number}.jsonl").write_text("raw stream, not a trajectory\n")
+    row = {"task": "synthetic", "mode": "tilth_forced", "repetition": 0}
+    row["trajectory_path"] = str(tmp_path / f"{stem}.turn1.trajectory.jsonl")
+    return row
+
+
+def test_load_turns_returns_every_turn_in_numeric_order(tmp_path) -> None:
+    turns = [[read_call()] * count for count in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11)]
+    row = make_chain_row(tmp_path, turns)
+
+    assert [len(turn) for turn in replay.load_turns(row)] == list(range(1, 12))
+
+
+@needs_binary
+def test_a_chain_row_replays_every_turn_on_a_new_server_each(fixture_repo, tmp_path) -> None:
+    tag = file_tag(fixture_repo, tmp_path)
+    row = make_chain_row(tmp_path, [[read_call(), write_call(tag)], [read_call(), read_call()]])
+
+    report = replay.replay_cell(row, BINARY, workdir=tmp_path / "work")
+
+    assert (report["total_calls"], report["replayed_calls"], report["stopped_at"]) == (4, 4, None)
+    assert (report["turns"], report["servers_started"]) == (2, 2)
+    assert [(call["index"], call["turn"]) for call in report["calls"]] == [(0, 1), (1, 1), (2, 2), (3, 2)]
+    totals = replay._chars_by_tool(report, "replayed_chars")
+    assert totals["tilth_read"] == sum(call["replayed_chars"] for call in report["calls"] if call["tool"] == "tilth_read")
+    assert sum(call["replayed_chars"] for call in report["calls"] if call["turn"] == 2) > 0
+    assert report["file_hashes"] == {"app.py": sha(EDITED)}
+
+
+@needs_binary
+def test_a_stop_in_an_early_turn_skips_the_later_turns(fixture_repo, tmp_path) -> None:
+    row = make_chain_row(tmp_path, [[read_call(), bash_call("touch x")], [read_call()]])
+
+    report = replay.replay_cell(row, BINARY, workdir=tmp_path / "work")
+
+    assert report["stopped_at"]["index"] == 1
+    assert (report["replayed_calls"], report["servers_started"]) == (1, 1)
+
+
+def test_cells_keep_every_tilth_arm_and_skip_baseline(tmp_path) -> None:
+    trajectory = tmp_path / "t.trajectory.jsonl"
+    trajectory.write_text(json.dumps(read_call()) + "\n")
+    rows = [{"task": "synthetic", "mode": mode, "trajectory_path": str(trajectory)} for mode in ("baseline", "tilth", "tilth_forced")]
+    rows_path = tmp_path / "rows.jsonl"
+    rows_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    assert [row["mode"] for row in replay._cells(rows_path, None, 10)] == ["tilth", "tilth_forced"]
+
+
+@needs_binary
+def test_build_bash_is_skipped_and_counted_without_running(fixture_repo, tmp_path) -> None:
+    calls = [read_call(), bash_call("cargo test 2>&1 | tail -20"), bash_call("cd sub && go test ./..."), read_call()]
+
+    report = run_replay(tmp_path, calls)
+
+    assert (report["replayed_calls"], report["skipped_build_bash"], report["skipped_bash"], report["stopped_at"]) == (2, 2, 0, None)
+
+
+@needs_binary
+@pytest.mark.parametrize("command", ["cargo fmt", "sed -i s/a/b/ app.py", "cargo test > out.txt", "npx prettier --write app.py"])
+def test_file_writing_bash_still_stops_the_replay(fixture_repo, tmp_path, command) -> None:
+    report = run_replay(tmp_path, [read_call(), bash_call(command), read_call()])
+
+    assert report["stopped_at"]["index"] == 1
+    assert report["skipped_build_bash"] == 0
+
+
+@pytest.mark.parametrize("command", [
+    "cargo test", "cargo check --all-targets", "npm test", "npm run build", "go test ./...", "pytest -q",
+    "python -m pytest tests", "cd /x && cargo clippy 2>&1 | tail -n 5",
+])
+def test_build_bash_accepts_build_and_test_commands(command) -> None:
+    assert replay.build_bash(command) is True
+
+
+@pytest.mark.parametrize("command", [
+    "cargo fmt", "cargo clippy --fix", "cargo test && cargo fmt", "sed -i s/a/b/ f", "cargo test > o", "npm install",
+    "npx prettier --write .", "go build -o bin ./...", "cd /x", "cargo test; rm -rf x", "cargo test $(rm x)",
+])
+def test_build_bash_refuses_writers_and_non_build_commands(command) -> None:
+    assert replay.build_bash(command) is False
