@@ -209,6 +209,21 @@ fn second_hit_in_a_whole_file_does_not_reprint_it() {
 
     assert_eq!(out.matches("\n5:").count(), 1, "{out}");
 }
+#[test]
+fn only_the_first_hit_file_prints_whole_when_several_files_are_small() {
+    let tmp = tempfile::tempdir().unwrap();
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        std::fs::write(tmp.path().join(name), host_source(40, &[10])).unwrap();
+    }
+
+    let (out, _session) = search_with_session(tmp.path(), "marker_call", 0, None);
+
+    assert_eq!(out.matches("\n12:").count(), 1, "{out}");
+    for name in ["a.rs", "b.rs", "c.rs"] {
+        assert!(out.contains(&format!("{name}#")), "{name} missing:\n{out}");
+    }
+    assert_eq!(out.matches("marker_call").count(), 4, "{out}");
+}
 
 // ---- press attack: request-cuts adversarial ----
 
