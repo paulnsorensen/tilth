@@ -5,18 +5,19 @@ The failures come from view shape: a tilth search hit shows one function, so the
 Agents with the built-in tools read one contiguous `Read` window or a `Grep` hit that shows it.
 This is goal `diagnose-accuracy-failures` of the [tilth-vs-builtin roadmap](roadmaps/tilth-vs-builtin/index.md).
 
-**At main `30f64208` the accuracy gap is not confirmed** (goal `confirm-accuracy-gap`, below). Tilth costs 17–22% more per cell on both tasks.
+**At main `30f64208` the result is inconclusive** (goal `confirm-accuracy-gap`, below): 20 reps per arm find no significant gap, but they cannot rule out a gap of 10–20 points. Tilth costs 17–22% more per cell on both tasks.
 
 ## Confirmation run (2026-11-08)
 
-Both arms ran 20 reps of each task in one run at main `30f64208`: sonnet, CLI 2.1.310, `--strict-file-tools --bare --max-budget-usd 3`, budget `goal1-accuracy-gap`, spend $4.58. Rows: `benchmark/results/goal1-accuracy-gap.jsonl` (local, untracked).
+Both arms ran 20 reps of each task at main `30f64208`: sonnet, CLI 2.1.310, `--strict-file-tools --bare --max-budget-usd 3`, budget `goal1-accuracy-gap`, spend $4.58. Rows: `benchmark/results/goal1-accuracy-gap.jsonl` (local, untracked). Baseline reps 0–3 of each task were reused from 2026-11-05 under the same run key; the other 16 baseline and all 20 tilth reps ran fresh.
 
 | Task | Baseline | Tilth | Fisher p | Mean cost per cell |
 |---|---|---|---|---|
 | ripgrep-2209 | 18/20 | 16/20 | 0.66 | $0.074 baseline, $0.090 tilth (+22%) |
 | coreutils-6682 | 20/20 | 18/20 | 0.49 | $0.042 baseline, $0.049 tilth (+17%) |
 
-- Neither difference is significant, so goal `fix-accuracy-failures` closes with no work, as its intent states.
+- Neither difference is significant. That does not show the arms are equal: at 20 reps a 20-point gap can still miss significance.
+- Goal `fix-accuracy-failures` closes with no work because the diagnosis found no tool defect to fix, not because of this test.
 - Tilth at main passes ripgrep-2209 16/20, against 21/40 for the four 2026-11-06 arms. These runs do not show whether a main change (#443, #444) or run-to-run noise causes the difference.
 - The view-shape finding below still explains how the failing cells failed. It is not evidence of a systematic gap.
 
@@ -36,19 +37,18 @@ Both arms ran 20 reps of each task in one run at main `30f64208`: sonnet, CLI 2.
 
 | Task | Cause | Failing cells |
 |---|---|---|
-| coreutils | Patched the callee from a search hit; never read the caller `mkdir()` | 6 |
-| coreutils | Read `mkdir()` and still patched only the callee | 4 |
+| coreutils | Patched the callee from a search hit; no tool output before or after the first write showed `mkdir()` with its `chmod` call | 10 |
 | ripgrep | Never read the default `replace_with_captures_at` body | 13 |
 | ripgrep | Read that body and still wrote only the guard | 6 |
 | both | Ran the existing tests, saw green, and stopped; no existing test covers the bug | 29 |
 
 ## Baseline against tilth
 
-- **coreutils:** all 4 baseline cells start with `Read` of `mkdir.rs` at offset 155-165, limit 80-90. That window holds `create_dir`, `mkdir()` and its `chmod` call. The caller was seen in 4/4 baseline cells, 0/10 failing tilth cells and 29/30 passing tilth cells.
+- **coreutils:** all 4 baseline cells start with `Read` of `mkdir.rs` at offset 155-165, limit 80-90. That window holds `create_dir`, `mkdir()` and its `chmod` call. An output holding both `fn mkdir(` and `chmod(` came before the first write in 4/4 baseline cells, 0/10 failing tilth cells and 20/30 passing tilth cells; 9 passing cells never saw both in one output.
 - **ripgrep:** 3 of 4 baseline cells `Grep` for `fn replace_with_captures_at`, and the result includes the body with the tail line. The fourth reads `lib.rs:920-964` after its first edit and fixes the tail.
 - Reading `lib.rs:923-943` before the first write separates tilth outcomes: 15 of 21 passing cells against 7 of 19 failing cells (counts are about ±2).
 - **Not the cause:** volume of code seen (baseline median 2.6k characters on coreutils and 7.1k on ripgrep, less than both tilth groups), blocked Bash (equal in both arms), and the ambiguous search response for `replace_with_captures_at` (6 of 19 failing and 7 of 21 passing cells saw it).
-- The tool output was correct in the cells checked. `fn create_dir` returned the full body with a `fetch_callers` hint, and `fn replace_all` returned the full body with a `fetch_callees` hint. No agent followed a hint.
+- The tool output was correct in the cells checked. `fn create_dir` returned the full body with a `fetch_callers` hint, and `fn replace_all` returned the full body with a `fetch_callees` hint. No agent followed a hint. (#451 removes the hints; a follow query now takes a result's `target`.)
 
 ## Levers to test
 

@@ -20,4 +20,4 @@ Two levers from [Stock A/B trajectory diagnosis](../../stock-ab-trajectory-diagn
 - A replay of the stored chain cells (goal `content-replay-gate`) shows search result characters at least 15% below main `30f64208`, with no new errors.
 - The replayed search responses keep the same definitions and the same hit paths for each recorded query.
 - Regression tests cover the new default output, and `just check` passes.
-- A paid check of `chain:express-edit-6`, tilth arm, 6 reps (about $9, user-approved), costs at or below the baseline mean of $1.24 per cell.
+- A paid check of `chain:express-edit-6`, tilth arm, 6 reps (about $9, user-approved), costs at or below the baseline mean of $1.24 per cell, with every sub-task correct in every rep; it reports correctness next to cost, so a change that makes agents stop early cannot pass on cost alone.

@@ -16,4 +16,4 @@ When the diagnosis finds only reasoning failures, record that and close this goa
 
 - Each fix has a regression test that fails on main `30f64208` and passes with the fix.
 - `just check` passes.
-- A paid re-run of the tilth arm on the two tasks, with the settings of `confirm-accuracy-gap` and 20 reps (about $3, user-approved), passes at least 18/20 on each task.
+- A paid re-run of the tilth arm, with the settings of `confirm-accuracy-gap` and 20 reps (about $3, user-approved), passes at least 18/20 on each task that has a confirmed gap and a tool cause; a task whose failures are all reasoning failures is not gated.

@@ -142,7 +142,7 @@ Goal `trim-search-output` of the [tilth-vs-builtin roadmap](roadmaps/tilth-vs-bu
 | Bash output (chars) | 3.9k | 6.6k | 7.6k |
 | Edit output (chars) | 8.2k `Edit` | 2.7k | 3.6k |
 
-- Replay of the 12 stored seed cells per chain (#448): express search −43.9%, rg search 0% (its hit files are larger than 60 lines), no new errors, the same hits. Live, search output fell 27% and reads did not rise.
+- Replay of the 12 stored seed cells per chain (#448): express search −43.9%, rg search 0% (its hit files are larger than 60 lines), combined −14.7%, which misses the goal's 15% replay target; no new errors, the same hits. Live, search output fell 27% and reads did not rise.
 - Cost did not move measurably ($1.40 against $1.42), so the goal's cost target ($1.24) is not met.
 - What remains of the context gap (207k tokens per cell against baseline): the fixed prefix is about 27% (1.9k more tokens on each of about 29 API calls: tool schemas and server instructions); the rest is conversation content, where tilth tool output is still 26% larger (84.5k against 67.2k characters).
 - Next levers by size: the fixed prefix (the `tilth_write` schema is the largest, 5.2k characters), search output still 60% above `Grep`, and Bash output twice baseline.
