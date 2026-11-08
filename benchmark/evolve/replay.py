@@ -36,7 +36,11 @@ CALL_TIMEOUT_S = 120
 PERSISTED_MARKER = "<persisted-output>"
 OLD_MTIME = 946684800  # 2000-01-01: older than every recorded `if_modified_since`, so unchanged files stay unchanged
 
-READ_ONLY_COMMANDS = frozenset({"cd", "ls", "pwd", "git", "find", "head", "tail", "cut", "wc"})
+READ_ONLY_COMMANDS = frozenset({
+    "cd", "ls", "pwd", "git", "find", "head", "tail", "cut", "wc", "grep", "sort", "uniq", "tr", "echo",
+})
+# Exact stderr redirects that name no file in the workspace.
+SAFE_REDIRECTS = (["2", ">&", "1"], ["2", ">", "/dev/null"])
 GIT_READ_ONLY = frozenset({"status", "diff", "log", "show"})
 FIND_FORBIDDEN = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"})
 # Build and test commands write only build output, so skipping them leaves the tree later tilth calls see unchanged.
@@ -44,7 +48,8 @@ BUILD_SUBCOMMANDS = {
     "cargo": frozenset({"test", "check", "build", "clippy", "nextest"}),
     "go": frozenset({"test", "build", "vet"}),
 }
-BUILD_FILTERS = frozenset({"cd", "head", "tail", "wc", "cut"})
+NPX_TEST_RUNNERS = frozenset({"mocha", "jest", "vitest"})
+ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 BUILD_WRITING_FLAGS = frozenset({"-w", "--write", "-o", "--output", "--out-dir", "--target-dir", "-i"})
 
 
@@ -62,11 +67,11 @@ def _text_len(output: object) -> int:
     return len(_text(output))
 
 
-def _simple_commands(command: str, *, merge_stderr: bool = False) -> list[list[str]] | None:
+def _simple_commands(command: str) -> list[list[str]] | None:
     """Split ``command`` into simple-command argv lists, or None when it could write or nest.
 
-    Redirection, background jobs, substitution, and subshells are refused outright. ``merge_stderr``
-    additionally accepts the exact ``2>&1`` token run, which names no file.
+    Background jobs, substitution, subshells, and every redirect except ``SAFE_REDIRECTS``
+    (``2>&1`` and ``2>/dev/null``, which name no workspace file) are refused outright.
     """
     if "`" in command or "$(" in command or "\n" in command.strip():
         return None
@@ -80,7 +85,7 @@ def _simple_commands(command: str, *, merge_stderr: bool = False) -> list[list[s
     index = 0
     while index < len(tokens):
         token = tokens[index]
-        if merge_stderr and tokens[index:index + 3] == ["2", ">&", "1"]:
+        if tokens[index:index + 3] in SAFE_REDIRECTS:
             index += 3
             continue
         index += 1
@@ -99,19 +104,22 @@ def read_only_bash(command: str) -> bool:
     The caller never runs the command either way.
     """
     commands = _simple_commands(command)
-    if commands is None:
+    return commands is not None and all(_read_only_argv(argv) for argv in commands)
+
+
+def _read_only_argv(argv: list[str]) -> bool:
+    name = argv[0]
+    if name not in READ_ONLY_COMMANDS:
         return False
-    for argv in commands:
-        name = argv[0]
-        if name not in READ_ONLY_COMMANDS:
+    if name == "git":
+        rest = [arg for arg in argv[1:] if arg != "-C" and not arg.startswith("/")]
+        sub = next((arg for arg in rest if not arg.startswith("-")), None)
+        if sub not in GIT_READ_ONLY or any(arg.startswith("--output") for arg in argv):
             return False
-        if name == "git":
-            rest = [arg for arg in argv[1:] if arg != "-C" and not arg.startswith("/")]
-            sub = next((arg for arg in rest if not arg.startswith("-")), None)
-            if sub not in GIT_READ_ONLY or any(arg.startswith("--output") for arg in argv):
-                return False
-        if name == "find" and FIND_FORBIDDEN & set(argv):
-            return False
+    if name == "find" and FIND_FORBIDDEN & set(argv):
+        return False
+    if name == "sort" and any(arg == "-o" or arg.startswith("--output") for arg in argv[1:]):
+        return False
     return True
 
 
@@ -120,26 +128,33 @@ def _build_command(argv: list[str]) -> bool:
     if any(arg in BUILD_WRITING_FLAGS or arg.startswith("--fix") for arg in args):
         return False
     sub = next((arg for arg in args if not arg.startswith(("-", "+"))), None)
+    if name == "cargo" and sub == "fmt":
+        return "--check" in args
     if name in BUILD_SUBCOMMANDS:
         return sub in BUILD_SUBCOMMANDS[name]
     if name == "npm":
         return sub == "test" or (sub == "run" and args[args.index("run") + 1:][:1] in (["test"], ["build"]))
+    if name == "npx":
+        return sub in NPX_TEST_RUNNERS
     if name == "python" or name == "python3":
         return args[:2] == ["-m", "pytest"]
     return name == "pytest"
 
 
 def build_bash(command: str) -> bool:
-    """True when ``command`` only builds or tests: every simple command is an audited build/test
-    invocation, a ``cd``, or a read-only output filter. Formatters, ``--fix``/``--write`` flags,
-    redirects to files, and anything unlisted are refused. The caller never runs the command.
+    """True when ``command`` builds or tests: at least one simple command is an audited build/test
+    invocation and every other one is read-only. Formatters (except ``cargo fmt --check``),
+    ``--fix``/``--write`` flags, redirects to files, and anything unlisted are refused. The caller
+    never runs the command.
     """
-    commands = _simple_commands(command, merge_stderr=True)
+    commands = _simple_commands(command)
     if not commands:
         return False
-    if not any(_build_command(argv) for argv in commands):
+    # `NODE_ENV=test npx mocha` sets the environment of one command; it writes nothing.
+    commands = [argv[next((i for i, arg in enumerate(argv) if not ENV_ASSIGNMENT.match(arg)), len(argv)):] for argv in commands]
+    if any(not argv for argv in commands) or not any(_build_command(argv) for argv in commands):
         return False
-    return all(argv[0] in BUILD_FILTERS or _build_command(argv) for argv in commands)
+    return all(_build_command(argv) or _read_only_argv(argv) for argv in commands)
 
 
 def bash_disposition(call: dict) -> str | None:
@@ -288,12 +303,14 @@ def prepare_workspace(row: dict, workdir: Path) -> Path:
     """A fresh checkout of the task's fixture at its pinned revision, without grading assets or tests run.
 
     A local task clones its fixture repo (leaving that repo's metadata untouched) and applies its
-    mutations; an external task exports its prepared tree. The workspace never carries a built
-    environment: replay only needs source files.
+    mutations; an external task exports its prepared tree. A chain's members are prepared one per turn
+    by ``replay_cell``, as ``run._run_chain`` does. The workspace never carries a built environment:
+    replay only needs source files.
     """
     import external
     import run
 
+    run._register_chains([row["task"]])
     task = run.TASKS.get(row["task"])
     if task is not None and task.fixture_path is not None:
         source = run.get_repo_path(task.repo)
@@ -304,7 +321,8 @@ def prepare_workspace(row: dict, workdir: Path) -> Path:
             ["git", "-C", str(workspace), "checkout", "--quiet", "--detach", revision],
         ):
             subprocess.run(argv, check=True, capture_output=True, text=True)
-        task.prepare(workspace)
+        if not getattr(task, "members", ()):
+            task.prepare(workspace)
         if getattr(task, "hide_git", False):
             shutil.rmtree(workspace / ".git", ignore_errors=True)
         return workspace
@@ -338,6 +356,37 @@ def load_trajectory(row: dict) -> list[dict]:
     return _read_calls(Path(path))
 
 
+HIT_HEADER = re.compile(r"^### (?P<path>[^\s#:]+)(?:#[0-9A-Fa-f]+)?:(?P<line>\d+)", re.MULTILINE)
+
+
+def search_hits(text: str) -> list[str]:
+    """The sorted ``path:line`` hits a search response lists, without file tags, so two binaries'
+    responses can be compared for the same hits whatever else they print."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = text
+    strings: list[str] = []
+    stack = [data]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, str):
+            strings.append(value)
+        elif isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return sorted({f"{m['path']}:{m['line']}" for s in strings for m in HIT_HEADER.finditer(s)})
+
+
+def chain_members(row: dict) -> tuple:
+    """The member tasks of a ``chain:`` row in turn order; any other row has none."""
+    import run
+
+    run._register_chains([row["task"]])
+    return tuple(getattr(run.TASKS.get(row["task"]), "members", ()))
+
+
 TURN_FILE = re.compile(r"^(?P<stem>.+)\.turn(?P<turn>\d+)\.trajectory\.jsonl$")
 
 
@@ -366,6 +415,7 @@ def replay_cell(row: dict, binary: Path, *, workdir: Path) -> dict:
     """
     turns = load_turns(row)
     trajectory = [call for turn in turns for call in turn]
+    members = chain_members(row)
     workdir.mkdir(parents=True, exist_ok=True)
     workspace = prepare_workspace(row, workdir).resolve()
     _age_files(workspace)
@@ -379,6 +429,8 @@ def replay_cell(row: dict, binary: Path, *, workdir: Path) -> dict:
     touched: set[str] = set()
     offset = 0
     for turn_number, turn_calls in enumerate(turns, 1):
+        if turn_number <= len(members):
+            members[turn_number - 1].prepare(workspace)
         server = McpServer(Path(binary).resolve(), workspace, workdir / f"server.turn{turn_number}.stderr")
         report["servers_started"] += 1
         try:
@@ -424,6 +476,7 @@ def replay_cell(row: dict, binary: Path, *, workdir: Path) -> dict:
                     "index": index, "turn": turn_number, "tool": tool, "recorded_chars": _text_len(call.get("output")),
                     "replayed_chars": len(text), "recorded_error": recorded_error, "replayed_error": replayed_error,
                     "recorded_truncated": PERSISTED_MARKER in _text(call.get("output")),
+                    **({"hits": search_hits(text)} if tool == "tilth_search" else {}),
                 })
                 if tool == "tilth_write" and replayed_error != recorded_error:
                     report["stopped_at"] = {
@@ -472,13 +525,25 @@ def _chars_by_tool(report: dict, key: str) -> dict[str, int]:
     return totals
 
 
-def _cells(rows_path: Path, task: str | None, limit: int) -> list[dict]:
+def _tilth_row(row: dict) -> bool:
+    """True when the row's cell ran tilth: its recorded tools or MCP servers name tilth, else its mode is a
+    built-in tilth arm. A ``--modes-json`` arm such as ``tilth_stock`` is not in ``run.MODES``."""
     import run
 
+    tools = row.get("available_tools") or []
+    servers = row.get("mcp_servers") or []
+    if tools or servers:
+        return any(str(tool).startswith(TOOL_PREFIX) for tool in tools) or any(
+            isinstance(server, dict) and server.get("name") == "tilth" for server in servers)
+    mode = run.MODES.get(row.get("mode"))
+    return mode is not None and run._is_tilth_arm(mode)
+
+
+def _cells(rows_path: Path, task: str | None, limit: int) -> list[dict]:
     rows = [json.loads(line) for line in rows_path.read_text().splitlines() if line.strip()]
     chosen = [
         row for row in rows
-        if row.get("mode") in run.MODES and run._is_tilth_arm(run.MODES[row["mode"]]) and (task is None or row.get("task") == task)
+        if _tilth_row(row) and (task is None or row.get("task") == task)
         and row.get("trajectory_path") and Path(row["trajectory_path"]).is_file()
     ]
     return chosen[:limit]

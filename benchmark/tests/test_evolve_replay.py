@@ -390,6 +390,27 @@ def test_a_chain_row_replays_every_turn_on_a_new_server_each(fixture_repo, tmp_p
 
 
 @needs_binary
+def test_a_chain_prepares_each_member_right_before_its_turn(fixture_repo, tmp_path, monkeypatch) -> None:
+    class Member:
+        def __init__(self, extra: str) -> None:
+            self.extra = extra
+
+        def prepare(self, workspace: Path) -> None:
+            with open(Path(workspace) / "app.py", "a") as handle:
+                handle.write(self.extra)
+
+    monkeypatch.setattr(replay, "chain_members", lambda row: (Member(""), Member("# mutated\n" * 40)))
+    row = make_chain_row(tmp_path, [[read_call()], [read_call()]])
+
+    report = replay.replay_cell(row, BINARY, workdir=tmp_path / "work")
+
+    assert report["stopped_at"] is None
+    first, second = (call["replayed_chars"] for call in report["calls"])
+    # Turn 1 reads the file before the second member's mutation; turn 2 reads it after.
+    assert second > first
+
+
+@needs_binary
 def test_a_stop_in_an_early_turn_skips_the_later_turns(fixture_repo, tmp_path) -> None:
     row = make_chain_row(tmp_path, [[read_call(), bash_call("touch x")], [read_call()]])
 
@@ -403,10 +424,17 @@ def test_cells_keep_every_tilth_arm_and_skip_baseline(tmp_path) -> None:
     trajectory = tmp_path / "t.trajectory.jsonl"
     trajectory.write_text(json.dumps(read_call()) + "\n")
     rows = [{"task": "synthetic", "mode": mode, "trajectory_path": str(trajectory)} for mode in ("baseline", "tilth", "tilth_forced")]
+    # --modes-json stock arms are not in run.MODES; their recorded tools decide.
+    rows += [
+        {"task": "synthetic", "mode": "tilth_stock", "trajectory_path": str(trajectory),
+         "available_tools": ["Bash", "mcp__tilth__tilth_read"], "mcp_servers": [{"name": "tilth", "status": "connected"}]},
+        {"task": "synthetic", "mode": "baseline_stock", "trajectory_path": str(trajectory),
+         "available_tools": ["Bash", "Read", "Edit"], "mcp_servers": []},
+    ]
     rows_path = tmp_path / "rows.jsonl"
     rows_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
-    assert [row["mode"] for row in replay._cells(rows_path, None, 10)] == ["tilth", "tilth_forced"]
+    assert [row["mode"] for row in replay._cells(rows_path, None, 10)] == ["tilth", "tilth_forced", "tilth_stock"]
 
 
 @needs_binary
@@ -430,6 +458,12 @@ def test_file_writing_bash_still_stops_the_replay(fixture_repo, tmp_path, comman
 @pytest.mark.parametrize("command", [
     "cargo test", "cargo check --all-targets", "npm test", "npm run build", "go test ./...", "pytest -q",
     "python -m pytest tests", "cd /x && cargo clippy 2>&1 | tail -n 5",
+    'cargo build --workspace --offline 2>&1 | grep -E "^(error|warning)" | sort | uniq',
+    "NODE_ENV=test npx mocha --require test/support/env --reporter dot test",
+    'git status --short && cargo test --workspace --offline 2>&1 | grep -E "^error|FAILED"',
+    "cargo fmt --all -- --check 2>&1 | head -80; cargo build --offline 2>&1 | tail -60",
+    "cargo build -p grep-searcher 2>&1 | tail -40; ls crates/*/examples 2>/dev/null; echo done",
+    "cargo fmt --all -- --check",
 ])
 def test_build_bash_accepts_build_and_test_commands(command) -> None:
     assert replay.build_bash(command) is True
@@ -438,6 +472,26 @@ def test_build_bash_accepts_build_and_test_commands(command) -> None:
 @pytest.mark.parametrize("command", [
     "cargo fmt", "cargo clippy --fix", "cargo test && cargo fmt", "sed -i s/a/b/ f", "cargo test > o", "npm install",
     "npx prettier --write .", "go build -o bin ./...", "cd /x", "cargo test; rm -rf x", "cargo test $(rm x)",
+    "cargo test 2>&1 | sort -o out", "npx eslint --fix .", "FOO=1", "FOO=1 npm install",
+    "touch src/lib.rs && cargo build", "cargo build 2>out.log", "cargo test > /dev/null",
 ])
 def test_build_bash_refuses_writers_and_non_build_commands(command) -> None:
     assert replay.build_bash(command) is False
+
+
+@pytest.mark.parametrize(("command", "expected"), [
+    ("find examples -name '*.js' -not -path '*/node_modules/*' | sort; ls test/acceptance | head -50", True),
+    ("git status --short; ls examples 2>/dev/null | sort | uniq", True),
+    ("find . -name '*.js' | sort -o listing", False),
+    ("echo hi > notes.txt", False),
+])
+def test_read_only_bash_accepts_filters_and_refuses_writes(command, expected) -> None:
+    assert replay.read_only_bash(command) is expected
+
+
+def test_search_hits_lists_path_and_line_without_tags() -> None:
+    preview = "# Search: \"x\"\n\n### src/a.rs#1A2B:12 [usage]\n-> [12] x\n\n### src/b.rs:3-9 [definition]\nbody"
+    text = json.dumps({"results": [{"preview": preview}], "hints": []})
+
+    assert replay.search_hits(text) == ["src/a.rs:12", "src/b.rs:3"]
+    assert replay.search_hits(preview) == ["src/a.rs:12", "src/b.rs:3"]
