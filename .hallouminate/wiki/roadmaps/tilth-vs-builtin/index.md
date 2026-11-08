@@ -9,17 +9,17 @@ It replaces evolve rounds and small paired A/Bs, which cannot detect effects of 
 
 ## Where the gap is (2026-11-07)
 
-Per-task seed scores come from `benchmark/results/ab-write-md-seed.jsonl` (12 reps, seed `e6d47cd4`), scored against the baseline rows of the tools-sonnet-r1 run (8 reps). The score is pass rate × baseline cost / tilth cost.
+Per-task seed scores come from `benchmark/results/ab-write-md-seed.jsonl` (12 reps, seed `e6d47cd4`), scored against the baseline cells of the tools-sonnet-r1 run (4 distinct cells per task; its rows file lists each twice). The score is pass rate × baseline cost / tilth cost.
 
 | Task | Seed score | Share of the shortfall | Cause |
 |---|---|---|---|
-| burntsushi__ripgrep-2209 | 0.502 | 49.6% | accuracy: 6/12 pass, baseline 8/8 |
-| uutils__coreutils-6682 | 0.709 | 29.0% | accuracy: 8/12 pass, baseline 8/8 |
+| burntsushi__ripgrep-2209 | 0.502 | 49.6% | accuracy: 6/12 pass, baseline 4/4 |
+| uutils__coreutils-6682 | 0.709 | 29.0% | accuracy: 8/12 pass, baseline 4/4 |
 | chain:express-edit-6 | 0.871 | 12.8% | cost: $1.42 per cell against $1.24 (+15%) |
 | vuejs__core-11739, caddy-6350, express_edit_example_start | 0.929–0.932 | 20.7% | one miss or a small cost difference each |
 | chain:rg-edit-6, rg_edit_flow_migration | 1.022, 1.099 | −12.1% | tilth costs less than baseline |
 
-- **Accuracy on two cheap SWE tasks carries 79% of the shortfall.** Across the four tilth arms run on 2026-11-06 (seed, `write.md` winner, #443, #444), ripgrep-2209 passes 21/40 against baseline 8/8 (Fisher exact p = 0.015). coreutils-6682 passes 30/40 (p = 0.18). Every tilth miss fails the same held-out test: `regression::r2208` for ripgrep-2209 and `test_mkdir::test_mkdir_parent_mode_skip_existing` for coreutils-6682.
+- **Accuracy on two cheap SWE tasks carries 79% of the shortfall.** Across the four tilth arms run on 2026-11-06 (seed, `write.md` winner, #443, #444), ripgrep-2209 passes 21/40 against baseline 4/4 (Fisher exact p = 0.12). coreutils-6682 passes 30/40 (p = 0.56). With only 4 baseline cells, neither difference is significant; goal `confirm-accuracy-gap` measures it. Every tilth miss fails the same held-out test: `regression::r2208` for ripgrep-2209 and `test_mkdir::test_mkdir_parent_mode_skip_existing` for coreutils-6682.
 - **The content gap of the stock A/B is mostly closed.** #433–#436 fixed causes 2–5 and 8 of [Stock A/B trajectory diagnosis](../../stock-ab-trajectory-diagnosis.md). `chain:express-edit-6` still costs about 15% more. Cause 7 (four continuation hints on each resolved search hit) is still in the default search output on main `30f64208`.
 - The tilth arm in these runs has no preamble. The preamble showed no detectable effect in the [preamble rounds and the stock-prompt A/B](../../benchmark-gepa-v3-evolve.md#november-2026-stock-prompt-ab).
 
