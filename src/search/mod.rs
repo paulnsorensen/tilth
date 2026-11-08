@@ -932,10 +932,9 @@ fn whole_file_block(
     Some((block, last, content))
 }
 
-/// True when an earlier entry already printed `path` whole.
-fn whole_file_printed(seen: &[(usize, SeenEntry)], path: &Path) -> bool {
-    seen.iter()
-        .any(|(_, entry)| entry.whole_file && entry.path == path)
+/// True when an earlier entry of this result already printed a file whole.
+fn whole_file_printed(seen: &[(usize, SeenEntry)]) -> bool {
+    seen.iter().any(|(_, entry)| entry.whole_file)
 }
 
 fn lines_as_ranges(lines: &[u32]) -> Vec<(u32, u32)> {
@@ -1311,15 +1310,14 @@ fn format_single_match(
     let fence_will_follow =
         *expand_remaining > 0 && !deduped && !(multi_file && expanded_files.contains(&m.path));
 
-    // A small file prints whole, so the agent can edit any line of it. Only a
-    // session-backed (taggable) search does this; a second hit in the same file
-    // falls through to its one-line preview.
-    let whole_file =
-        if session.is_some() && !fence_will_follow && !whole_file_printed(seen, &m.path) {
-            whole_file_block(m, out.len(), budget_tokens)
-        } else {
-            None
-        };
+    // The first small file prints whole, so the agent can edit any line of it.
+    // Only a session-backed (taggable) search does this; every later hit falls
+    // through to its preview.
+    let whole_file = if session.is_some() && !fence_will_follow && !whole_file_printed(seen) {
+        whole_file_block(m, out.len(), budget_tokens)
+    } else {
+        None
+    };
 
     let preview_content = if !fence_will_follow && whole_file.is_none() {
         fs::read_to_string(&m.path).ok().filter(|source| {
