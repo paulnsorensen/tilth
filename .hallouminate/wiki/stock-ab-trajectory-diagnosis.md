@@ -127,4 +127,24 @@ Ordered by evidence. Prompt steering cannot remove causes 1–5, 7 or 8, so the 
 - **Setup gotchas.** `run.py` keeps only an allowlist of environment keys, so `XDG_STATE_HOME` does not reach tilth. The seen store then writes to `~/.local/state/tilth/seen`, one file per cell checkout. The CLI pin 2.1.310 had to be reinstalled with `mise install aqua:anthropics/claude-code@2.1.310` and passed through `TILTH_BENCH_CLAUDE`. Pass `--bare` to match the stock A/B rows. `bare` is part of the run key, so a `--bare` run does not reuse rows without it.
 - **Limits.** n=3. The baseline rows come from November 2, not from the same day. The first re-run started before #432, so the `/tmp` aging guard did not apply. Spend: $7.87 (budget `litmus-rg-edit-6`) and $6.52 (budget `litmus-rg-edit-6-bare`).
 
-_Source: stream analysis of `benchmark/results/stock-ab/rows_streams/` (budget `stock-ab-1`), request captures of the four arms' first API call, `chain:rg-edit-6` rep 0 trajectories, the 2026-11-04 and 2026-11-05 litmus streams and rows (`bare`, `git_sha`), and session-analytics `model_turns` · Updated: 2026-11-05 · Supersedes: none_
+## One whole file per search (2026-11-08)
+
+Goal `trim-search-output` of the [tilth-vs-builtin roadmap](roadmaps/tilth-vs-builtin/index.md) tested lever 4 in a new form. Since #309, a session-backed search printed every hit file of 60 lines or fewer whole. On `chain:express-edit-6`, 90% of search output was `preview`, and 80% of the preview characters were these numbered lines; hit lines were 4%. #450 prints at most one whole file per query.
+
+| Per `chain:express-edit-6` cell | baseline (4 cells) | tilth seed `e6d47cd4` (12) | tilth #450 (6) |
+|---|---|---|---|
+| Correct | 4/4 | 12/12 | 6/6 |
+| Cost | $1.24 | $1.42 | $1.40 |
+| Context tokens | 977k | 1,244k | 1,184k |
+| First-call context | 5.8k | 7.7k | 7.7k |
+| Search output (chars) | 18.3k `Grep` | 40.0k | 29.2k |
+| Read output (chars) | 36.7k `Read` | 47.9k | 44.1k |
+| Bash output (chars) | 3.9k | 6.6k | 7.6k |
+| Edit output (chars) | 8.2k `Edit` | 2.7k | 3.6k |
+
+- Replay of the 12 stored seed cells per chain (#448): express search −43.9%, rg search 0% (its hit files are larger than 60 lines), no new errors, the same hits. Live, search output fell 27% and reads did not rise.
+- Cost did not move measurably ($1.40 against $1.42), so the goal's cost target ($1.24) is not met.
+- What remains of the context gap (207k tokens per cell against baseline): the fixed prefix is about 27% (1.9k more tokens on each of about 29 API calls: tool schemas and server instructions); the rest is conversation content, where tilth tool output is still 26% larger (84.5k against 67.2k characters).
+- Next levers by size: the fixed prefix (the `tilth_write` schema is the largest, 5.2k characters), search output still 60% above `Grep`, and Bash output twice baseline.
+
+_Source: stream analysis of `benchmark/results/stock-ab/rows_streams/` (budget `stock-ab-1`), request captures of the four arms' first API call, `chain:rg-edit-6` rep 0 trajectories, the 2026-11-04 and 2026-11-05 litmus streams and rows (`bare`, `git_sha`), session-analytics `model_turns`, and for the 2026-11-08 section `benchmark/results/goal5-express-chain.jsonl` (budget `goal5-express-chain`, $8.41), `ab-write-md-seed.jsonl`, the tools-sonnet-r1 baseline rows, and replay reports from #448 · Updated: 2026-11-08 · Supersedes: none_
