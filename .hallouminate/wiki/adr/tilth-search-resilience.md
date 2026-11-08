@@ -50,3 +50,14 @@ _Source: checkout source and live MCP query comparison · Updated: 2026-09-29_
   budget truncations, and nothing is silently lost.
 - **Alternatives:** Keep hard error (observed failures stay failures);
   raise cap to 10 (bigger responses, rejected without benchmark evidence).
+
+### ADR-003: Qualified names and pasted declarations route to definitions [status: accepted]
+
+- **Context:** A qualified name such as `Owner::name` fell to a literal search. A pasted declaration line such as `pub fn run(&self) -> Guard` went to the regex route on its parentheses and returned 0 matches.
+- **Decision:** PR #443 adds a route before the regex route in `src/mcp/tools/search_v2.rs`. The order is now: path, Go signature, declaration shape, regex, signature-prefix normalization, filename-shaped miss, symbol or ambiguous, literal, miss.
+  1. The route reduces the query to its last path segment and resolves the definitions of that name.
+  2. A qualifier keeps only the definitions that its owner holds: an impl block, an outline container, a Go receiver, or a C++ out-of-line declarator.
+  3. When the qualifier keeps none, every definition of the name returns, and the diagnostic names the owners found.
+  4. A query with regex syntax stays a pattern. A bare identifier and `keyword name` keep the identifier and signature-prefix routes. A bare dotted name with no definition (`os.path.join`) falls through to the later routes.
+- **Open:** The evolve round `tools-sonnet-r1` proposed the same route and failed on a changed `route_identifier` signature ([[../benchmark-gepa-v3-evolve]]). Treat the shipped route as unmeasured by the evolve panel.
+- **Verification:** `tests/mcp_v2/test_search_qualified_declaration.py`.
