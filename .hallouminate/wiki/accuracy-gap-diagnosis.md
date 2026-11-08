@@ -5,6 +5,21 @@ The failures come from view shape: a tilth search hit shows one function, so the
 Agents with the built-in tools read one contiguous `Read` window or a `Grep` hit that shows it.
 This is goal `diagnose-accuracy-failures` of the [tilth-vs-builtin roadmap](roadmaps/tilth-vs-builtin/index.md).
 
+**At main `30f64208` the accuracy gap is not confirmed** (goal `confirm-accuracy-gap`, below). Tilth costs 17–22% more per cell on both tasks.
+
+## Confirmation run (2026-11-08)
+
+Both arms ran 20 reps of each task in one run at main `30f64208`: sonnet, CLI 2.1.310, `--strict-file-tools --bare --max-budget-usd 3`, budget `goal1-accuracy-gap`, spend $4.58. Rows: `benchmark/results/goal1-accuracy-gap.jsonl` (local, untracked).
+
+| Task | Baseline | Tilth | Fisher p | Mean cost per cell |
+|---|---|---|---|---|
+| ripgrep-2209 | 18/20 | 16/20 | 0.66 | $0.074 baseline, $0.090 tilth (+22%) |
+| coreutils-6682 | 20/20 | 18/20 | 0.49 | $0.042 baseline, $0.049 tilth (+17%) |
+
+- Neither difference is significant, so goal `fix-accuracy-failures` closes with no work, as its intent states.
+- Tilth at main passes ripgrep-2209 16/20, against 21/40 for the four 2026-11-06 arms. These runs do not show whether a main change (#443, #444) or run-to-run noise causes the difference.
+- The view-shape finding below still explains how the failing cells failed. It is not evidence of a systematic gap.
+
 ## Data
 
 - Tilth cells: 40 per task from four arms on 2026-11-06 (`ab-write-md-seed`, `ab-write-md-winner`, `bench-prs-pr443`, `bench-prs-pr444` in `benchmark/results/`, local and untracked). ripgrep-2209 passes 21/40, coreutils-6682 30/40.
