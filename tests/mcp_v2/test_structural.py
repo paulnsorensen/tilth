@@ -96,7 +96,7 @@ class StructuralSearch(unittest.TestCase):
             with self.subTest(language=language):
                 self.write(path, source)
                 payload = self.result([{"pattern": pattern, "language": language}])
-                self.assertEqual(set(payload), {"results", "hints", "diagnostics"})
+                self.assertEqual(set(payload), {"results", "diagnostics"})
                 result = payload["results"][0]
                 self.assertEqual(result["resolved_as"], "structural")
                 self.assertEqual(result["status"], "ok")

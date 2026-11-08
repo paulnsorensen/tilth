@@ -83,7 +83,7 @@ class ContinuationBoundary(unittest.TestCase):
 
     def test_follow_rejects_identity_drift_after_emission(self):
         first = self.payload([{"query": "root"}])
-        hint = next(item for item in first["hints"] if item["kind"] == "fetch_callers")
+        hint = {"kind": "fetch_callers", "target": first["results"][0]["target"]}
         (self.cwd / "fixture.ts").write_text(
             "export function renamed() {}\n"
             "function caller() { renamed(); }\n"
@@ -93,7 +93,7 @@ class ContinuationBoundary(unittest.TestCase):
 
     def test_mixed_query_and_follow_preserve_input_order(self):
         first = self.payload([{"query": "root"}])
-        hint = next(item for item in first["hints"] if item["kind"] == "fetch_callers")
+        hint = {"kind": "fetch_callers", "target": first["results"][0]["target"]}
         payload = self.payload([{"follow": hint}, {"query": "caller"}])
         self.assertEqual(len(payload["results"]), 2)
         self.assertEqual(payload["results"][0]["resolved_as"], "fetch_callers")
@@ -114,7 +114,8 @@ class ContinuationBoundary(unittest.TestCase):
         )
         (self.cwd / "fixture.ts").write_text(f"export function root() {{}}\n{callers}\n")
         first = self.payload([{"query": "root"}])
-        hints = [h for h in first["hints"] if h["kind"] in ("fetch_callers", "fetch_callees")][:2]
+        target = first["results"][0]["target"]
+        hints = [{"kind": kind, "target": target} for kind in ("fetch_callers", "fetch_callees")]
         response = self.call([{"follow": hint} for hint in hints], budget=200)
         self.assertFalse(harness.tool_is_error(response), response)
         payload = json.loads(harness.tool_result_text(response))

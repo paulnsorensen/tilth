@@ -834,7 +834,8 @@ mod tests {
         let args = serde_json::json!({"queries": [{"query": "foo"}], "cwd": cwd});
         let initial = dispatch_tool("tilth_search", &args, &services).unwrap();
         let initial: Value = serde_json::from_str(&initial).unwrap();
-        let hint = &initial["hints"][0];
+        let hint =
+            serde_json::json!({"kind": "fetch_callers", "target": initial["results"][0]["target"]});
         for entry in [
             serde_json::json!({"follow": hint}),
             serde_json::json!({"follow": hint}),
@@ -1121,7 +1122,7 @@ mod tests {
     fn server_instructions_byte_lock() {
         assert_eq!(
             SERVER_INSTRUCTIONS.len(),
-            1684,
+            1723,
             "SERVER_INSTRUCTIONS byte count drifted from baseline"
         );
         assert!(SERVER_INSTRUCTIONS.starts_with(
@@ -1467,12 +1468,18 @@ mod tests {
             "outline read reparses the shared snapshot"
         );
         let response: Value = serde_json::from_str(&result).unwrap();
-        let hints = response["hints"].as_array().unwrap();
+        let target = &response["results"][0]["target"];
         assert!(
-            !hints.is_empty(),
-            "search must emit a followable hint: {hints:?}"
+            target.is_object(),
+            "search must emit a followable target: {response}"
         );
-        for hint in hints {
+        for kind in [
+            "fetch_callers",
+            "fetch_callees",
+            "fetch_siblings",
+            "fetch_tests",
+        ] {
+            let hint = serde_json::json!({"kind": kind, "target": target});
             let follow = serde_json::json!({"cwd": dir.path(), "queries": [{"follow": hint}]});
             for _ in 0..2 {
                 let response = dispatch_tool("tilth_search", &follow, &services).unwrap();

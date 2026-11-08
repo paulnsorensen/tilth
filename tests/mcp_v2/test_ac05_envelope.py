@@ -37,7 +37,7 @@ class AC05Envelope(unittest.TestCase):
         self.assertIsNotNone(response)
         payload = json.loads(harness.tool_result_text(response))
         self.assertIn("results", payload)
-        self.assertIn("hints", payload)
+        self.assertNotIn("hints", payload)
         self.assertIn("diagnostics", payload)
         self.assertFalse(_contains_key(payload, "routes_tried"))
 
