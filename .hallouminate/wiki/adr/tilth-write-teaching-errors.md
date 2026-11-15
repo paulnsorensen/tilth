@@ -228,3 +228,16 @@ Session 2026-08-02; spec at the durable corpus
 - **Verification:** `tests/mcp_v2/test_seen_persist.py` fails on `aec0efd4` (4 failures, 1 error) and passes with the change. Unit tests are in `src/edit/seen_store.rs`, `src/edit/snapshots.rs`, and `src/mcp/tools/write.rs`.[^seen-persist]
 
 [^seen-persist]: `src/edit/seen_store.rs`; `src/session.rs` (`take_unsaved_seen`, `save_seen`, `persisted_seen`); `src/mcp/mod.rs` (`run_tool_with_timeout`); `src/mcp/tools/write.rs` (`resolve_edit`, `carried_seen_lines`). Decision: November 4, 2026, from the stock A/B trajectory diagnosis, cause 3.
+
+
+### ADR-012: Unseen-match refusals print the matches (amends ADR-009) [status: accepted]
+
+- **Context:** ADR-009 names one unblocking read for a refused `rewrite` or `replace_text all|count`. The agent still needs a second call to read, then a third call to retry. The `tools-sonnet-r1` evolve round proposed a patch that prints the matches in the refusal. That patch deadlocked, so it never reached a measurement ([[../benchmark-gepa-v3-evolve]]).
+- **Decision:** PR #444 ships the idea.
+  1. A refusal whose only reason is unseen `rewrite` or `replace_text all|count` matches prints each match as `N:content` lines under `[path#TAG]`.
+  2. The printed lines count as displayed. The refusal records them in the snapshot store, and the seen store persists them (ADR-011). The same call, sent again unchanged, then applies. A resumed tilth process also applies it.
+  3. Every other refusal stays plain. This includes a drifted section and a tag collision.
+  4. The response has a budget (`WRITE_RESPONSE_BUDGET` in `src/mcp/tools/write.rs`). When the printed lines do not fit what the host shows, the last printed refusal reverts to its plain form and records nothing. A file over the tag cap mints no tag, so it reverts too.
+- **Why record after the response is built:** A host shows no text past its limit. Lines that the agent never saw must not count as seen. `settle_shown` records the lines only after it knows that the whole response fits.
+- **Gotcha:** The patch from the evolve round took the snapshots mutex twice. Take it once per call. The test harness runs `tool_write` on its own thread with a 30 s wait, so a retaken lock fails the test and does not hang the suite.
+- **Verification:** `tests/mcp_v2/test_unseen_match_refusal.py` and the unit tests in `src/mcp/tools/write.rs`.
