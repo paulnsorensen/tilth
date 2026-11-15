@@ -290,21 +290,24 @@ pub(crate) fn unseen_match_spans(
 }
 
 /// Rounds and lines [`unseen_anchor_lines`] works through before it gives up.
-const MAX_UNSEEN_ROUNDS: usize = 64;
+const MAX_UNSEEN_ROUNDS: usize = 8;
 const MAX_UNSEEN_LINES: usize = 400;
 
 /// Every line the gate refuses as never displayed when `ops` are the only
 /// reason that [`gated_apply`] refuses. Once these lines count as displayed,
-/// `ops` apply. `None` when the gate accepts `ops`, when another failure
-/// comes first, and when the lines exceed a bounded amount.
+/// `ops` apply. Only lines that exist in the snapshot count. `None` when the
+/// gate accepts `ops`, when another failure comes first, and when the lines
+/// or the rounds exceed a bounded amount.
 pub(crate) fn unseen_anchor_lines(
     snapshot: &Snapshot,
     path: &Path,
     ops: &[Op],
 ) -> Option<Vec<u32>> {
+    let total = u32::try_from(snapshot.text.lines().count()).unwrap_or(u32::MAX);
     let mut shown = snapshot.clone();
     let mut added: Vec<u32> = Vec::new();
-    for _ in 0..MAX_UNSEEN_ROUNDS {
+    // One more pass than rounds, so the last round's addition is still checked.
+    for _ in 0..=MAX_UNSEEN_ROUNDS {
         let result = gated_apply(&shown, path, ops);
         let Err(EditError::Mismatch(MismatchError::UnseenAnchor {
             line,
@@ -326,7 +329,7 @@ pub(crate) fn unseen_anchor_lines(
             reads
         };
         for (lo, hi) in spans {
-            for l in lo..=hi {
+            for l in lo.max(1)..=hi.min(total) {
                 if shown.seen_lines.insert(l) {
                     added.push(l);
                 }

@@ -63,6 +63,25 @@ pub fn parse_tag(raw: &str) -> Option<u16> {
     u16::from_str_radix(raw, 16).ok()
 }
 
+/// Format the id of a held edit as a hold token: `H` and 7 uppercase hex
+/// digits. The token never reads as a 4-hex file tag.
+pub fn format_hold(id: u32) -> String {
+    format!("H{:07X}", id & HOLD_MASK)
+}
+
+/// Ids of held edits fit in 28 bits, the 7 hex digits of a hold token.
+pub const HOLD_MASK: u32 = 0x0FFF_FFFF;
+
+/// Parse a hold token back to its id. Case-insensitive; rejects every other
+/// shape, a 4-hex file tag included.
+pub fn parse_hold(raw: &str) -> Option<u32> {
+    let digits = raw.strip_prefix(['H', 'h'])?;
+    if digits.len() != 7 {
+        return None;
+    }
+    u32::from_str_radix(digits, 16).ok()
+}
+
 /// Format a hashline section header for a file path and tag: `[path#TAG]`.
 pub fn format_header(path: &str, tag: u16) -> String {
     format!("[{path}#{}]", format_tag(tag))

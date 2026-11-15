@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::parser::{parse_sections, BlockAnchor, BlockMode, Cursor, Op, Section};
-use super::tag::parse_tag;
+use super::tag::{parse_hold, parse_tag};
 
 /// One `{path, tag?, ops}` section as it arrives on the wire. `ops` stays as
 /// raw `Value`s so each op's deserialize error can be tagged with its verb and
@@ -282,17 +282,29 @@ fn op_error_hint(verb: &str) -> &'static str {
 }
 
 fn lower_section(index: usize, raw: RawSection) -> Result<Section, String> {
-    let tag = match raw.tag {
-        None => None,
+    let (tag, hold) = match raw.tag {
+        None => (None, None),
         Some(t) => {
             let stripped = t.strip_prefix('#').unwrap_or(t.as_str());
-            Some(parse_tag(stripped).ok_or_else(|| {
-                format!(
-                    "edits[{index}] (path {:?}): tag {t:?} is not a 4-hex-digit tag from a \
-                     tilth_read — run tilth_read on the path to mint a fresh tag",
-                    raw.path
-                )
-            })?)
+            if let Some(id) = parse_hold(stripped) {
+                if !raw.ops.is_empty() {
+                    return Err(format!(
+                        "edits[{index}] (path {:?}): hold token {t:?} confirms a held edit, so \
+                         send it with ops: []",
+                        raw.path
+                    ));
+                }
+                (None, Some(id))
+            } else {
+                let tag = parse_tag(stripped).ok_or_else(|| {
+                    format!(
+                        "edits[{index}] (path {:?}): tag {t:?} is not a 4-hex-digit tag from a \
+                         tilth_read — run tilth_read on the path to mint a fresh tag",
+                        raw.path
+                    )
+                })?;
+                (Some(tag), None)
+            }
         }
     };
     let mut ops = Vec::with_capacity(raw.ops.len());
@@ -331,6 +343,7 @@ fn lower_section(index: usize, raw: RawSection) -> Result<Section, String> {
     Ok(Section {
         path: raw.path,
         tag,
+        hold,
         ops,
     })
 }
