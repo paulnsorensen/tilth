@@ -23,6 +23,7 @@ GATE_COMMANDS = {
         ["python3", "-m", "unittest", "discover", "-s", "tests/mcp_v2", "-t", "tests/mcp_v2"],
         ["python3", "-m", "unittest", "discover", "-s", "tests/scripts", "-t", "tests/scripts"],
         ["python3", "scripts/tilth-bash-guard", "--self-test"],
+        ["python3", "scripts/ratchet_gate.py"],
     ],
     "benchmark-tests": [
         ["python3", "-m", "pytest", "benchmark/tests", "-q"],

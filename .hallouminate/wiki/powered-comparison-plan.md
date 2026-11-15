@@ -41,6 +41,16 @@ The run at main `69581207` (after #448, #450, #451) planned 144 cells, ran all o
 - Limits: 3 reps per task; a 15% band, not 10%; the strict hook blocked `sleep`/`until` wait loops in both arms, which costs turns but is equal across arms.
 - Next levers by evidence: the per-task outliers above (vuejs, ripgrep-2209) and the fixed prefix (about 27% of the chain context gap, see [Stock A/B trajectory diagnosis](stock-ab-trajectory-diagnosis.md#one-whole-file-per-search-2026-11-08)). Measure each with replay first, then a paid run on the affected tasks.
 
+### Continuation: hill-climb loop (2026-11-15)
+
+The user chose a hill-climb loop after this verdict: one lever per iteration, a free deterministic gate, a paid check only on affected tasks (up to $10 per lever, baseline cells reused), and a fresh 24 × 3 comparison after about four levers with explicit approval.
+
+- First thread `mcp-prefix`: metric `mcp_prefix.bytes` from `scripts/mcp_prefix_bytes.py` (instructions + served tool descriptions + compact input schemas), 10704 bytes at `9f9ba1f3`, ratcheted in `perf/ratchet/mcp-prefix.json` and checked by `scripts/ratchet_gate.py` in CI.
+- Why the prefix: in this run the per-task first-call context delta is 1951–1958 tokens, the tilth prefix as tokenized. Over 16.1 API calls per cell at the fitted cache-read price ($0.303/Mtok) it costs $0.0094 per cell, 2.2% of pooled tilth cost. The mean cost gap is $0.009 per cell, so the prefix is about the size of the gap; the gap is noisy, the prefix cost is not.
+- Ceiling: deleting the whole prefix saves about 2–4% of tilth cost. Most prefix bytes are model-facing text or validation keywords, so a material cut changes wording or removes a check.
+- Not levers: `maximum: 4294967295` on integer op fields is the #116 client-side check; the six goal 6 `InputValidationError`s are raw control characters in model-written JSON, which the host rejects before tilth sees the call.
+- vuejs (+75%): the tilth agents wrote and ran throwaway repro specs (rep 0: 15 `tilth_write` and 14 `Bash` calls, 25.9k output tokens against 9.0k). Two of those writes failed: `create_file` on a file the agent had just created, then an untagged `replace` of it. The agent then switched to delete and recreate under a new name.
+
 ## Power estimate
 
 From the stock A/B rows (18 tasks × 3 reps, `tilth_stock` against `baseline_stock`): the per-task delta spread splits into true task-to-task spread and rep noise from resampling each task's reps. Power for a true mean effect d is Φ(|d|/SE − 1.96), SE = √((σ_task² + σ_rep²·3/R)/T).
