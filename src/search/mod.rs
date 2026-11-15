@@ -1206,9 +1206,7 @@ fn format_single_match(
     let scope_suffix = if m.is_definition || m.impl_target.is_some() {
         String::new()
     } else {
-        enclosing_scope_label(&m.path, m.line, cache)
-            .map(|s| format!(" in {s}"))
-            .unwrap_or_default()
+        enclosing_scope_label(&m.path, m.line, cache).map_or_default(|s| format!(" in {s}"))
     };
 
     // Show line range for definitions with def_range, otherwise just the line.

@@ -393,9 +393,7 @@ pub(crate) fn collect_siblings(
     {
         entries.iter().collect()
     } else {
-        find_parent(entries, target)
-            .map(|parent| parent.children.iter().collect())
-            .unwrap_or_default()
+        find_parent(entries, target).map_or_default(|parent| parent.children.iter().collect())
     };
 
     let mut out: Vec<SiblingEntry> = candidates

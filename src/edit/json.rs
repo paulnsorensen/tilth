@@ -307,9 +307,7 @@ fn lower_section(index: usize, raw: RawSection) -> Result<Section, String> {
                 ));
             }
             Some(v) if !VALID_OPS.contains(&v) => {
-                let suggestion = suggest_op(v)
-                    .map(|s| format!(" Did you mean {s}?"))
-                    .unwrap_or_default();
+                let suggestion = suggest_op(v).map_or_default(|s| format!(" Did you mean {s}?"));
                 return Err(format!(
                     "edits[{index}].ops[{j}] (path {:?}): op {v:?} is not a valid op — valid \
                      ops are {}.{suggestion} {}",
