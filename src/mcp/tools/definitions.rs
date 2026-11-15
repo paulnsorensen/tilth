@@ -174,7 +174,7 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
 /// The shared `cwd` schema property. The description text is model-facing
 /// and must always tell the model to set `cwd` explicitly.
 fn cwd_property() -> Value {
-    serde_json::json!({ "type": "string", "description": "Absolute checkout directory; relative paths anchor here." })
+    serde_json::json!({ "type": "string", "description": "Absolute checkout directory; always set this explicitly. Relative paths anchor here." })
 }
 
 #[cfg(test)]
