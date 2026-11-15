@@ -3,8 +3,8 @@
     "mcp_prefix.bytes": {
       "command": "python3 scripts/mcp_prefix_bytes.py",
       "direction": "lower",
-      "revision": "9f9ba1f3",
-      "threshold": 10704,
+      "revision": "1c2ede71",
+      "threshold": 10524,
       "tolerance": 0.0,
       "unit": "bytes"
     }
