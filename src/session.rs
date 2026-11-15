@@ -6,8 +6,22 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde_json::Value;
 
-use crate::edit::seen_store::{SeenRecord, SeenStore};
+use crate::edit::parser::Section;
+use crate::edit::seen_store::{content_digest, SeenRecord, SeenStore};
 use crate::edit::snapshots::SnapshotStore;
+
+/// Most refused sections that a session holds for a confirm at once.
+const MAX_HELD_EDITS: usize = 16;
+
+/// `tilth_write` state that outlives one call.
+#[derive(Default)]
+struct WriteMemory {
+    /// Path key to the digest of the content that tilth last wrote to a file
+    /// that this session created with `create_file`.
+    created: HashMap<String, u64>,
+    /// Sections refused for unseen lines, held until a confirm applies them.
+    held: HashMap<(String, u16), Section>,
+}
 
 const BATCH_NUDGE_LIMIT: u8 = 2;
 const NUDGE_MAX_CHARS: usize = 120;
@@ -123,6 +137,7 @@ pub struct Session {
     /// The seen lines of `snapshots`, saved per checkout so that a resumed
     /// agent session (a new tilth process) keeps them.
     seen_store: Mutex<SeenStore>,
+    write_memory: Mutex<WriteMemory>,
     /// Cumulative token estimates: sum of full-file baseline tokens and
     /// tokens actually returned across all reads in this session.
     baseline_tokens: AtomicU64,
@@ -148,6 +163,7 @@ impl Session {
             expanded: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(SnapshotStore::new()),
             seen_store: Mutex::new(SeenStore::from_env()),
+            write_memory: Mutex::new(WriteMemory::default()),
             baseline_tokens: AtomicU64::new(0),
             saved_tokens: AtomicU64::new(0),
             batch_nudges: Mutex::new(BatchNudgeState::default()),
@@ -239,6 +255,58 @@ impl Session {
     /// Move the snapshot history from `from` to `to` (a renamed file).
     pub fn relocate_snapshot(&self, from: &Path, to: &Path) {
         self.snapshots().relocate(from, to);
+    }
+
+    fn write_memory(&self) -> MutexGuard<'_, WriteMemory> {
+        self.write_memory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Hold a section that a refusal displayed, until a confirm for `key` at
+    /// `tag` applies it.
+    pub fn hold_edit(&self, key: &str, tag: u16, section: Section) {
+        let mut memory = self.write_memory();
+        if memory.held.len() >= MAX_HELD_EDITS {
+            memory.held.clear();
+        }
+        memory.held.insert((key.to_string(), tag), section);
+    }
+
+    /// Take the held section for `key` at `tag`. A held section is used once.
+    pub fn take_held_edit(&self, key: &str, tag: u16) -> Option<Section> {
+        self.write_memory().held.remove(&(key.to_string(), tag))
+    }
+
+    /// A `create_file` made `key`, which now holds `text`.
+    pub fn note_created(&self, key: &str, text: &str) {
+        let mut memory = self.write_memory();
+        memory.held.retain(|(held, _), _| held != key);
+        memory.created.insert(key.to_string(), content_digest(text));
+    }
+
+    /// A tilth write left `key` holding `text`. A file that this session
+    /// created stays tracked at its new content, and a held edit for the file
+    /// is stale.
+    pub fn note_written(&self, key: &str, text: &str) {
+        let mut memory = self.write_memory();
+        memory.held.retain(|(held, _), _| held != key);
+        if let Some(digest) = memory.created.get_mut(key) {
+            *digest = content_digest(text);
+        }
+    }
+
+    /// `key` was removed or moved away.
+    pub fn forget_written(&self, key: &str) {
+        let mut memory = self.write_memory();
+        memory.held.retain(|(held, _), _| held != key);
+        memory.created.remove(key);
+    }
+
+    /// Whether this session created `key` with `create_file` and `live` is
+    /// still the content that tilth last wrote to it.
+    pub fn created_unchanged(&self, key: &str, live: &str) -> bool {
+        self.write_memory().created.get(key) == Some(&content_digest(live))
     }
 
     pub fn record_read(&self, path: &Path) {
@@ -788,5 +856,44 @@ mod tests {
         session.record_search("TODO: fix");
         session.record_search("TODO: fix");
         assert!(session.summary().contains("TODO: fix (2)"));
+    }
+
+    fn held_section(path: &str) -> Section {
+        Section {
+            path: path.into(),
+            tag: Some(0x1234),
+            ops: vec![],
+        }
+    }
+
+    #[test]
+    fn a_held_edit_is_taken_once_for_its_key_and_tag() {
+        let session = Session::new();
+        session.hold_edit("/k", 0x1234, held_section("k"));
+        assert!(session.take_held_edit("/k", 0x4321).is_none());
+        assert!(session.take_held_edit("/other", 0x1234).is_none());
+        assert!(session.take_held_edit("/k", 0x1234).is_some());
+        assert!(session.take_held_edit("/k", 0x1234).is_none());
+    }
+
+    #[test]
+    fn a_write_to_the_file_drops_its_held_edits() {
+        let session = Session::new();
+        session.hold_edit("/k", 0x1234, held_section("k"));
+        session.note_written("/k", "new");
+        assert!(session.take_held_edit("/k", 0x1234).is_none());
+    }
+
+    #[test]
+    fn only_a_created_unchanged_file_counts_as_the_sessions_own() {
+        let session = Session::new();
+        assert!(!session.created_unchanged("/k", "a"));
+        session.note_created("/k", "a");
+        assert!(session.created_unchanged("/k", "a"));
+        assert!(!session.created_unchanged("/k", "outside"));
+        session.note_written("/k", "b");
+        assert!(session.created_unchanged("/k", "b"));
+        session.forget_written("/k");
+        assert!(!session.created_unchanged("/k", "b"));
     }
 }

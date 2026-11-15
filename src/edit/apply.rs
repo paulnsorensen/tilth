@@ -11,6 +11,7 @@
 #![allow(dead_code)]
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::path::Path;
 
 use super::block::{outline_for, resolve_block_in};
@@ -510,6 +511,7 @@ fn lower_text_swaps(
         end: usize,
         new: Cow<'a, str>,
         line_span: (u32, u32),
+        multi: bool,
     }
 
     let newlines: Vec<usize> = memchr::memchr_iter(b'\n', text.as_bytes()).collect();
@@ -519,6 +521,7 @@ fn lower_text_swaps(
     let mut resolved: Vec<Resolved> = Vec::new();
     let mut normalized = false;
     for (op_idx, op) in ops.iter().enumerate() {
+        let multi = matches!(op, Op::TextSwapAll { .. } | Op::Rewrite { .. });
         let spans: Vec<(usize, usize, Cow<str>)> = match op {
             Op::TextSwap { old, new } => {
                 let (start, end, was_normalized) = match_text_span(text, old)?;
@@ -545,6 +548,7 @@ fn lower_text_swaps(
                 start,
                 end,
                 new,
+                multi,
                 // Covering span (may include a line past the match's real
                 // content) — correct for run-coalescing/reject_overlaps below,
                 // but not for the seen-lines gate; use content_line_span there.
@@ -555,6 +559,17 @@ fn lower_text_swaps(
     // Sorting by byte start puts members of a run adjacent and makes the error
     // reported for a conflicting pair deterministic; grouping through a HashMap
     // left it dependent on iteration order.
+    let matches: Vec<TextMatch> = resolved
+        .iter()
+        .map(|r| TextMatch {
+            op_idx: r.op_idx,
+            start: r.start,
+            end: r.end,
+            multi: r.multi,
+        })
+        .collect();
+    let mut nested = nested_in_other_op(&matches).into_iter();
+    resolved.retain(|_| !nested.next().unwrap_or(false));
     resolved.sort_by_key(|r| r.start);
 
     let mut out: Vec<Vec<LineOp>> = vec![Vec::new(); ops.len()];
@@ -594,6 +609,94 @@ fn lower_text_swaps(
     }
 
     Ok((out, normalized))
+}
+
+/// One resolved text match: the op that produced it and its byte span.
+#[derive(Clone, Copy)]
+pub(super) struct TextMatch {
+    pub op_idx: usize,
+    pub start: usize,
+    pub end: usize,
+    /// The match belongs to a `replace_text` with `all`/`count` or to a `rewrite`.
+    pub multi: bool,
+}
+
+/// Flag each match of a multi-match op (`all`/`count` or `rewrite`) that lies
+/// wholly inside a match of another op. The outer, more specific op wins and
+/// the nested match is dropped. A single-match `replace_text` is never
+/// dropped, so nesting inside it keeps its overlap error. Two multi-match
+/// matches with the same span are not nested; they stay an overlap.
+pub(super) fn nested_in_other_op(matches: &[TextMatch]) -> Vec<bool> {
+    let mut by_op: HashMap<usize, Vec<TextMatch>> = HashMap::new();
+    for m in matches {
+        by_op.entry(m.op_idx).or_default().push(*m);
+    }
+    for spans in by_op.values_mut() {
+        spans.sort_unstable_by_key(|m| m.start);
+    }
+    matches
+        .iter()
+        .map(|m| {
+            m.multi
+                && by_op.iter().any(|(&op_idx, spans)| {
+                    if op_idx == m.op_idx {
+                        return false;
+                    }
+                    // One op's matches never overlap, so only the last match
+                    // that starts at or before `m` can contain it.
+                    let at = spans.partition_point(|o| o.start <= m.start);
+                    at.checked_sub(1).map(|i| spans[i]).is_some_and(|o| {
+                        o.end >= m.end && !(o.multi && o.start == m.start && o.end == m.end)
+                    })
+                })
+        })
+        .collect()
+}
+
+/// The byte spans of each multi-match op that survive nested-match dropping,
+/// one slot per op in `ops`: `None` for other ops and for an op that does not
+/// resolve (`apply_ops` reports that failure). The seen-lines gate asks here
+/// so it judges the same matches that [`lower_text_swaps`] applies.
+pub(super) fn kept_multi_spans(
+    path: &Path,
+    text: &str,
+    ops: &[Op],
+) -> Vec<Option<Vec<(usize, usize)>>> {
+    let mut matches: Vec<TextMatch> = Vec::new();
+    let mut resolved = vec![false; ops.len()];
+    for (op_idx, op) in ops.iter().enumerate() {
+        let (spans, multi) = match op {
+            Op::TextSwap { old, .. } => (
+                match_text_span(text, old).map(|(start, end, _)| vec![(start, end)]),
+                false,
+            ),
+            Op::TextSwapAll { old, count, .. } => (find_all_text_spans(text, old, *count), true),
+            Op::Rewrite { pattern, count, .. } => (
+                super::rewrite::rewrite_match_spans(path, text, pattern, *count),
+                true,
+            ),
+            _ => continue,
+        };
+        let Ok(spans) = spans else {
+            continue;
+        };
+        resolved[op_idx] = multi;
+        matches.extend(spans.into_iter().map(|(start, end)| TextMatch {
+            op_idx,
+            start,
+            end,
+            multi,
+        }));
+    }
+    let nested = nested_in_other_op(&matches);
+    let mut kept: Vec<Option<Vec<(usize, usize)>>> =
+        resolved.iter().map(|&multi| multi.then(Vec::new)).collect();
+    for (m, nested) in matches.iter().zip(nested) {
+        if let (false, Some(spans)) = (nested, kept[m.op_idx].as_mut()) {
+            spans.push((m.start, m.end));
+        }
+    }
+    kept
 }
 
 /// Lower `ops` into concrete [`LineOp`]s by resolving block anchors against
@@ -1880,5 +1983,60 @@ mod tests {
     fn all_coalesces_same_line_occurrences() {
         let out = apply_all("a a a\n", &[all_op("a", "b", None)]).expect("apply");
         assert_eq!(out, "b b b\n");
+    }
+
+    fn swap(old: &str, new: &str) -> Op {
+        Op::TextSwap {
+            old: old.into(),
+            new: new.into(),
+        }
+    }
+
+    #[test]
+    fn an_all_match_nested_in_another_ops_match_is_dropped() {
+        let text = "x Result<bool> y\nz FnMut() -> Result<bool> w\n";
+        let out = apply_all(
+            text,
+            &[
+                all_op("Result<bool>", "R", None),
+                all_op("FnMut() -> Result<bool>", "F", None),
+            ],
+        )
+        .expect("nested match drops");
+        assert_eq!(out, "x R y\nz F w\n");
+    }
+
+    #[test]
+    fn an_all_match_inside_a_specific_swap_is_dropped_and_count_still_checks_the_original() {
+        let text = "a\n  Ok(true)\nb\nOk(true)\n";
+        let ops = |count| {
+            [
+                all_op("Ok(true)", "Ok(false)", count),
+                swap("a\n  Ok(true)\n", "a\n  keep\n"),
+            ]
+        };
+        let out = apply_all(text, &ops(Some(2))).expect("count is the original 2");
+        assert_eq!(out, "a\n  keep\nb\nOk(false)\n");
+        let err = apply_all(text, &ops(Some(1))).unwrap_err();
+        assert!(
+            matches!(err, ApplyError::TextCountMismatch { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_partial_overlap_and_a_nested_single_swap_stay_errors() {
+        let partial = apply_all(
+            "foo bar baz\n",
+            &[all_op("foo bar", "X", None), all_op("bar baz", "Y", None)],
+        )
+        .unwrap_err();
+        assert!(matches!(partial, ApplyError::Overlap { .. }), "{partial:?}");
+        let nested = apply_all(
+            "aaa XYZ bbb\n",
+            &[all_op("aaa XYZ", "Q", None), swap("XYZ", "R")],
+        )
+        .unwrap_err();
+        assert!(matches!(nested, ApplyError::Overlap { .. }), "{nested:?}");
     }
 }

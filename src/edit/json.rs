@@ -344,9 +344,9 @@ pub fn lower_edits(edits: &Value) -> Result<Vec<Section>, String> {
         .ok_or("`edits` must be a JSON array of {path, tag?, ops} section objects")?;
     // Enforce the batch cap up front, before allocating or deserializing any
     // section — an oversized array is rejected without paying to lower it.
-    if arr.len() > 20 {
+    if arr.len() > 50 {
         return Err(format!(
-            "batch write limited to 20 sections (got {}); split into calls of at most 20 sections",
+            "batch write limited to 50 sections (got {}); split into calls of at most 50 sections",
             arr.len()
         ));
     }

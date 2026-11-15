@@ -25,7 +25,8 @@ use crate::edit::json::{lower_edits, teaching_error_for_string};
 use crate::edit::mismatch::MismatchError;
 use crate::edit::parser::{Op, Section};
 use crate::edit::recovery::{
-    check_seen_lines, current_match_ranges, gated_apply, try_recover, unseen_match_spans, EditError,
+    check_seen_lines, current_match_ranges, gated_apply, try_recover, unseen_anchor_lines,
+    unseen_match_spans, EditError,
 };
 use crate::edit::snapshots::{Snapshot, SnapshotStore};
 use crate::edit::tag::{compute_file_hash, format_header};
@@ -52,7 +53,7 @@ fn parse_write_args(args: &Value) -> Result<(Vec<Section>, &Path, bool), String>
 
     let cwd = super::require_cwd(args)?;
 
-    // `lower_edits` enforces the 20-section batch cap up front (before lowering).
+    // `lower_edits` enforces the 50-section batch cap up front (before lowering).
     let sections = lower_edits(edits_val)?;
     if sections.is_empty() {
         return Err("edits array contained no sections".into());
@@ -134,6 +135,9 @@ fn settle_shown(results: &mut [String], mut shown: Vec<(usize, Shown)>, session:
             .is_none()
         {
             results[i] = refusal.fallback;
+        } else {
+            let key = crate::edit::normalize_path_key(&refusal.path);
+            session.hold_edit(&key, refusal.tag, refusal.section);
         }
     }
 }
@@ -156,6 +160,9 @@ struct Shown {
     path: PathBuf,
     text: String,
     lines: Vec<u32>,
+    /// The refused section, which [`settle_shown`] holds for a confirm.
+    section: Section,
+    tag: u16,
     /// The section block with the plain refusal, for when the lines cannot
     /// count as displayed.
     fallback: String,
@@ -229,6 +236,12 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
         }
     };
 
+    if section.ops.is_empty() {
+        if let Some(tag) = section.tag {
+            return confirm_held(tag, path, &live, ctx);
+        }
+    }
+
     let section = fill_live_tag(section, path, session, &live);
     let section: &Section = &section;
     let (new_text, file_op, normalized, written) =
@@ -258,6 +271,7 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     ctx.cache.invalidate_alias(path, &canonical_or_raw(path));
     ctx.cache.update_after_write(path, &live, &new_text);
     session.record_read(path);
+    session.note_written(&crate::edit::normalize_path_key(path), &new_text);
 
     let (summary, mut seen_lines) = summarize_changes(&live, &new_text, written.as_ref());
     seen_lines.extend(carried_seen_lines(
@@ -320,12 +334,35 @@ fn map_edit_error(e: EditError, path: &Path, tag: u16) -> TilthError {
     e.into()
 }
 
+/// Apply the section that an earlier refusal held for `path` under `tag`.
+/// A held edit works once, and only while the file still has that tag. Any
+/// other state writes nothing and says why.
+fn confirm_held(tag: u16, path: &Path, live: &str, ctx: &SectionCtx) -> Result<String, TilthError> {
+    let key = crate::edit::normalize_path_key(path);
+    let p = crate::format::display_path(path);
+    let held = ctx.session.take_held_edit(&key, tag);
+    if compute_file_hash(live) != tag {
+        return Err(TilthError::EditRejected(format!(
+            "Edit rejected for {p}: the file changed since the held edit was refused, so \
+             nothing was written. Read the lines to edit and send the edit again."
+        )));
+    }
+    let Some(held) = held else {
+        return Err(TilthError::EditRejected(format!(
+            "Edit rejected for {p}: no held edit exists for tag {tag:04X}, so nothing was \
+             written. Send the full edit with its ops."
+        )));
+    };
+    commit_section(&held, path, ctx)
+}
+
 /// Turn a refusal whose only reason is unseen `rewrite` or `replace_text
-/// all|count` matches into one that prints each match as `N:content` lines
-/// under `[path#TAG]`, so that the same call applies once those lines count
-/// as displayed. [`settle_shown`] records them after the whole response is
-/// built. Every other refusal, a drifted or tag-collided section included,
-/// passes through unchanged.
+/// all|count` matches, or unseen anchor lines, into one that prints each
+/// line as `N:content` under `[path#TAG]`. Once those lines count as
+/// displayed, the same call applies, and so does an empty-ops confirm that
+/// names the tag: [`settle_shown`] records the lines and holds the section
+/// after the whole response is built. Every other refusal, a drifted or
+/// tag-collided section included, passes through unchanged.
 fn show_unseen_matches(
     e: TilthError,
     section: &Section,
@@ -333,35 +370,46 @@ fn show_unseen_matches(
     live: &str,
     ctx: &SectionCtx,
 ) -> TilthError {
+    let Some(tag) = section.tag.filter(|&tag| tag == compute_file_hash(live)) else {
+        return e;
+    };
+    let key = crate::edit::normalize_path_key(path);
+    let Some(snap) = gate_snapshot(ctx.session, &key, tag, live, ctx.cwd) else {
+        return e;
+    };
     let multi_match = section
         .ops
         .iter()
         .any(|op| matches!(op, Op::TextSwapAll { .. } | Op::Rewrite { .. }));
-    let Some(tag) = section
-        .tag
-        .filter(|&tag| multi_match && tag == compute_file_hash(live))
-    else {
+    let (lines, what) = if let Some(spans) = multi_match
+        .then(|| unseen_match_spans(&snap, path, &section.ops))
+        .flatten()
+    {
+        let mut lines: Vec<u32> = spans.iter().flat_map(|&(lo, hi)| lo..=hi).collect();
+        lines.sort_unstable();
+        lines.dedup();
+        let what = match spans.len() {
+            1 => "1 match was".to_string(),
+            n => format!("{n} matches were"),
+        };
+        (lines, what)
+    } else if let Some(lines) = unseen_anchor_lines(&snap, path, &section.ops) {
+        let what = match lines.len() {
+            1 => "1 line was".to_string(),
+            n => format!("{n} lines were"),
+        };
+        (lines, what)
+    } else {
         return e;
     };
-    let key = crate::edit::normalize_path_key(path);
-    let Some(spans) = gate_snapshot(ctx.session, &key, tag, live, ctx.cwd)
-        .and_then(|snap| unseen_match_spans(&snap, path, &section.ops))
-    else {
-        return e;
-    };
-    let mut lines: Vec<u32> = spans.iter().flat_map(|&(lo, hi)| lo..=hi).collect();
-    lines.sort_unstable();
-    lines.dedup();
     let rows: Vec<&str> = live.split('\n').collect();
     let p = crate::format::display_path(path);
-    let matches = match spans.len() {
-        1 => "1 match was".to_string(),
-        n => format!("{n} matches were"),
-    };
+    let confirm = serde_json::json!({"path": p, "tag": format!("{tag:04X}"), "ops": []});
     let mut out = format!(
-        "Edit rejected for {p}: {matches} never displayed under this tag, so nothing was \
-         applied. The lines below show them, and they now count as displayed. Send the same \
-         call again unchanged to apply it.\n{}",
+        "Edit rejected for {p}: {what} never displayed under this tag, so nothing was \
+         written. The lines below are the read of them, and they now count as displayed. \
+         The server holds your edit: send the section {confirm} to apply it once. Send the \
+         same call again unchanged also works.\n{}",
         format_header(&p, tag)
     );
     for &n in &lines {
@@ -376,6 +424,8 @@ fn show_unseen_matches(
         path: path.to_path_buf(),
         text: live.to_string(),
         lines,
+        section: section.clone(),
+        tag,
         fallback: error_block(path, &e),
     }));
     TilthError::EditRejected(out)
@@ -581,16 +631,34 @@ fn commit_file_op(
                     source: e,
                 })?;
             }
-            crate::util::atomic_create_bytes_no_replace(path, content.as_bytes()).map_err(|e| {
-                if e.kind() == std::io::ErrorKind::AlreadyExists {
-                    create_target_exists_error(path)
-                } else {
-                    TilthError::IoError {
+            let created = crate::util::atomic_create_bytes_no_replace(path, content.as_bytes());
+            match created {
+                Ok(()) => {}
+                // A file that this session created and nothing changed since
+                // is the agent's own: overwrite it. Any other file stays.
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::AlreadyExists
+                        && session
+                            .created_unchanged(&crate::edit::normalize_path_key(path), live) =>
+                {
+                    crate::util::atomic_write_bytes(path, content.as_bytes()).map_err(|e| {
+                        TilthError::IoError {
+                            path: path.to_path_buf(),
+                            source: e,
+                        }
+                    })?;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(create_target_exists_error(path));
+                }
+                Err(e) => {
+                    return Err(TilthError::IoError {
                         path: path.to_path_buf(),
                         source: e,
-                    }
+                    });
                 }
-            })?;
+            }
+            session.note_created(&crate::edit::normalize_path_key(path), content);
             ctx.cache
                 .invalidate_spellings(path, &canonical_or_raw(path));
             session.record_read(path);
@@ -616,6 +684,8 @@ fn commit_file_op(
             })?;
             ctx.cache.invalidate_spellings(path, &canonical);
             session.invalidate_snapshot(&canonical);
+            session.forget_written(&crate::edit::normalize_path_key(&canonical));
+            session.forget_written(&crate::edit::normalize_path_key(path));
             Ok(format!(
                 "## {}\nremoved{suffix}",
                 crate::format::display_path(path)
@@ -661,6 +731,7 @@ fn commit_file_op(
             ctx.cache
                 .invalidate_spellings(&dest, &canonical_or_raw(&dest));
             session.relocate_snapshot(&canonical_src, &dest);
+            session.forget_written(&crate::edit::normalize_path_key(&canonical_src));
             Ok(format!(
                 "## {}\nmoved{suffix} → {}",
                 crate::format::display_path(path),
@@ -1258,40 +1329,53 @@ mod tests {
     fn other_refusals_show_no_lines_and_stay_refused() {
         let calls = Calls::read_head();
         let source = calls.text();
-        let rewrite = json!({"op": "rewrite", "pattern": "foo($A)", "rewrite": "bar($A)"});
-        let on_call =
-            json!({"op": "replace", "start": 41, "end": 41, "content": "    bar(x) + y\n"});
-        let cases = [
-            (
-                "a line op on an undisplayed line",
-                json!([on_call]),
-                "never displayed",
-            ),
-            (
-                "a single-match replace_text",
-                json!([{"op": "replace_text", "old": "let x =  7;", "new": "let x = 70;"}]),
-                "never displayed",
-            ),
-            (
-                "a count mismatch",
-                json!([{"op": "replace_text", "old": "foo(x) + y", "new": "bar(x) + y", "count": 5}]),
-                "expected 5 matches",
-            ),
-            (
-                "a rewrite beside a line op on an undisplayed line",
-                json!([rewrite, {"op": "replace", "start": 12, "end": 12, "content": "}\n"}]),
-                "never displayed",
-            ),
-            (
-                "a rewrite beside a line op inside an unseen match",
-                json!([rewrite, on_call]),
-                "never displayed",
-            ),
-        ];
+        let cases = [(
+            "a count mismatch",
+            json!([{"op": "replace_text", "old": "foo(x) + y", "new": "bar(x) + y", "count": 5}]),
+            "expected 5 matches",
+        )];
         for (case, ops, expected) in cases {
             eprintln!("case: {case}");
             calls.assert_stays_refused(&ops, &source, expected);
         }
+    }
+
+    #[test]
+    fn a_refused_line_op_is_held_and_the_empty_ops_confirm_applies_it() {
+        let calls = Calls::read_head();
+        let source = calls.text();
+        let ops = json!([{"op": "replace", "start": 41, "end": 41, "content": "    bar(x) + y"}]);
+        let refusal = calls.write(&ops).unwrap_err();
+        assert!(refusal.contains("never displayed"), "{refusal}");
+        assert!(refusal.contains("\"ops\":[]"), "{refusal}");
+        assert!(numbered(&refusal).contains(&(41, CALL)), "{refusal}");
+        assert_eq!(calls.text(), source, "a refusal writes nothing");
+        calls
+            .write(&json!([]))
+            .expect("the confirm applies the held edit");
+        let mut rows: Vec<&str> = source.split('\n').collect();
+        rows[40] = "    bar(x) + y";
+        assert_eq!(calls.text(), rows.join("\n"));
+        let again = calls.write(&json!([])).unwrap_err();
+        assert!(
+            again.contains("no held edit") || again.contains("changed"),
+            "{again}"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_beside_a_line_op_on_an_undisplayed_line_shows_both_and_confirms() {
+        let calls = Calls::read_head();
+        let source = calls.text();
+        let rewrite = json!({"op": "rewrite", "pattern": "foo($A)", "rewrite": "bar($A)"});
+        let ops = json!([rewrite, {"op": "replace", "start": 12, "end": 12, "content": "}\n"}]);
+        let refusal = calls.write(&ops).unwrap_err();
+        assert!(!numbered(&refusal).is_empty(), "{refusal}");
+        assert_eq!(calls.text(), source, "a refusal writes nothing");
+        calls
+            .write(&json!([]))
+            .expect("the confirm applies the held edit");
+        assert_ne!(calls.text(), source);
     }
 
     #[test]
@@ -2869,13 +2953,13 @@ mod tests {
         );
     }
 
-    /// More than 20 sections is rejected at the batch cap before any apply.
+    /// More than 50 sections is rejected at the batch cap before any apply.
     #[test]
-    fn batch_over_twenty_sections_rejected() {
+    fn batch_over_fifty_sections_rejected() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let (session, bloom) = services();
-        let sections: Vec<Value> = (0..21)
+        let sections: Vec<Value> = (0..51)
             .map(|i| {
                 json!({
                     "path": format!("f{i}.rs"),
@@ -2889,8 +2973,8 @@ mod tests {
             &session,
             &bloom,
         )
-        .expect_err("21 sections must exceed the cap");
-        assert!(err.contains("20 sections"), "must name the cap: {err}");
+        .expect_err("51 sections must exceed the cap");
+        assert!(err.contains("50 sections"), "must name the cap: {err}");
     }
 
     #[test]
