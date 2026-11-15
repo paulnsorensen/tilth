@@ -4474,8 +4474,7 @@ mod tests {
                 .session
                 .snapshots()
                 .by_tag(path, tag)
-                .map(|s| s.seen_lines.into_iter().collect())
-                .unwrap_or_default(),
+                .map_or_default(|s| s.seen_lines.into_iter().collect()),
         }
     }
 

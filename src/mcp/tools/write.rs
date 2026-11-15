@@ -1244,8 +1244,7 @@ mod tests {
                 .session
                 .snapshots()
                 .by_tag(&key, tag)
-                .map(|snap| snap.seen_lines)
-                .unwrap_or_default()
+                .map_or_default(|snap| snap.seen_lines)
         };
         let before = seen();
         let ops = json!([{"op": "rewrite", "pattern": "foo($A)", "rewrite": "bar($A)"}]);
