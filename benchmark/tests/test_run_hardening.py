@@ -254,6 +254,8 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
     monkeypatch.setitem(run.OPENCODE_CONFIGS, "runner_test_mode", "/controlled/opencode.json")
     monkeypatch.setattr(run, "get_repo_path", lambda _: tmp_path)
     monkeypatch.setattr(run, "_tilth_version", lambda: "test-version")
+    monkeypatch.setattr(run, "_codex_catalog_file", lambda: tmp_path / "catalog.json")
+    monkeypatch.setattr(run, "check_codex_tool_surface", lambda *_a, **_k: None)
     monkeypatch.setenv("SENTINEL_SECRET", "do-not-forward")
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setattr(run, "TILTH_BIN", "/opt/tilth/bin/tilth")
@@ -357,9 +359,10 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
         assert not any(arg.startswith("approval_policy=") for arg in cmd)
         assert "skill_search" in cmd and "skip_host_skill_discovery" in cmd
         instructions = next(arg for arg in cmd if arg.startswith("developer_instructions="))
-        assert "Use tilth MCP first" in instructions
+        assert "Use tilth MCP for source discovery, reads, and writes" in instructions
         assert "Batch independent files" in instructions
-        assert "Native tools remain available" in instructions
+        assert "there is no patch tool" in instructions
+        assert "Native tools remain available" not in instructions
         assert cmd[-1] == task.prompt
         assert result["successful_tilth_mcp_calls"] == 1
     else:
@@ -409,14 +412,15 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
 
 
 
-def test_codex_selection_rejects_non_codex_models_and_forced_mode():
+def test_codex_selection_defaults_to_baseline_and_the_tilth_only_arm():
     assert run.select_models("all", "codex") == [name for name in run.MODELS if run.RUNNERS[name] == "codex"]
     assert run.select_models(None, "codex") == ["gpt5"]
-    assert run.select_modes(None, "codex") == ["baseline", "tilth"]
+    assert run.select_modes(None, "codex") == ["baseline", "tilth_forced"]
+    assert run.select_modes("tilth_forced", "codex") == ["tilth_forced"]
     with pytest.raises(ValueError, match="not a codex model"):
         run.select_models("sonnet", "codex")
-    with pytest.raises(ValueError, match="tilth_forced"):
-        run.select_modes("tilth_forced", "codex")
+    with pytest.raises(ValueError, match="modes"):
+        run.select_modes("tilth", "codex")
 
 
 def test_all_claude_models_skip_pinned_names():
@@ -488,6 +492,8 @@ def test_codex_config_escapes_paths_and_preserves_auth_home(
         return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(map(json.dumps, events)), stderr="")
 
     monkeypatch.setattr(run.subprocess, "run", fake_run)
+    monkeypatch.setattr(run, "_codex_catalog_file", lambda: tmp_path / "catalog.json")
+    monkeypatch.setattr(run, "check_codex_tool_surface", lambda *_a, **_k: None)
     home = tmp_path / 'home "quoted"'
     skill = home / ".agents" / "skills" / "my skill" / "SKILL.md"
     skill.parent.mkdir(parents=True)
@@ -562,14 +568,14 @@ def test_codex_invalid_cell_aborts_schedule(monkeypatch: pytest.MonkeyPatch, tmp
     fake_tilth.write_text("#!/bin/sh\necho 'tilth 0.0.0'\n")
     fake_tilth.chmod(0o755)
     monkeypatch.setattr(run, "TILTH_BIN", str(fake_tilth))
-    monkeypatch.setitem(run.MODES, "tilth", replace(run.MODES["tilth"], binary_path=str(fake_tilth)))
+    monkeypatch.setitem(run.MODES, "tilth_forced", replace(run.MODES["tilth_forced"], binary_path=str(fake_tilth)))
     calls = []
     def invalid(*_args, **_kwargs):
         calls.append(1)
         raise run.InvalidCodexCellError("no successful tilth call")
     monkeypatch.setattr(run, "run_single", invalid)
     monkeypatch.setattr(sys, "argv", ["run.py", "--runner", "codex", "--models", "luna56",
-        "--tasks", "invalid_task", "--modes", "tilth", "--reps", "2", "--max-cells", "2", "--max-usd", "100"])
+        "--tasks", "invalid_task", "--modes", "tilth_forced", "--reps", "2", "--max-cells", "2", "--max-usd", "100"])
     with pytest.raises(SystemExit) as error:
         run.main()
     assert error.value.code == 1
@@ -940,6 +946,7 @@ def test_experiment_scheduler_randomizes_matched_blocks_and_records_order(
             "2",
             "--max-cells",
             "6",
+            "--no-strict-file-tools",
             "--max-usd",
             "100",
         ],
@@ -991,7 +998,7 @@ def test_claude_runtime_options_and_local_tilth_config(
 ) -> None:
     monkeypatch.setitem(run.TASKS, "claude_options_task", _RunnerTask())
     monkeypatch.setattr(run, "TILTH_BIN", "/release/tilth")
-    monkeypatch.setitem(run.MODES, "tilth", replace(run.MODES["tilth"], binary_path="/release/tilth"))
+    monkeypatch.setitem(run.MODES, "tilth_forced", replace(run.MODES["tilth_forced"], binary_path="/release/tilth"))
     captured = {}
     events = [{"type": "system", "subtype": "init", "apiKeySource": "none", "tools": ["mcp__tilth__tilth_read"]},
               {"type": "result", "subtype": "success", "is_error": False, "total_cost_usd": 0.01}]
@@ -1000,7 +1007,7 @@ def test_claude_runtime_options_and_local_tilth_config(
         return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(map(json.dumps, events)), stderr="")
     monkeypatch.setattr(run.subprocess, "run", fake_run)
     monkeypatch.setattr(run, "_tilth_version", lambda *_args: "test-version")
-    result = run._run_single_in_repo("claude_options_task", "tilth", "sonnet5", 0, tmp_path,
+    result = run._run_single_in_repo("claude_options_task", "tilth_forced", "sonnet5", 0, tmp_path,
                                      bare=True, reasoning_effort="high", max_budget_usd=2.5)
     cmd = captured["cmd"]
     assert cmd[cmd.index("--effort") + 1] == "high"
@@ -1199,7 +1206,7 @@ def test_legacy_arm_seed_and_local_binary_identity(
     binary.chmod(0o755)
     config = tmp_path / "mcp.json"
     config.write_text(json.dumps({"mcpServers": {"tilth": {"command": "tilth"}}}))
-    monkeypatch.setitem(run.MODES, "tilth", replace(run.MODES["tilth"],
+    monkeypatch.setitem(run.MODES, "tilth_forced", replace(run.MODES["tilth_forced"],
                         mcp_config_path=str(config), binary_path=str(binary), binary_sha256=None))
     monkeypatch.setitem(run.TASKS, "seed_task", _RunnerTask())
     monkeypatch.setattr(run, "SYNTHETIC_REPO", source)
@@ -1213,23 +1220,23 @@ def test_legacy_arm_seed_and_local_binary_identity(
                 "output_tokens": 1, "total_cost_usd": 0.0, "duration_ms": 1}
     monkeypatch.setattr(run, "run_single", fake_run_single)
     monkeypatch.setattr(sys, "argv", ["run.py", "--tasks", "seed_task", "--models", "sonnet5",
-                        "--modes", "baseline,tilth", "--reps", "2", "--max-cells", "4",
-                        "--arm-order-seed", "42", "--max-budget-usd", "2.5", "--max-usd", "100"])
+                        "--modes", "baseline,tilth_forced", "--reps", "2", "--max-cells", "4",
+                        "--no-strict-file-tools", "--arm-order-seed", "42", "--max-budget-usd", "2.5", "--max-usd", "100"])
     run.main()
     rows = [json.loads(line) for line in next((tmp_path / "results").glob("benchmark_*.jsonl")).read_text().splitlines()]
     for repetition in range(2):
-        expected = run.randomized_arm_order(["baseline", "tilth"], seed=42,
+        expected = run.randomized_arm_order(["baseline", "tilth_forced"], seed=42,
                     task="seed_task", model="sonnet5", repetition=repetition)
         assert [mode for mode, rep, budget in seen if rep == repetition] == expected
     assert all(budget == 2.5 for _, _, budget in seen)
     assert all(row["arm_order_seed"] == 42 and row["max_budget_usd"] == 2.5 for row in rows)
-    assert run.MODES["tilth"].binary_sha256 == hashlib.sha256(binary.read_bytes()).hexdigest()
-    assert next(row for row in rows if row["mode"] == "tilth")["variant"]["binary_sha256"] == run.MODES["tilth"].binary_sha256
+    assert run.MODES["tilth_forced"].binary_sha256 == hashlib.sha256(binary.read_bytes()).hexdigest()
+    assert next(row for row in rows if row["mode"] == "tilth_forced")["variant"]["binary_sha256"] == run.MODES["tilth_forced"].binary_sha256
 
 
 @pytest.mark.parametrize("mode_name,expected_tools", [
     ("baseline", "Read,Edit,Write,Grep,Glob,Bash"),
-    ("tilth", "Bash"),
+    ("tilth_forced", "Bash"),
     ("wozcode", "Bash"),
 ])
 def test_strict_file_tools_configures_equal_mcp_restrictions(
@@ -1262,7 +1269,7 @@ def test_strict_file_tools_configures_equal_mcp_restrictions(
     entry = settings["hooks"]["PreToolUse"][0]
     assert entry["matcher"] == "Bash"
     expected_binary, expected_hint = (
-        (run.MODES["tilth"].binary_path, "tilth") if mode_name == "tilth" else (str(hook), "native"))
+        (run.MODES["tilth_forced"].binary_path, "tilth") if mode_name == "tilth_forced" else (str(hook), "native"))
     assert entry["hooks"] == [{"type": "command", "command": expected_binary,
                                "args": ["hook", "--hint", expected_hint], "onFailure": "block"}]
     assert result["strict_file_tools"] is True
@@ -1409,12 +1416,12 @@ def test_tilth_arm_key_includes_candidate_identity(monkeypatch: pytest.MonkeyPat
     monkeypatch.setitem(run.TASKS, "identity_task", _RunnerTask())
     monkeypatch.setattr(run, "cli_version", lambda _runner: "2.1.0")
     monkeypatch.setattr(run, "env_fingerprint", lambda _repo: "env-fingerprint-a")
-    candidate = replace(run.MODES["tilth"], git_sha="a" * 40, binary_sha256="b" * 64)
-    monkeypatch.setitem(run.MODES, "tilth", candidate)
-    first = run.cell_identity("identity_task", "tilth", "sonnet5", 0, bare=False, reasoning_effort=None,
+    candidate = replace(run.MODES["tilth_forced"], git_sha="a" * 40, binary_sha256="b" * 64)
+    monkeypatch.setitem(run.MODES, "tilth_forced", candidate)
+    first = run.cell_identity("identity_task", "tilth_forced", "sonnet5", 0, bare=False, reasoning_effort=None,
                               max_budget_usd=1.0, strict_file_tools=False)
-    monkeypatch.setitem(run.MODES, "tilth", replace(candidate, binary_sha256="c" * 64))
-    second = run.cell_identity("identity_task", "tilth", "sonnet5", 0, bare=False, reasoning_effort=None,
+    monkeypatch.setitem(run.MODES, "tilth_forced", replace(candidate, binary_sha256="c" * 64))
+    second = run.cell_identity("identity_task", "tilth_forced", "sonnet5", 0, bare=False, reasoning_effort=None,
                                max_budget_usd=1.0, strict_file_tools=False)
 
     assert first["run_key"] != second["run_key"]

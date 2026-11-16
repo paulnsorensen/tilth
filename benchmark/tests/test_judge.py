@@ -125,7 +125,7 @@ def rollout(directory: Path, index: int = 0, **fields: object) -> tuple[dict, st
             "output": LONG_OUTPUT + f" ROLLOUT[{index:02d}]", "is_error": False}
     sidecar.write_text(json.dumps(call) + "\n")
     row = {
-        "task": "rg_search_dispatch", "mode": "tilth", "model": "claude-sonnet-5", "repetition": index,
+        "task": "rg_search_dispatch", "mode": "tilth_forced", "model": "claude-sonnet-5", "repetition": index,
         "num_turns": 3, "num_tool_calls": 1, "tool_calls": {"Bash": 1}, "total_cost_usd": 0.12,
         "duration_ms": 900, "result_text": f"Final answer ROLLOUT[{index:02d}]\nIt is \"ReadByLine\" AGENT_GT",
         "correct": True, "pass_rate": 1.0, "f2p_passed": 3, "f2p_output": "SECRET_GT f2p output",

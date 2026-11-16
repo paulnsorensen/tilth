@@ -452,8 +452,12 @@ class InvalidCodexCellError(RuntimeError):
     """A Codex cell broke benchmark isolation or did not use required MCP."""
 
 
+_CODEX_FILE_ITEMS = frozenset({"file_change", "file_edit", "file_write"})
+
+
 def _validate_codex_stream(
     raw: str, require_tilth: bool, skill_paths: list[str], skill_roots: list[str],
+    *, tilth_only: bool = False,
 ) -> int:
     successful = 0
     for line in raw.splitlines():
@@ -465,7 +469,9 @@ def _validate_codex_stream(
         item = event.get("item")
         if not isinstance(item, dict):
             continue
-        if item.get("type") in {"command_execution", "mcp_tool_call", "file_change", "file_edit", "file_write"}:
+        if tilth_only and item.get("type") in _CODEX_FILE_ITEMS:
+            raise InvalidCodexCellError(f"Codex tilth-only arm used a native file tool: {item.get('type')}")
+        if item.get("type") in {"command_execution", "mcp_tool_call", *_CODEX_FILE_ITEMS}:
             tool_input = str({key: item.get(key) for key in ("command", "arguments", "changes", "file_path")})
             aliases = (".agents/skills/", ".codex/skills/", "$CODEX_HOME/skills/")
             if any(path in tool_input for path in (*skill_paths, *skill_roots, *aliases)):
@@ -1163,8 +1169,11 @@ def _command_template(
         return [f"unbuildable: {error}"]
     # The digest records max_budget_usd on its own; the budget format must not change the key.
     # The system prompt keys the preamble text, so its content-addressed file path does not.
+    # The catalog keys by its content hash, which the file name carries; the results dir path stays out.
     return [_BUDGET_PLACEHOLDER if cmd[i - 1] == "--max-budget-usd"
             else _PREAMBLE_PLACEHOLDER if part.startswith(_PREAMBLE_KEY)
+            else _CODEX_CATALOG_PLACEHOLDER.format(sha=Path(json.loads(part[len(_CODEX_CATALOG_KEY):])).stem)
+            if part.startswith(_CODEX_CATALOG_KEY)
             else part for i, part in enumerate(cmd)]
 
 
@@ -1391,10 +1400,100 @@ _CODEX_GUIDANCE = (
     "Batch independent source reads in one call when the tool supports it."
 )
 _CODEX_TILTH_GUIDANCE = (
-    " Use tilth MCP first for source discovery, reads, and writes. "
+    " Use tilth MCP for source discovery, reads, and writes. "
     "Batch independent files into one tilth call. "
-    "Use shell only for tests and builds. Native tools remain available."
+    "Use shell only for directory listing, git, tests, and builds. "
+    "The shell denies file reads and writes, and there is no patch tool."
 )
+_CODEX_HOOK_TIMEOUT_S = 30
+_CODEX_CATALOG_KEY = "model_catalog_json="
+_CODEX_CATALOG_PLACEHOLDER = _CODEX_CATALOG_KEY + "<catalog:{sha}>"
+
+
+def _write_content_addressed(path: Path, data: bytes) -> Path:
+    if not path.is_file() or path.read_bytes() != data:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        partial = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        partial.write_bytes(data)
+        partial.replace(path)
+    return path
+
+
+@functools.lru_cache(maxsize=1)
+def _codex_catalog_file() -> Path:
+    """A copy of ``codex debug models`` with ``apply_patch`` off and the plain shell tool on.
+
+    The ``include_apply_patch_tool`` feature and ``tools.apply_patch`` settings do not remove the tool;
+    only a catalog with ``apply_patch_tool_type`` null does. ``tool_mode`` ``default`` keeps the shell a
+    top-level tool, so the PreToolUse hook sees it. The file is content-addressed: its hash keys the cells.
+    """
+    with tempfile.TemporaryDirectory() as home:
+        try:
+            proc = subprocess.run(
+                ["codex", "debug", "models"], capture_output=True, text=True, timeout=60,
+                env={"PATH": os.environ.get("PATH", ""), "HOME": home, "CODEX_HOME": home},
+            )
+        except (OSError, subprocess.SubprocessError) as error:
+            raise RuntimeError(f"codex debug models failed: {error}") from error
+    if proc.returncode != 0:
+        raise RuntimeError(f"codex debug models failed with code {proc.returncode}: {proc.stderr.strip()}")
+    catalog = json.loads(proc.stdout)
+    for model in catalog["models"]:
+        model["apply_patch_tool_type"] = None
+        model["tool_mode"] = "default"
+    data = json.dumps(catalog, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return _write_content_addressed(
+        RESULTS_DIR / "configs" / "codex-catalogs" / f"catalog-{hashlib.sha256(data).hexdigest()}.json", data,
+    )
+
+
+def _codex_hook_config(tilth_bin: object) -> str:
+    """The inline ``hooks.PreToolUse`` value that runs the tilth shell guard on every Bash call."""
+    command = json.dumps(f"{shlex.quote(str(tilth_bin))} hook --host codex --hint tilth")
+    return (
+        'hooks.PreToolUse=[{matcher = "^Bash$", hooks = [{type = "command", '
+        f"command = {command}, timeout = {_CODEX_HOOK_TIMEOUT_S}}}]}}]"
+    )
+
+
+_CODEX_PROMPT_INPUT_FLAGS = frozenset({"-c", "--enable", "--disable"})
+
+
+def _codex_prompt_input_argv(cmd: list[str]) -> list[str]:
+    """``codex debug prompt-input`` with the configuration flags of an exec argv, minus the exec-only ones."""
+    out = ["codex", "debug", "prompt-input"]
+    flags = iter(cmd[2:cmd.index("--")])
+    for flag in flags:
+        if flag in _CODEX_PROMPT_INPUT_FLAGS:
+            out += [flag, next(flags)]
+        elif flag == "-m":
+            out += ["-c", f"model={json.dumps(next(flags))}"]
+        elif flag == "--sandbox":
+            next(flags)
+    return [*out, "--", "preflight"]
+
+
+def _codex_tool_names(tools: list) -> set[str]:
+    names: set[str] = set()
+    for tool in tools:
+        if isinstance(tool, dict):
+            if isinstance(tool.get("name"), str):
+                names.add(tool["name"])
+            names |= _codex_tool_names(tool.get("tools") or [])
+    return names
+
+
+def check_codex_tool_surface(cmd: list[str], env: Mapping[str, str], cwd: Path) -> set[str]:
+    """Render a tilth-only Codex argv's prompt input with no model call and refuse a native patch tool."""
+    proc = subprocess.run(
+        _codex_prompt_input_argv(cmd), capture_output=True, text=True, timeout=60, env=dict(env), cwd=str(cwd),
+    )
+    if proc.returncode != 0:
+        raise InvalidCodexCellError(f"codex debug prompt-input failed with code {proc.returncode}: {proc.stderr.strip()}")
+    names = _codex_tool_names(json.loads(proc.stdout)[0].get("tools") or [])
+    if "apply_patch" in names or "exec_command" not in names:
+        raise InvalidCodexCellError(f"Codex tilth-only tool surface is wrong: {sorted(names)}")
+    return names
 
 
 def _codex_command(
@@ -1411,7 +1510,8 @@ def _codex_command(
         "--ignore-user-config", "--ignore-rules",
         "--sandbox", "workspace-write",
         "--enable", "skip_host_skill_discovery",
-        "--disable", "skill_search", "--disable", "plugins", "--disable", "hooks",
+        "--disable", "skill_search", "--disable", "plugins",
+        *([] if mode.mcp_config_path else ["--disable", "hooks"]),
         "--disable", "apps", "--disable", "multi_agent",
         "--disable", "skill_mcp_dependency_install",
         "-m", model_id,
@@ -1440,6 +1540,9 @@ def _codex_command(
     if mode.mcp_config_path:
         tilth_bin = mode.binary_path or TILTH_BIN
         cmd += [
+            "--dangerously-bypass-hook-trust",
+            "-c", f"{_CODEX_CATALOG_KEY}{json.dumps(str(_codex_catalog_file()))}",
+            "-c", _codex_hook_config(tilth_bin),
             "-c", f"mcp_servers.tilth.command={json.dumps(str(tilth_bin))}",
             "-c", 'mcp_servers.tilth.args=["--mcp", "--edit"]',
             "-c", "mcp_servers.tilth.required=true",
@@ -1603,8 +1706,6 @@ def _runner_command(
     model_id = MODELS[model_name]
     runner = RUNNERS[model_name]
     if runner == "codex":
-        if mode_name == "tilth_forced":
-            raise ValueError("Codex cannot enforce tilth_forced tool restrictions")
         cmd = _codex_command(
             task, mode, model_id, repo_path,
             reasoning_effort=reasoning_effort, skill_paths=skill_paths,
@@ -1693,6 +1794,8 @@ def _run_single_in_repo(
     )
     if runner == "claude":
         cmd = [resolve_claude_binary(), *cmd[1:]]
+    if runner == "codex" and mode.mcp_config_path:
+        check_codex_tool_surface(cmd, env, repo_path)
     cmd = _host_runner_argv(cmd, env, agent_venv)
     if claude_config_dir is not None:
         env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
@@ -1817,6 +1920,7 @@ def _run_single_in_repo(
     if runner == "codex":
         codex_tilth_calls = _validate_codex_stream(
             result.stdout, bool(mode.mcp_config_path), skill_paths, skill_roots,
+            tilth_only=bool(mode.mcp_config_path),
         )
 
     run_result.task_name = task_name
@@ -1963,12 +2067,24 @@ def select_models(value: str | None, runner: str | None) -> list[str]:
     return parse_comma_list(requested, aliases, "models")
 
 
+def resolve_strict_file_tools(requested: bool | None, models: list[str]) -> bool:
+    """Strict file tools default on for Claude and never apply to Codex or opencode.
+
+    Codex enforces its own tilth-only arm (no patch tool, hooked shell); opencode has no tool allowlist.
+    """
+    claude = [RUNNERS[model] == "claude" for model in models]
+    if requested is None:
+        if any(claude) and not all(claude):
+            raise ValueError("mixed Claude and non-Claude models: pass --no-strict-file-tools (strict is Claude-only)")
+        return all(claude)
+    if requested and not all(claude):
+        raise ValueError("--strict-file-tools requires Claude models")
+    return requested
+
+
 def select_modes(value: str | None, runner: str | None) -> list[str]:
-    """Codex cannot enforce the Claude-only forced tool arm."""
-    modes = parse_comma_list(value or ("baseline,tilth" if runner == "codex" else "all"), MODES, "modes")
-    if runner == "codex" and "tilth_forced" in modes:
-        raise ValueError("tilth_forced is not supported by the codex runner")
-    return modes
+    """The stock arm and the tilth-only arm, on every runner that can enforce it."""
+    return parse_comma_list(value or ("baseline,tilth_forced" if runner == "codex" else "all"), MODES, "modes")
 
 
 def parse_comma_list(value: str, valid_options: dict, name: str) -> list[str]:
@@ -2260,13 +2376,9 @@ def _base_prompt(mode: ModeConfig) -> str:
 def _preamble_file(text: str) -> Path:
     """A content-addressed copy of ``text`` under the results dir, for Codex's ``model_instructions_file``."""
     data = text.encode("utf-8")
-    path = RESULTS_DIR / "configs" / "preambles" / f"preamble-{hashlib.sha256(data).hexdigest()}.md"
-    if not path.is_file() or path.read_bytes() != data:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        partial = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-        partial.write_bytes(data)
-        partial.replace(path)
-    return path
+    return _write_content_addressed(
+        RESULTS_DIR / "configs" / "preambles" / f"preamble-{hashlib.sha256(data).hexdigest()}.md", data,
+    )
 
 
 def planned_identity(cell: CellSpec, *, max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
@@ -2703,8 +2815,6 @@ def _select_arms(args: argparse.Namespace, models: list[str], timestamp: str) ->
         }
         MODES.update(configured_modes)
         modes = [variant.name for variant in experiment.variants]
-        if args.runner == "codex" and "tilth_forced" in modes:
-            raise ValueError("tilth_forced is not supported by the codex runner")
     elif args.modes_json:
         modes = load_modes_json(args.modes_json, preamble_sha=args.candidate_sha)
         if any(RUNNERS[model] != "claude" for model in models) and any(
@@ -2712,7 +2822,7 @@ def _select_arms(args: argparse.Namespace, models: list[str], timestamp: str) ->
         ):
             raise ValueError("--modes-json skill and prompt_mode arms require Claude models")
     else:
-        requested_modes = args.modes or ("baseline,tilth,wozcode" if args.wozcode_plugin_dir else None)
+        requested_modes = args.modes or ("baseline,tilth_forced,wozcode" if args.wozcode_plugin_dir else None)
         modes = select_modes(requested_modes, args.runner)
         if "wozcode" in modes and not args.wozcode_plugin_dir:
             raise ValueError("wozcode mode requires --wozcode-plugin-dir")
@@ -2820,7 +2930,7 @@ def _main(argv: Optional[list[str]], held: ExitStack):
         epilog="""
 Examples:
   python run.py --experiment benchmark/experiments/upstream-fork.json --models sonnet --reps 5 --max-usd 40
-  python run.py --models haiku --reps 1 --tasks find_definition --modes baseline,tilth --max-usd 1
+  python run.py --models haiku --reps 1 --tasks find_definition --modes baseline,tilth_forced --max-usd 1
         """,
     )
 
@@ -2849,9 +2959,14 @@ Examples:
         help="Shuffle legacy arms deterministically inside each task/model/repetition block",
     )
     parser.add_argument(
-        "--strict-file-tools", action="store_true",
-        help="Give MCP arms only Bash and MCP tools; allow Bash only for Go checks and gofmt",
+        "--strict-file-tools", dest="strict_file_tools", action="store_true",
+        help="Give MCP arms only hooked Bash and MCP tools (the default for Claude models)",
     )
+    parser.add_argument(
+        "--no-strict-file-tools", dest="strict_file_tools", action="store_false",
+        help="Run Claude cells without the Bash file-tool hook; every cell key then changes",
+    )
+    parser.set_defaults(strict_file_tools=None)
     parser.add_argument(
         "--reps",
         type=int,
@@ -3002,8 +3117,7 @@ Examples:
     panel = None
     try:
         models = select_models(args.models, args.runner)
-        if args.strict_file_tools and any(RUNNERS[model] != "claude" for model in models):
-            raise ValueError("--strict-file-tools requires Claude models")
+        args.strict_file_tools = resolve_strict_file_tools(args.strict_file_tools, models)
         if args.reasoning_effort is not None and any(RUNNERS[model] == "opencode" for model in models):
             raise ValueError("--reasoning-effort is not supported by OpenCode")
         if args.wozcode_plugin_dir:

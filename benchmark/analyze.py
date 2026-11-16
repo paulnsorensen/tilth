@@ -153,13 +153,12 @@ def format_delta(baseline_val: float, tilth_val: float) -> str:
     return f"{sign}{pct_change:.0f}%"
 
 
-MODE_ORDER = ["no_tilth", "upstream", "fork", "baseline", "tilth", "tilth_forced"]
+MODE_ORDER = ["no_tilth", "upstream", "fork", "baseline", "tilth_forced"]
 MODE_LABELS = {
     "no_tilth": "no_tilth",
     "upstream": "upstream",
     "fork": "fork",
     "baseline": "baseline",
-    "tilth": "tilth-added",
     "tilth_forced": "tilth-only",
 }
 

@@ -42,7 +42,7 @@ def hook_source(monkeypatch: pytest.MonkeyPatch) -> dict:
 # --- model name: the key hashes the configured model string, not the short name ---
 
 
-@pytest.mark.parametrize("mode", ["baseline", "tilth"])
+@pytest.mark.parametrize("mode", ["baseline", "tilth_forced"])
 def test_pinned_name_keys_like_the_legacy_id(monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     """`sonnet46` keys exactly as the old `sonnet` -> claude-sonnet-4-6 cells, so it reuses their rows."""
     monkeypatch.setitem(run.MODELS, "legacy_sonnet", "claude-sonnet-4-6")
@@ -62,17 +62,17 @@ def test_codex_developer_instructions_feed_the_key(monkeypatch: pytest.MonkeyPat
 
 
 def test_codex_tilth_instructions_feed_the_tilth_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    before = _key(mode="tilth", model="luna56")
+    before = _key(mode="tilth_forced", model="luna56")
     monkeypatch.setattr(run, "_CODEX_TILTH_GUIDANCE", " Use tilth for everything.")
 
-    assert _key(mode="tilth", model="luna56") != before
+    assert _key(mode="tilth_forced", model="luna56") != before
 
 
 def test_disallowed_tools_feed_the_strict_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    before = _key(mode="tilth", strict=True)
+    before = _key(mode="tilth_forced", strict=True)
     monkeypatch.setattr(run, "_STRICT_NATIVE_FILE_TOOLS", run._STRICT_NATIVE_FILE_TOOLS - {"LS"})
 
-    assert _key(mode="tilth", strict=True) != before
+    assert _key(mode="tilth_forced", strict=True) != before
 
 
 def test_strict_bash_settings_feed_the_strict_key(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -152,14 +152,14 @@ def test_any_runner_command_change_feeds_the_key(monkeypatch: pytest.MonkeyPatch
 
 
 def test_command_template_normalizes_repo_and_binary_paths(monkeypatch: pytest.MonkeyPatch) -> None:
-    candidate = replace(run.MODES["tilth"], binary_path="/builds/one/tilth", git_sha="a" * 40,
+    candidate = replace(run.MODES["tilth_forced"], binary_path="/builds/one/tilth", git_sha="a" * 40,
                         binary_sha256="b" * 64)
-    monkeypatch.setitem(run.MODES, "tilth", candidate)
-    first = {model: _key(mode="tilth", model=model) for model in ("sonnet5", "luna56")}
-    monkeypatch.setitem(run.MODES, "tilth", replace(candidate, binary_path="/builds/two/tilth"))
+    monkeypatch.setitem(run.MODES, "tilth_forced", candidate)
+    first = {model: _key(mode="tilth_forced", model=model) for model in ("sonnet5", "luna56")}
+    monkeypatch.setitem(run.MODES, "tilth_forced", replace(candidate, binary_path="/builds/two/tilth"))
 
-    assert {model: _key(mode="tilth", model=model) for model in ("sonnet5", "luna56")} == first
-    template = run._command_template(StoreTask(), candidate, "tilth", "luna56", bare=False,
+    assert {model: _key(mode="tilth_forced", model=model) for model in ("sonnet5", "luna56")} == first
+    template = run._command_template(StoreTask(), candidate, "tilth_forced", "luna56", bare=False,
                                      reasoning_effort=None, max_budget_usd=1.0, strict_file_tools=False)
     assert not any("/builds/" in arg for arg in template)
 
@@ -170,11 +170,11 @@ def test_command_template_normalizes_repo_and_binary_paths(monkeypatch: pytest.M
 def test_mcp_server_args_feed_the_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     mcp_config = tmp_path / "tilth_mcp.json"
     mcp_config.write_text(json.dumps({"mcpServers": {"tilth": {"command": "tilth", "args": ["--mcp", "--edit"]}}}))
-    monkeypatch.setitem(run.MODES, "tilth", replace(run.MODES["tilth"], mcp_config_path=str(mcp_config)))
-    before = _key(mode="tilth")
+    monkeypatch.setitem(run.MODES, "tilth_forced", replace(run.MODES["tilth_forced"], mcp_config_path=str(mcp_config)))
+    before = _key(mode="tilth_forced")
     mcp_config.write_text(json.dumps({"mcpServers": {"tilth": {"command": "tilth", "args": ["--mcp"]}}}))
 
-    assert _key(mode="tilth") != before
+    assert _key(mode="tilth_forced") != before
 
 
 def test_task_ground_truth_feeds_the_key(monkeypatch: pytest.MonkeyPatch) -> None:

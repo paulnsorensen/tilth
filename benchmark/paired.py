@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 import stats
 
 BASELINE_MODE = "baseline"
-TILTH_MODE = "tilth"
+TILTH_MODE = "tilth_forced"
 
 
 # Legacy rows have no `model_alias` field and stored the short name as `model`.

@@ -67,12 +67,19 @@ binary's prompt surface is in question.**
 
 The September benchmark adds explicit Codex isolation and a forward-migration grader, documented in [Tool Efficiency Report: tilth versus WOZCODE](sources/tilth-versus-wozcode-2026-09.md).[^sept-harness]
 These are properties of the extracted harness commit, not claims that every installed runner supports them.
-Codex scheduling rejects other providers and `tilth_forced` before inference.
+Codex scheduling rejects other providers before inference.
+As of the tilth-only arm, `tilth_forced` runs on Codex too.
 The runner disables discovered skills explicitly; `skip_host_skill_discovery` alone is insufficient in CLI 0.154.0.
-It disables skill search, plugins, hooks, apps, and delegation for the measured invocation.
+It disables skill search, plugins, apps, and delegation for the measured invocation.
+The baseline also disables hooks. The tilth-only arm keeps a hooked shell instead (see below).
 The tilth server is required. A missing successful MCP call or detected skill-access attempt invalidates the run.
 Codex lacks Claude's init inventory, so an empty `available_tools` field does not prove MCP absence.
-The tilth arm retains native tools and receives explicit MCP-first guidance.
+The tilth-only arm has no `apply_patch`: the harness copies `codex debug models` with `apply_patch_tool_type=null` and `tool_mode="default"` and passes it as `-c model_catalog_json=<path>`.
+Its shell stays but runs behind an inline `hooks.PreToolUse` that calls `tilth hook --host codex --hint tilth`.
+Inline hooks need `--dangerously-bypass-hook-trust`; without it the hook never fires and `cat` runs.
+A zero-spend preflight (`codex debug prompt-input` with the same flags) must show no `apply_patch` tool before any cell runs.
+The built-in base instructions still say "use apply_patch" as text; only the `preamble` prompt mode replaces them.
+`benchmark/codex_probe.py` proves the hook denial against a mock Responses server with no model spend.
 Invocation-only write approval enables `tilth_write`; it neither changes global settings nor confines MCP paths.
 
 The small Luna selection uses two test-graded Gin repairs and excludes read-only, single-file, history-only, and keyword-graded tasks.

@@ -28,7 +28,7 @@ def test_power_readout_is_informational(
     rows = []
     for index, (baseline_correct, tilth_correct) in enumerate(pattern):
         rows.append(_row(f"t{index}", "baseline", baseline_correct))
-        rows.append(_row(f"t{index}", "tilth", tilth_correct))
+        rows.append(_row(f"t{index}", "tilth_forced", tilth_correct))
     results_file = tmp_path / "benchmark_fixture.jsonl"
     results_file.write_text("".join(json.dumps(row) + "\n" for row in rows))
     monkeypatch.setattr(sys, "argv", ["analyze.py", str(results_file)])
@@ -52,15 +52,15 @@ def _panel_rows() -> list[dict]:
     return [
         {**_row("fb_task", "baseline", True), **stamp, "contaminated": True, "total_cost_usd": 0.2},
         {**_row("fb_task", "baseline", True), **stamp, "contaminated": False, "total_cost_usd": 0.2},
-        {**_row("fb_task", "tilth", True), **stamp, "contaminated": False, "total_cost_usd": 0.2},
-        {**_row("fb_task", "tilth", False), **stamp, "contaminated": True, "total_cost_usd": 0.2},
+        {**_row("fb_task", "tilth_forced", True), **stamp, "contaminated": False, "total_cost_usd": 0.2},
+        {**_row("fb_task", "tilth_forced", False), **stamp, "contaminated": True, "total_cost_usd": 0.2},
     ]
 
 
 def _plain_rows() -> list[dict]:
     return [
         {**_row("plain_task", "baseline", True), "contaminated": True},
-        {**_row("plain_task", "tilth", True), "contaminated": False},
+        {**_row("plain_task", "tilth_forced", True), "contaminated": False},
     ]
 
 
@@ -70,7 +70,7 @@ def test_panel_contaminated_rows_count_incorrect(
     results = analyze.load_results(_write(tmp_path, _panel_rows()))
 
     baseline = [row for row in results if row["mode"] == "baseline"]
-    tilth = [row for row in results if row["mode"] == "tilth"]
+    tilth = [row for row in results if row["mode"] == "tilth_forced"]
     assert len(baseline) == 2 and len(tilth) == 2
     assert analyze.correctness_pct(baseline) == 50.0
     assert analyze.correctness_with_ci(baseline)[0] == 50.0
