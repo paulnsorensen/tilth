@@ -126,7 +126,7 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
             "properties": {
                 "edits": {
                     "type": "array",
-                    "description": "Up to 20 `{path, tag?, ops}` sections; copy read tags.",
+                    "description": "Up to 50 `{path, tag?, ops}` sections; copy read tags.",
                     "items": {
                         "type": "object",
                         "required": ["path", "ops"],

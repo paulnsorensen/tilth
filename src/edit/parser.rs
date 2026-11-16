@@ -105,6 +105,9 @@ pub enum Op {
 pub struct Section {
     pub path: String,
     pub tag: Option<u16>,
+    /// The id of a held edit that an empty-ops section confirms. Set only
+    /// when the wire `tag` is a hold token, in which case `tag` is `None`.
+    pub hold: Option<u32>,
     pub ops: Vec<Op>,
 }
 
@@ -479,6 +482,7 @@ pub fn parse_sections(input: &str) -> Result<Vec<Section>, ParseError> {
             current = Some(Section {
                 path,
                 tag,
+                hold: None,
                 ops: Vec::new(),
             });
             continue;

@@ -131,17 +131,17 @@ class UnseenMatchRefusal(unittest.TestCase):
         self.target.write_text(drifted)
         self.assert_stays_refused(server, tag, REWRITE, drifted, "file changed since the read")
 
-    def test_a_line_op_on_an_undisplayed_line_keeps_its_refusal(self):
+    def test_a_line_op_on_an_undisplayed_line_shows_it_and_the_same_call_applies(self):
         server = self.server()
-        op = {"op": "replace", "start": CALL_LINES[5], "end": CALL_LINES[5], "content": "    bar(x) + y\n"}
-        self.assert_stays_refused(server, self.tag(server), op, SOURCE, "never displayed")
-
-    def test_a_single_match_replace_text_keeps_its_refusal(self):
-        # A whitespace-normalized single match on an undisplayed line.
-        server = self.server()
-        op = {"op": "replace_text", "old": "let x =  7;", "new": "let x = 70;"}
-        self.assert_stays_refused(server, self.tag(server), op, SOURCE, "never displayed")
-
+        tag = self.tag(server)
+        line = CALL_LINES[5]
+        op = {"op": "replace", "start": line, "end": line, "content": "    bar(x) + y"}
+        refusal = self.assert_refused(self.write(server, tag, op))
+        self.assertIn("never displayed", refusal)
+        self.assertIn((line, CALL), self.shown(refusal, tag))
+        rows = SOURCE.split("\n")
+        rows[line - 1] = "    bar(x) + y"
+        self.assert_applied(self.write(server, tag, op), "\n".join(rows))
     def test_a_count_mismatch_keeps_its_refusal(self):
         server = self.server()
         op = {"op": "replace_text", "old": "foo(x) + y", "new": "bar(x) + y", "count": 5}
