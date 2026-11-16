@@ -57,7 +57,7 @@ pub fn format_tag(tag: u16) -> String {
 /// Parse a 4-hex tag back to `u16`. Case-insensitive; rejects non-hex or
 /// wrong-length input.
 pub fn parse_tag(raw: &str) -> Option<u16> {
-    if raw.len() != TAG_HEX_LEN {
+    if raw.len() != TAG_HEX_LEN || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     u16::from_str_radix(raw, 16).ok()
@@ -76,7 +76,7 @@ pub const HOLD_MASK: u32 = 0x0FFF_FFFF;
 /// shape, a 4-hex file tag included.
 pub fn parse_hold(raw: &str) -> Option<u32> {
     let digits = raw.strip_prefix(['H', 'h'])?;
-    if digits.len() != 7 {
+    if digits.len() != 7 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;
     }
     u32::from_str_radix(digits, 16).ok()
@@ -194,5 +194,19 @@ mod tests {
         assert_eq!(parse_tag("1A2B5"), None, "too long");
         assert_eq!(parse_tag("1A2G"), None, "non-hex");
         assert_eq!(parse_tag("1a2b"), Some(0x1a2b), "lowercase accepted");
+        assert_eq!(parse_tag("+1A2"), None, "sign rejected");
+    }
+
+    #[test]
+    fn parse_hold_takes_only_h_and_seven_hex_digits() {
+        assert_eq!(parse_hold(&format_hold(0x0ABC_DEF1)), Some(0x0ABC_DEF1));
+        assert_eq!(
+            parse_hold("h0abcdef"),
+            Some(0x00AB_CDEF),
+            "lowercase accepted"
+        );
+        assert_eq!(parse_hold("H+123456"), None, "sign rejected");
+        assert_eq!(parse_hold("H123456"), None, "too short");
+        assert_eq!(parse_hold("1A2B"), None, "a file tag is not a hold");
     }
 }

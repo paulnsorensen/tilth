@@ -165,7 +165,8 @@ class ConfirmHeldEdit(WriteCase):
 
     def test_the_file_tag_with_empty_ops_applies_nothing(self):
         self.refused(self.edit("f.rs", self.tag, REWRITE))
-        self.edit("f.rs", self.tag)
+        reply = self.applied(self.edit("f.rs", self.tag))
+        self.assertIn("no change", reply)
         self.assertEqual(self.text("f.rs"), SOURCE)
 
     def test_an_unchanged_resend_still_applies(self):
@@ -196,6 +197,18 @@ class ConfirmHeldEdit(WriteCase):
         self.assertEqual(self.text("f.rs"), landed)
         stale = self.refused(self.edit("f.rs", one))
         self.assertIn("changed", stale)
+        self.assertEqual(self.text("f.rs"), landed)
+
+    def test_the_older_of_two_holds_confirms_its_own_section(self):
+        first, second = CALL_LINES[3], CALL_LINES[8]
+        one = self.hold(self.refused(self.edit("f.rs", self.tag, self.line_op(first, "    one(x) + y"))))
+        two = self.hold(self.refused(self.edit("f.rs", self.tag, self.line_op(second, "    two(x) + y"))))
+        self.applied(self.edit("f.rs", one))
+        rows = SOURCE.split("\n")
+        rows[first - 1] = "    one(x) + y"
+        landed = "\n".join(rows)
+        self.assertEqual(self.text("f.rs"), landed)
+        self.assertIn("changed", self.refused(self.edit("f.rs", two)))
         self.assertEqual(self.text("f.rs"), landed)
 
     def test_a_hold_token_with_another_path_is_refused_and_stays_valid(self):
@@ -272,6 +285,7 @@ class ConfirmHeldEdit(WriteCase):
         self.assertEqual(max(shown), last, refusal)
         self.applied(self.edit("f.rs", self.hold(refusal)))
         past = self.refused(self.edit("f.rs", self.read_tag("f.rs", "1-5"), {"op": "insert_before", "line": last + 1, "content": "x"}))
+        self.assertIsNone(HOLD.search(past), past)
         self.assertEqual([n for n in re.findall(r"(?m)^(\d+):", past) if int(n) > last], [], past)
 
     def test_a_refusal_on_a_crlf_file_shows_rows_without_the_carriage_return(self):

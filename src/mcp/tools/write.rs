@@ -1618,10 +1618,11 @@ mod tests {
         let calls = Calls::read_head();
         let source = calls.text();
         let total = u32::try_from(source.lines().count()).unwrap();
-        let past = json!([{"op": "insert_before", "line": total + 1, "content": "x"}]);
-        let refusal = calls.write(&past).unwrap_err();
+        let last = json!([{"op": "replace", "start": total, "end": total, "content": "}"}]);
+        let refusal = calls.write(&last).unwrap_err();
+        assert_eq!(hold_tokens(&refusal).len(), 1, "{refusal}");
         let shown: Vec<u32> = numbered(&refusal).into_iter().map(|(n, _)| n).collect();
-        assert!(shown.iter().all(|&n| n <= total), "{refusal}");
+        assert_eq!(shown.iter().max(), Some(&total), "{refusal}");
         let key = crate::edit::normalize_path_key(&calls.path);
         let tag = crate::edit::tag::parse_tag(&calls.tag).unwrap();
         let seen = calls
