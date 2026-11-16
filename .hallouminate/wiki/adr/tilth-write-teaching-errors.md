@@ -262,6 +262,11 @@ Session 2026-08-02; spec at the durable corpus
 - **Verification:**
   - `tests/mcp_v2/test_write_friction.py`: 12 of its first 19 cases fail on `1c2ede71`.
   - Unit tests are in `src/session.rs`, `src/edit/apply.rs`, `src/edit/tag.rs`, and `src/mcp/tools/write.rs`.
-  - The Haiku check on the three hard tasks scored 9/9 (main: 8/9).[^write-friction]
+  - The Haiku check on the three hard tasks scored 9/9 (main: 8/9).
+  - Paid check (`f14b4638`, sonnet, strict tilth-only arm, 3 reps): five write-heavy goal 6 tasks with write failures (`express_edit_example_start`, `fastapi_edit_security_raise_on_missing`, `gin_edit_render_context`, `rg_edit_flow_migration`, `vuejs__core-11739`).
+    - Spend: $7.11.
+    - The mean per-task cost delta against the goal 6 baseline went from +3.6% (goal 6 tilth cells) to −2.1%. Most of the gain is `vuejs__core-11739`, which went from $0.538 to $0.420 per cell. The other four tasks moved within 3-rep noise.
+    - Failed writes fell from 23 of 132 calls to 13 of 112. The batch-cap, overlap, and create-exists classes did not recur. The rest were `old` not found, ambiguous matches, held seen-gate refusals, and malformed sections.
+    - Correct: 14 of 15. The goal 6 tilth and baseline cells passed 15 of 15. The miss is an `rg_edit_flow_migration` patch that did not compile.[^write-friction]
 
 [^write-friction]: `src/edit/apply.rs` (`nested_in_other_op`, `nested_drops`); `src/edit/recovery.rs` (`unseen_anchor_lines`); `src/mcp/tools/write.rs` (`show_unseen_matches`, `settle_shown`, `confirm_held`, `own_file_unchanged`); `src/session.rs` (`hold_edit`, `take_held_edit`, `note_created`); `src/edit/json.rs` (`lower_edits`). Decision: November 15, 2026, from the goal 6 write-failure analysis.
