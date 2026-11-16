@@ -25,7 +25,7 @@ def _key(task: str = "wiring_task", mode: str = "baseline", model: str = "sonnet
          bare: bool = False, strict: bool = False) -> str:
     return run.cell_identity(task, mode, model, 0, bare=bare, reasoning_effort=None,
                              max_budget_usd=1.0, strict_file_tools=strict,
-                             hook_sha="h" if strict else None)["run_key"]
+                             hook_sha="h")["run_key"]
 
 
 @pytest.fixture(autouse=True)

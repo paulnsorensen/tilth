@@ -6,6 +6,9 @@ called and no key is read. The report records the request's tool names, whether 
 ``cat``, and whether the ``ls`` ran.
 
     python benchmark/codex_probe.py --tilth-bin target/debug/tilth --out probe.json
+
+``run.py`` calls ``probe`` and ``problems`` once per run, before any paid Codex tilth-only cell, with the
+exact argv a cell uses and the one pinned hook binary.
 """
 
 import argparse
@@ -72,11 +75,16 @@ def _outputs(request: dict) -> list[str]:
     return [str(item.get("output")) for item in request.get("input", []) if item.get("type") == "function_call_output"]
 
 
-def probe(tilth_bin: Path, extra_flags: list[str], keep: Path | None) -> dict:
+def probe(mode: run.ModeConfig, hook_binary: Path | str, extra_flags: list[str], keep: Path | None) -> dict:
+    """Run the mock-provider cell for ``mode`` with ``hook_binary`` as its hook; return the report.
+
+    Raises ``HookProbeFailed`` first when the hook binary has no working ``hook`` subcommand, so a binary that
+    only prints a usage error (exit 2, which reads as a deny) never passes as an enforcing hook.
+    """
+    run._probe_hook(str(hook_binary), "tilth", host="codex")
     MockResponses.requests = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), MockResponses)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    mode = replace(run.MODES["tilth_forced"], binary_path=str(tilth_bin))
     with tempfile.TemporaryDirectory() as scratch:
         repo = Path(scratch) / "repo"
         repo.mkdir()
@@ -84,7 +92,8 @@ def probe(tilth_bin: Path, extra_flags: list[str], keep: Path | None) -> dict:
         home = Path(scratch) / "codex_home"
         home.mkdir()
         task = SimpleNamespace(prompt="Read hello.txt", hide_git=True)
-        cmd = run._codex_command(task, mode, "gpt-5.6-sol", repo, reasoning_effort=None, skill_paths=[])
+        cmd = run._codex_command(task, mode, "gpt-5.6-sol", repo, reasoning_effort=None, skill_paths=[],
+                              hook_binary=str(hook_binary))
         provider = [
             "-c", 'model_provider="mock"',
             "-c", 'model_providers.mock.name="mock"',
@@ -118,6 +127,7 @@ def probe(tilth_bin: Path, extra_flags: list[str], keep: Path | None) -> dict:
         "argv_has_catalog": any(part.startswith(run._CODEX_CATALOG_KEY) for part in argv),
         "argv_has_hook": any(part.startswith("hooks.PreToolUse=") for part in argv),
         "argv_disables_hooks": any(argv[i:i + 2] == ["--disable", "hooks"] for i in range(len(argv))),
+        "argv_enables_hooks": any(argv[i:i + 2] == ["--enable", "hooks"] for i in range(len(argv))),
         "extra_flags": extra_flags,
         "returncode": done.returncode,
         "preflight_tools": surface,
@@ -132,19 +142,36 @@ def probe(tilth_bin: Path, extra_flags: list[str], keep: Path | None) -> dict:
     }
 
 
+def problems(report: dict) -> list[str]:
+    """Name every way the probe report shows the hook or catalog not enforcing; empty means enforcing."""
+    found = []
+    if not report["argv_enables_hooks"] or report["argv_disables_hooks"]:
+        found.append("argv does not enable hooks")
+    if not report["cat_denied"]:
+        found.append("the hook did not deny a repo-file cat")
+    if report["secret_leaked"]:
+        found.append("a repo file's content reached the model")
+    if not report["ls_ran"]:
+        found.append("a benign command did not run")
+    if report["apply_patch_in_request"]:
+        found.append("apply_patch is in the request")
+    return found
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tilth-bin", type=Path, required=True)
+    parser.add_argument("--hook-bin", type=Path, help="hook binary; defaults to --tilth-bin")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--keep", type=Path, help="directory for the raw stream, stderr and request bodies")
     parser.add_argument("--extra", action="append", default=[], help="extra codex exec flag, repeatable")
     args = parser.parse_args()
-    report = probe(args.tilth_bin.resolve(), args.extra, args.keep)
+    tilth_bin = args.tilth_bin.resolve()
+    mode = replace(run.MODES["tilth_forced"], binary_path=str(tilth_bin))
+    report = probe(mode, (args.hook_bin or tilth_bin).resolve(), args.extra, args.keep)
     args.out.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
-    ok = (report["cat_denied"] and report["ls_ran"] and not report["apply_patch_in_request"]
-          and not report["secret_leaked"] and not report["argv_disables_hooks"])
-    return 0 if ok else 1
+    return 1 if problems(report) else 0
 
 
 if __name__ == "__main__":

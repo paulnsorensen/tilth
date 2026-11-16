@@ -53,7 +53,8 @@ def results(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 
 def _argv(mode: run.ModeConfig, model: str) -> list[str]:
     cmd, _ = run._runner_command(TASK, mode, mode.name, model, Path("/work/repo"), bare=True, reasoning_effort=None,
-                                 max_budget_usd=1.0, strict_file_tools=False, skill_paths=[])
+                                 max_budget_usd=1.0, strict_file_tools=False, skill_paths=[],
+                                 strict_hook_binary="/pinned/seed/tilth")
     return cmd
 
 
@@ -106,10 +107,11 @@ def test_codex_preamble_arm_sets_the_model_instructions_file(tree) -> None:
 
 def _identity(monkeypatch: pytest.MonkeyPatch, mode_name: str, model: str, text: str | None) -> dict:
     base = run.MODES[mode_name]
+    monkeypatch.setattr(run, "_hook_source_key", lambda _sha, _repo=None: "tree:lock")
     monkeypatch.setitem(run.MODES, mode_name, base if text is None else run.preamble_mode(base, text))
     try:
         return run.cell_identity("preamble_task", mode_name, model, 0, bare=True, reasoning_effort=None,
-                                 max_budget_usd=1.0, strict_file_tools=False)
+                                 max_budget_usd=1.0, strict_file_tools=False, hook_sha="seed")
     finally:
         monkeypatch.setitem(run.MODES, mode_name, base)
 

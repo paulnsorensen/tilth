@@ -256,6 +256,7 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
     monkeypatch.setattr(run, "_tilth_version", lambda: "test-version")
     monkeypatch.setattr(run, "_codex_catalog_file", lambda: tmp_path / "catalog.json")
     monkeypatch.setattr(run, "check_codex_tool_surface", lambda *_a, **_k: None)
+    install_fake_hook(monkeypatch, tmp_path)
     monkeypatch.setenv("SENTINEL_SECRET", "do-not-forward")
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setattr(run, "TILTH_BIN", "/opt/tilth/bin/tilth")
@@ -315,6 +316,7 @@ def test_run_single_uses_allowlisted_env_and_preserves_runner_flags(
         alias,
         0,
         bare=True,
+        **({"hook_sha": "seed"} if runner == "codex" else {}),
     )
 
     env = captured["env"]
@@ -500,10 +502,11 @@ def test_codex_config_escapes_paths_and_preserves_auth_home(
     skill.write_text("skill")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("CODEX_HOME", "/saved/codex")
-    run._run_single_in_repo("codex_quoted_task", "codex_quoted_mode", "gpt5", 0, tmp_path)
+    install_fake_hook(monkeypatch, tmp_path)
+    run._run_single_in_repo("codex_quoted_task", "codex_quoted_mode", "gpt5", 0, tmp_path, hook_sha="seed")
     assert "--skip-git-repo-check" in captured["cmd"]
     assert f"mcp_servers.tilth.command={json.dumps(quoted_bin)}" in captured["cmd"]
-    assert captured["env"]["CODEX_HOME"] == "/saved/codex"
+    assert captured["env"]["CODEX_HOME"] != "/saved/codex"
     skill_override = f'{{path={json.dumps(str(skill.resolve()))},enabled=false}}'
     assert any(skill_override in arg for arg in captured["cmd"])
     assert captured["env"]["HOME"] == str(home)
@@ -574,6 +577,8 @@ def test_codex_invalid_cell_aborts_schedule(monkeypatch: pytest.MonkeyPatch, tmp
         calls.append(1)
         raise run.InvalidCodexCellError("no successful tilth call")
     monkeypatch.setattr(run, "run_single", invalid)
+    install_fake_hook(monkeypatch, tmp_path)
+    monkeypatch.setattr(run, "preflight_codex_hooks", lambda *_a, **_k: None)
     monkeypatch.setattr(sys, "argv", ["run.py", "--runner", "codex", "--models", "luna56",
         "--tasks", "invalid_task", "--modes", "tilth_forced", "--reps", "2", "--max-cells", "2", "--max-usd", "100"])
     with pytest.raises(SystemExit) as error:

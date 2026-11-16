@@ -7,8 +7,17 @@ Automated evaluation of tilth's impact on AI agent code navigation.
 Use `--runner codex` to exclude Claude and OpenCode model calls.
 It defaults to `gpt5` (`gpt-5.6-sol`) and the `baseline,tilth_forced` arms.
 `--models all` selects only Codex models.
-The runner rejects other providers and `tilth_forced` before any model call.
-Codex cannot enforce the forced arm's tool restrictions.
+The runner rejects other providers before any model call.
+The `tilth_forced` arm enforces tilth-only mode on Codex with three parts.
+A model catalog override removes the patch tool.
+A `PreToolUse` hook runs one pinned `tilth hook`, built from the seed commit, never the arm's own binary, and denies shell file reads.
+The pin joins the run key as `hook_source_key`.
+Before the first paid cell, a zero-spend mock-provider probe (`benchmark/codex_probe.py`) runs the exact cell argv.
+It must show a denied repo-file `cat`, a benign command that runs, and no `apply_patch` in the request.
+After each cell, the runner replays every `command_execution` command through the hook and invalidates the cell as `hook_loosened` on any deny.
+Rows record `tool_restriction` (`codex-hook+catalog`), the catalog hash, and `codex_audited_commands`.
+Enforcement on a live provider is not verified; only the mock path proves it.
+Every Codex cell, baseline included, runs under a private `CODEX_HOME` that keeps saved authentication, so Codex run keys differ from earlier rows.
 
 Install and authenticate Codex CLI 0.154.0 (`codex login`).
 The [Codex non-interactive guide](https://learn.chatgpt.com/docs/non-interactive-mode) describes headless execution.
@@ -19,11 +28,11 @@ For synthetic tasks, run `python benchmark/fixtures/setup.py`.
 On a systemd host, exclude `/tmp/tilth_bench` from `/tmp` age cleanup once (see [Running benchmarks](#running-benchmarks)).
 Set `TILTH_BIN` to select a specific binary.
 The runner preserves saved Codex authentication and `CODEX_HOME`.
-It ignores user config and rules and disables skill search, plugins, hooks, apps, and multi-agent support.
+It ignores user config and rules and disables skill search, plugins, apps, and multi-agent support. It disables hooks except for the tilth-only arm, which enables its one pinned hook.
 It preserves `HOME`, `CODEX_HOME`, and saved authentication.
 It sets the disposable project to untrusted and omits project instructions.
 Both arms get the same task and guidance to batch independent reads.
-The tilth arm also gets explicit tilth-first guidance for source work. Native tools remain available.
+The tilth arm also gets explicit tilth-first guidance for source work. In a `tilth_forced` cell the hook denies native shell file reads and the catalog removes the patch tool; other tilth arms keep native tools.
 Each tilth arm configures only its selected MCP binary and requires at least one successful tilth MCP call.
 The Codex tilth arm approves only `tilth_write` through invocation-only tool configuration.
 Benchmark tasks target disposable repository copies. Native shell commands retain the `workspace-write` sandbox.
@@ -573,7 +582,7 @@ CLAUDE_CONFIG_DIR=/absolute/path/to/isolated/config \
 python benchmark/run.py \
   --tasks gin_edit_render_context --models sonnet5 --reasoning-effort high \
   --modes baseline,tilth_forced,wozcode --wozcode-plugin-dir /absolute/path/to/wozcode \
-  --reps 5 --max-cells 15 --max-budget-usd 10 --max-usd 150 --arm-order-seed 20260929 \
+  --reps 5 --max-cells 15 --max-budget-usd 10 --max-usd 150 --arm-order-seed 20260929
 
 # Claude runs are strict by default; pass --no-strict-file-tools to opt out
 python benchmark/run.py --tasks all --models haiku --reps 1 --modes tilth_forced --max-usd 20

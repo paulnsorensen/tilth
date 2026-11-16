@@ -342,6 +342,16 @@ def paired_report(
         )
 
 
+def warn_if_mode_absent(runs: list[dict], experiment_mode: str, out=None) -> bool:
+    """Warn on stderr when no row has ``experiment_mode``, listing the modes present; return whether it warned."""
+    present = sorted({str(run.get("mode")) for run in runs})
+    if any(run.get("mode") == experiment_mode for run in runs):
+        return False
+    print(f"warning: no rows have experiment mode {experiment_mode!r}; modes present: {', '.join(present) or 'none'}",
+          file=out or sys.stderr)
+    return True
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results_file", type=Path, help="JSONL results from run.py")
@@ -360,6 +370,7 @@ def main() -> None:
             run for run in runs
             if args.model in (run.get("model_alias"), run.get("model")) or model_label(run) == target_model
         ]
+    warn_if_mode_absent(runs, args.experiment_mode)
     paired_report(runs, args.experiment_mode, args.baseline_mode)
 
 

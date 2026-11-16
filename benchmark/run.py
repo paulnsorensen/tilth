@@ -790,11 +790,13 @@ def _hook_source_key(hook_sha: str, repo: Path | None = None) -> str:
     return _hook_source_key_at(full, str(repo))
 
 
-def _run_hook(binary: str, hint: str, command: str, timeout: float = 30) -> subprocess.CompletedProcess:
-    """Send one Bash pre-tool event to ``binary hook --hint <hint>``."""
+def _run_hook(binary: str, hint: str, command: str, timeout: float = 30,
+              host: str | None = None) -> subprocess.CompletedProcess:
+    """Send one Bash pre-tool event to ``binary hook [--host <host>] --hint <hint>``."""
     event = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
-    return subprocess.run([binary, "hook", "--hint", hint], input=event, capture_output=True, text=True,
-                          timeout=timeout)
+    host_args = ["--host", host] if host else []
+    return subprocess.run([binary, "hook", *host_args, "--hint", hint], input=event, capture_output=True,
+                          text=True, timeout=timeout)
 
 
 def run_hook(binary: str, hint: str, command: str, *, timeout: float = 30) -> subprocess.CompletedProcess:
@@ -821,10 +823,10 @@ def build_failure_detail(error: BaseException) -> str:
     return f"{error}\n{detail}".strip()
 
 
-def _hook_replay(hook_binary: str, command: str) -> bool:
+def _hook_replay(hook_binary: str, command: str, hint: str = "native", host: str | None = None) -> bool:
     """Replay one Bash command through the hook; exit 2 denies, 0 allows, anything else is an error."""
     try:
-        result = _run_hook(hook_binary, "native", command)
+        result = _run_hook(hook_binary, hint, command, host=host)
     except (OSError, subprocess.SubprocessError) as error:
         raise RuntimeError(f"strict audit could not run the hook {hook_binary}: {error}") from error
     if result.returncode not in (0, 2):
@@ -838,10 +840,10 @@ _PROBE_DENY = "cat src/lib.rs"
 _PROBE_HINT_TEXT = {"tilth": "tilth_read", "native": "Read tool"}
 
 
-def _probe_hook(binary: str, hint: str) -> None:
+def _probe_hook(binary: str, hint: str, host: str | None = None) -> None:
     for command, want_exit in ((_PROBE_ALLOW, 0), (_PROBE_DENY, 2)):
         try:
-            result = _run_hook(binary, hint, command)
+            result = _run_hook(binary, hint, command, host=host)
         except (OSError, subprocess.SubprocessError) as error:
             raise HookProbeFailed(f"strict hook probe could not run {binary}: {error}") from error
         problem = None
@@ -1164,6 +1166,8 @@ def _command_template(
             strict_file_tools=strict_file_tools, skill_paths=[],
             strict_hook_binary=_HOOK_BIN_PLACEHOLDER,
         )
+    except CodexCatalogError:
+        raise
     except (ValueError, RuntimeError) as error:
         # The cell fails when it runs; key it by the reason it cannot be built.
         return [f"unbuildable: {error}"]
@@ -1175,6 +1179,17 @@ def _command_template(
             else _CODEX_CATALOG_PLACEHOLDER.format(sha=Path(json.loads(part[len(_CODEX_CATALOG_KEY):])).stem)
             if part.startswith(_CODEX_CATALOG_KEY)
             else part for i, part in enumerate(cmd)]
+
+
+def _codex_hooked(runner: str, mode: ModeConfig) -> bool:
+    """A Codex tilth-only cell: its shell runs behind the pinned hook and its patch tool is off."""
+    return runner == "codex" and bool(mode.mcp_config_path)
+
+
+def _codex_telemetry(codex_hooked: bool) -> dict:
+    if not codex_hooked:
+        return {}
+    return {"tool_restriction": "codex-hook+catalog", "codex_catalog_sha256": _codex_catalog_sha()}
 
 
 def cell_identity(
@@ -1194,13 +1209,20 @@ def cell_identity(
 
     A strict cell needs ``hook_sha``, the commit (of ``hook_repo``, default this checkout) whose hook
     guards the baseline arm and replays every Bash call; its hook source key joins the harness digest.
+    Strict is per runner: only a Claude cell is strict. A Codex tilth-only cell always runs that same
+    pinned hook (never its arm's own binary), so it needs ``hook_sha`` too and records the hook source
+    key, ``tool_restriction`` and the catalog hash.
     """
-    if strict_file_tools and hook_sha is None:
-        raise ValueError("strict_file_tools requires hook_sha")
-    hook_source_key = _hook_source_key(hook_sha, hook_repo) if strict_file_tools else None
     task = TASKS[task_name]
     mode = MODES[mode_name]
     runner = RUNNERS[model_name]
+    strict_file_tools = strict_file_tools and runner == "claude"
+    codex_hooked = _codex_hooked(runner, mode)
+    if strict_file_tools and hook_sha is None:
+        raise ValueError("strict_file_tools requires hook_sha")
+    if codex_hooked and hook_sha is None:
+        raise ValueError("a Codex tilth-only cell requires hook_sha: it runs the pinned hook")
+    hook_source_key = _hook_source_key(hook_sha, hook_repo) if strict_file_tools or codex_hooked else None
     if strict_file_tools:
         tools = list(_STRICT_BASELINE_TOOLS) if not mode.mcp_config_path else ["Bash"]
     else:
@@ -1239,7 +1261,8 @@ def cell_identity(
         "max_budget_usd": max_budget_usd if runner == "claude" else None,
     }
     return {"run_key": baselines.run_key(key_inputs), **identity, **variant_flags,
-            **({"hook_source_key": hook_source_key} if strict_file_tools else {})}
+            **({"hook_source_key": hook_source_key} if hook_source_key else {}),
+            **_codex_telemetry(codex_hooked)}
 
 
 TRAJECTORY_RUNNERS = frozenset({"claude", "codex"})
@@ -1419,6 +1442,19 @@ def _write_content_addressed(path: Path, data: bytes) -> Path:
     return path
 
 
+class CodexCatalogError(RuntimeError):
+    """``codex debug models`` printed a payload this harness cannot edit; the Codex CLI changed shape."""
+
+
+def _codex_catalog_sha() -> str | None:
+    try:
+        return _codex_catalog_file().stem.removeprefix("catalog-")
+    except CodexCatalogError:
+        raise
+    except RuntimeError:
+        return None
+
+
 @functools.lru_cache(maxsize=1)
 def _codex_catalog_file() -> Path:
     """A copy of ``codex debug models`` with ``apply_patch`` off and the plain shell tool on.
@@ -1437,8 +1473,16 @@ def _codex_catalog_file() -> Path:
             raise RuntimeError(f"codex debug models failed: {error}") from error
     if proc.returncode != 0:
         raise RuntimeError(f"codex debug models failed with code {proc.returncode}: {proc.stderr.strip()}")
-    catalog = json.loads(proc.stdout)
-    for model in catalog["models"]:
+    try:
+        catalog = json.loads(proc.stdout)
+    except ValueError:
+        catalog = None
+    models = catalog.get("models") if isinstance(catalog, dict) else None
+    if not isinstance(models, list) or not models or not all(isinstance(model, dict) for model in models):
+        raise CodexCatalogError(
+            f"codex debug models printed an unexpected payload (codex {cli_version('codex')}): "
+            "want a JSON object with a non-empty `models` list of objects")
+    for model in models:
         model["apply_patch_tool_type"] = None
         model["tool_mode"] = "default"
     data = json.dumps(catalog, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -1483,10 +1527,66 @@ def _codex_tool_names(tools: list) -> set[str]:
     return names
 
 
-def check_codex_tool_surface(cmd: list[str], env: Mapping[str, str], cwd: Path) -> set[str]:
-    """Render a tilth-only Codex argv's prompt input with no model call and refuse a native patch tool."""
+class CodexHookLoosenedError(InvalidCodexCellError):
+    """A Codex tilth-only cell ran a shell command that the pinned hook denies."""
+
+
+def _audit_codex_commands(raw: str, hook_binary: str) -> int:
+    """Replay every ``command_execution`` of a Codex stream through the pinned hook; return the count.
+
+    A denied command emits no stream item. A command in the stream that the hook denies therefore ran
+    because the cell's own hook did not block it: a hook that crashes or times out does not block.
+    """
+    replayed = 0
+    for line in raw.splitlines():
+        if not line.strip():
+            continue
+        event = json.loads(line)
+        item = event.get("item") if event.get("type") == "item.completed" else None
+        if not isinstance(item, dict) or item.get("type") != "command_execution":
+            continue
+        command = item.get("command")
+        if not isinstance(command, str):
+            raise CodexHookLoosenedError("hook_loosened: a Codex command_execution item has no command text")
+        if _hook_replay(hook_binary, command, hint="tilth", host="codex"):
+            raise CodexHookLoosenedError(
+                f"hook_loosened: Codex tilth-only cell ran a command the hook denies: {command}")
+        replayed += 1
+    return replayed
+
+
+def check_codex_hook_live(mode: ModeConfig, hook_binary: str) -> None:
+    """Run the zero-spend mock-provider probe on one arm's real argv; raise when it does not enforce."""
+    # The probe imports ``run``; as a script this module is ``__main__``, so name it to avoid a second copy.
+    sys.modules.setdefault("run", sys.modules[__name__])
+    import codex_probe
+    found = codex_probe.problems(codex_probe.probe(mode, hook_binary, [], None))
+    if found:
+        raise InvalidCodexCellError(f"Codex hook live check failed for {mode.name}: {'; '.join(found)}")
+
+
+def preflight_codex_hooks(mode_names, hook_binary: str) -> None:
+    """Refuse a run, before any spend, when the pinned hook or a Codex tilth-only argv does not enforce.
+
+    The hook is probed with the Codex host flag first: a binary without a ``hook`` subcommand exits 2,
+    which looks like a deny, so the allow probe must see exit 0. Raises ``HookProbeFailed`` or
+    ``InvalidCodexCellError``.
+    """
+    _probe_hook(hook_binary, "tilth", host="codex")
+    for name in sorted(mode_names):
+        check_codex_hook_live(MODES[name], hook_binary)
+
+
+def check_codex_tool_surface(cmd: list[str], env: Mapping[str, str], cwd: Path,
+                             agent_venv: Path | None = None) -> set[str]:
+    """Render a tilth-only Codex argv's prompt input with no model call and refuse a native patch tool.
+
+    The argv resolves ``codex`` as the exec does. The goal tools appear only in the real request, not in
+    this rendering, so the live probe checks the request tools too.
+    """
     proc = subprocess.run(
-        _codex_prompt_input_argv(cmd), capture_output=True, text=True, timeout=60, env=dict(env), cwd=str(cwd),
+        _host_runner_argv(_codex_prompt_input_argv(cmd), env, agent_venv),
+        capture_output=True, text=True, timeout=60, env=dict(env), cwd=str(cwd),
     )
     if proc.returncode != 0:
         raise InvalidCodexCellError(f"codex debug prompt-input failed with code {proc.returncode}: {proc.stderr.strip()}")
@@ -1504,14 +1604,18 @@ def _codex_command(
     *,
     reasoning_effort: str | None,
     skill_paths: list[str],
+    hook_binary: str | None = None,
 ) -> list[str]:
+    """A tilth-only arm's shell runs behind ``hook_binary``, the one pinned seed hook, not the arm's binary."""
+    if mode.mcp_config_path and not hook_binary:
+        raise ValueError(f"mode '{mode.name}': a Codex tilth-only arm needs the pinned hook binary")
     cmd = [
         "codex", "exec", "--json", "--ephemeral",
         "--ignore-user-config", "--ignore-rules",
         "--sandbox", "workspace-write",
         "--enable", "skip_host_skill_discovery",
         "--disable", "skill_search", "--disable", "plugins",
-        *([] if mode.mcp_config_path else ["--disable", "hooks"]),
+        *(["--enable", "hooks"] if mode.mcp_config_path else ["--disable", "hooks"]),
         "--disable", "apps", "--disable", "multi_agent",
         "--disable", "skill_mcp_dependency_install",
         "-m", model_id,
@@ -1542,7 +1646,7 @@ def _codex_command(
         cmd += [
             "--dangerously-bypass-hook-trust",
             "-c", f"{_CODEX_CATALOG_KEY}{json.dumps(str(_codex_catalog_file()))}",
-            "-c", _codex_hook_config(tilth_bin),
+            "-c", _codex_hook_config(hook_binary),
             "-c", f"mcp_servers.tilth.command={json.dumps(str(tilth_bin))}",
             "-c", 'mcp_servers.tilth.args=["--mcp", "--edit"]',
             "-c", "mcp_servers.tilth.required=true",
@@ -1708,7 +1812,7 @@ def _runner_command(
     if runner == "codex":
         cmd = _codex_command(
             task, mode, model_id, repo_path,
-            reasoning_effort=reasoning_effort, skill_paths=skill_paths,
+            reasoning_effort=reasoning_effort, skill_paths=skill_paths, hook_binary=strict_hook_binary,
         )
         return cmd, None
     if runner == "opencode":
@@ -1721,7 +1825,13 @@ def _runner_command(
     return cmd, None
 
 
-def _run_single_in_repo(
+def _run_single_in_repo(*args, **kwargs) -> dict:
+    """Execute and grade one benchmark cell; a Codex cell runs under an isolated CODEX_HOME that the cell outlives."""
+    with ExitStack() as home_stack:
+        return _run_single_cell(*args, home_stack=home_stack, **kwargs)
+
+
+def _run_single_cell(
     task_name: str,
     mode_name: str,
     model_name: str,
@@ -1739,8 +1849,13 @@ def _run_single_in_repo(
     baseline: Path | None = None,
     chain_turn: bool = False,
     resume_session: str | None = None,
+    *,
+    home_stack: ExitStack,
 ) -> dict:
     """Execute and grade one benchmark cell.
+
+    A Codex cell enters ``isolated_codex_home`` on ``home_stack``: the stack closes after the run and the audit.
+    A Claude strict cell and a Codex tilth-only cell run the pinned hook built at ``hook_sha``.
 
     ``baseline`` is the workspace snapshot taken before the agent ran; without one the
     workspace diff is not measured.
@@ -1760,9 +1875,9 @@ def _run_single_in_repo(
         max_budget_usd=max_budget_usd, strict_file_tools=strict_file_tools,
         hook_sha=hook_sha, hook_repo=hook_repo,
     )
-    hook_binary = (
-        build_candidate(hook_sha, repo=hook_repo).binary_path if strict_file_tools and runner == "claude" else None
-    )
+    claude_strict = strict_file_tools and runner == "claude"
+    codex_hooked = _codex_hooked(runner, mode)
+    hook_binary = build_candidate(hook_sha, repo=hook_repo).binary_path if claude_strict or codex_hooked else None
 
     if runner == "codex":
         skill_paths = _codex_skill_paths(repo_path, os.environ)
@@ -1792,10 +1907,12 @@ def _run_single_in_repo(
         language=task.language,
         agent_venv=agent_venv,
     )
+    if runner == "codex":
+        home_stack.enter_context(isolated_codex_home(env, "tilth-bench-codex-"))
     if runner == "claude":
         cmd = [resolve_claude_binary(), *cmd[1:]]
-    if runner == "codex" and mode.mcp_config_path:
-        check_codex_tool_surface(cmd, env, repo_path)
+    if codex_hooked:
+        check_codex_tool_surface(cmd, env, repo_path, agent_venv)
     cmd = _host_runner_argv(cmd, env, agent_venv)
     if claude_config_dir is not None:
         env["CLAUDE_CONFIG_DIR"] = str(claude_config_dir)
@@ -1922,6 +2039,7 @@ def _run_single_in_repo(
             result.stdout, bool(mode.mcp_config_path), skill_paths, skill_roots,
             tilth_only=bool(mode.mcp_config_path),
         )
+    codex_audited = _audit_codex_commands(result.stdout, hook_binary) if codex_hooked else 0
 
     run_result.task_name = task_name
     run_result.mode_name = mode_name
@@ -1946,7 +2064,7 @@ def _run_single_in_repo(
 
     strict_denied_bash_calls = (
         _audit_strict_claude(result.stdout, mode, run_result.available_tools, hook_binary)
-        if strict_file_tools and runner == "claude" else 0
+        if claude_strict else 0
     )
 
     # Override duration if needed (subprocess timing may be more accurate)
@@ -1988,7 +2106,8 @@ def _run_single_in_repo(
         "resolved_model": run_result.resolved_model,
         **({"reasoning_effort": reasoning_effort} if reasoning_effort is not None else {}),
         **({"max_budget_usd": max_budget_usd} if runner == "claude" else {}),
-        **({"strict_file_tools": True, "strict_denied_bash_calls": strict_denied_bash_calls} if strict_file_tools else {}),
+        **({"strict_file_tools": True, "strict_denied_bash_calls": strict_denied_bash_calls} if claude_strict else {}),
+        **({"codex_audited_commands": codex_audited} if codex_hooked else {}),
         **({"successful_tilth_mcp_calls": codex_tilth_calls} if runner == "codex" else {}),
         "capability": task.capability,
         "source": task_source,
@@ -2068,18 +2187,15 @@ def select_models(value: str | None, runner: str | None) -> list[str]:
 
 
 def resolve_strict_file_tools(requested: bool | None, models: list[str]) -> bool:
-    """Strict file tools default on for Claude and never apply to Codex or opencode.
+    """Strict file tools default on whenever a Claude model runs; the cells of other runners are not strict.
 
-    Codex enforces its own tilth-only arm (no patch tool, hooked shell); opencode has no tool allowlist.
+    Strict applies per runner, so a mixed run needs no opt-out. A Codex tilth-only cell has its own
+    enforcement (no patch tool, pinned hook); opencode has no tool allowlist.
     """
-    claude = [RUNNERS[model] == "claude" for model in models]
-    if requested is None:
-        if any(claude) and not all(claude):
-            raise ValueError("mixed Claude and non-Claude models: pass --no-strict-file-tools (strict is Claude-only)")
-        return all(claude)
-    if requested and not all(claude):
-        raise ValueError("--strict-file-tools requires Claude models")
-    return requested
+    claude = any(RUNNERS[model] == "claude" for model in models)
+    if requested and not claude:
+        raise ValueError("--strict-file-tools requires a Claude model")
+    return claude if requested is None else requested
 
 
 def select_modes(value: str | None, runner: str | None) -> list[str]:
@@ -2467,20 +2583,25 @@ def run_plan(
 
     Raises ``CandidateBuildFailed`` when ``candidate_sha`` or ``hook_sha`` does not build, ``hook_sha`` has no
     ``src/hook``, or ``preamble`` finds no preamble file; its subclass ``HookProbeFailed`` when a strict hook binary fails the allow/deny probe.
-    Raises ``ValueError`` when ``strict_file_tools`` meets a non-Claude cell or a Claude CLI older than the
-    minimum for exec-form hooks.
+    Strict applies to the Claude cells only. Every Codex tilth-only cell runs the one hook built at ``hook_sha``
+    (the seed hook, never its arm's binary); before any paid cell, a mock-provider probe checks that argv.
+    Raises ``InvalidCodexCellError`` when that probe finds the hook or catalog not enforcing.
+    Raises ``ValueError`` when a strict or Codex tilth-only cell has no ``hook_sha``, or a Claude CLI is older than
+    the minimum for exec-form hooks.
     Raises ``BaselineDrift`` before any cell when a stock-arm cell drifted without ``refreeze_baselines``.
     Raises ``PlanStopped`` when the ledger or a usage limit stops it before a cell.
     """
     panel.register(TASKS)
     cells = [CellSpec(*cell) for cell in cells]
     _register_chains(cell.task for cell in cells)
-    if strict_file_tools:
+    claude_cells = [cell for cell in cells if RUNNERS[cell.model] == "claude"]
+    codex_hooked = any(_codex_hooked(RUNNERS[cell.model], MODES[cell.mode]) for cell in cells)
+    strict_file_tools = strict_file_tools and bool(claude_cells)
+    if strict_file_tools or codex_hooked:
         if hook_sha is None:
-            raise ValueError("strict_file_tools requires hook_sha")
-        if any(RUNNERS[cell.model] != "claude" for cell in cells):
-            raise ValueError("strict_file_tools requires Claude models")
-        if not store_only:
+            raise ValueError("strict_file_tools requires hook_sha" if strict_file_tools
+                             else "a Codex tilth-only cell requires hook_sha: it runs the pinned hook")
+        if strict_file_tools and not store_only:
             _require_strict_cli()
         try:
             _hook_source_key(hook_sha, repo)
@@ -2510,7 +2631,7 @@ def run_plan(
                 MODES[name] = preamble_mode(MODES[name], text)
     try:
         if strict_file_tools and not store_only:
-            probe_strict_hooks({cell.mode for cell in cells}, hook_binary)
+            probe_strict_hooks({cell.mode for cell in claude_cells}, hook_binary)
         return _run_plan(cells, panel=panel, ledger=ledger, refreeze_baselines=refreeze_baselines, output=output,
                          cell_estimate_usd=max_budget_usd if cell_estimate_usd is None else cell_estimate_usd,
                          max_budget_usd=max_budget_usd, store_only=store_only,
@@ -2535,6 +2656,9 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
             claude_auth_targets([(cell.task, cell.mode, cell.model) for cell, _ in pending], bare=True))
         if not refreeze_baselines:
             _refuse_baseline_drift(pending, history)
+        codex_modes = {cell.mode for cell, _ in pending if _codex_hooked(RUNNERS[cell.model], MODES[cell.mode])}
+        if codex_modes:
+            preflight_codex_hooks(codex_modes, build_candidate(hook_sha, repo=hook_repo).binary_path)
 
     rows: list[dict] = []
     run_max_cost: float | None = None
@@ -2642,8 +2766,8 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         try:
             result = run_single(cell.task, cell.mode, cell.model, cell.repetition, stream_log_path=stream_log_path,
                                 bare=True, max_budget_usd=cell_cap,
-                                **({"strict_file_tools": True, "hook_sha": hook_sha, "hook_repo": hook_repo}
-                                   if strict_file_tools else {}))
+                                **({"strict_file_tools": strict_file_tools, "hook_sha": hook_sha,
+                                    "hook_repo": hook_repo} if hook_sha is not None else {}))
         except InvalidCodexCellError as error:
             fail({"error": f"invalid_codex_cell: {error}", "correctness_reason": f"Invalid cell: {error}"})
             raise PlanStopped("invalid-cell", str(error), rows) from error
@@ -3158,7 +3282,8 @@ Examples:
     # Ad hoc, the baseline hook and the replay audit use this checkout's HEAD (the seed hook), even with
     # --candidate-sha: a candidate hook is audited against the seed hook, never against itself.
     hook_sha = None
-    if args.strict_file_tools:
+    codex_modes = {name for name in modes if any(_codex_hooked(RUNNERS[m], MODES[name]) for m in models)}
+    if args.strict_file_tools or codex_modes:
         try:
             hook_sha = _git("rev-parse", "--verify", "HEAD^{commit}", cwd=REPO_ROOT).strip()
             _hook_source_key(hook_sha)
@@ -3173,6 +3298,7 @@ Examples:
             probe_strict_hooks(modes, hook_binary)
         except HookProbeFailed as error:
             parser.error(f"strict hook probe failed, no cell ran: {error}")
+    codex_preflight = codex_modes
 
     # Filter tasks by repo
     if args.repos.lower() != "all":
@@ -3295,6 +3421,12 @@ Examples:
             )
         if drift:
             print(f"Refreezing {len(drift)} drifted baseline cell(s).")
+        # Zero spend: a mock provider, once per run, before the first paid cell.
+        if codex_preflight and any(_codex_hooked(RUNNERS[cell.model_name], MODES[cell.mode_name]) for cell in pending):
+            try:
+                preflight_codex_hooks(codex_preflight, hook_binary)
+            except (HookProbeFailed, InvalidCodexCellError) as error:
+                parser.error(f"Codex hook check failed, no cell ran: {error}")
 
     # Include the model in the filename when one process owns one model.
     model_suffix = f"_{models[0]}" if len(models) == 1 else ""
@@ -3479,7 +3611,7 @@ Examples:
                 "model_alias": model_name,
                 **({"reasoning_effort": args.reasoning_effort} if args.reasoning_effort is not None else {}),
                 **({"max_budget_usd": args.max_budget_usd} if runner == "claude" else {}),
-                **({"strict_file_tools": True} if args.strict_file_tools else {}),
+                **({"strict_file_tools": True} if args.strict_file_tools and runner == "claude" else {}),
                 "capability": task.capability,
                 "source": asdict(task.source),
                 "repetition": rep,
@@ -3504,15 +3636,13 @@ Examples:
                     reasoning_effort=args.reasoning_effort,
                     max_budget_usd=args.max_budget_usd,
                     strict_file_tools=args.strict_file_tools,
-                    **({"hook_sha": hook_sha} if args.strict_file_tools else {}),
+                    **({"hook_sha": hook_sha} if hook_sha is not None else {}),
                 )
                 result.update(experiment_metadata)
                 if args.reasoning_effort is not None:
                     result["reasoning_effort"] = args.reasoning_effort
                 if runner == "claude":
                     result["max_budget_usd"] = args.max_budget_usd
-                if args.strict_file_tools:
-                    result["strict_file_tools"] = True
                 result.update(cell.identity)
                 result["reused"] = False
                 result.setdefault("trajectory_path", None)

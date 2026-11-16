@@ -785,9 +785,9 @@ def report_rows() -> list[dict]:
                 "result_text": f"{task}-{mode}-{repetition}", "capability": "trace"}
     return [
         row("alpha", "baseline", 0, True, 1.0), row("alpha", "baseline", 1, False, 1.0),
-        row("alpha", "tilth", 0, True, 0.5), row("alpha", "tilth", 1, True, 0.5),
+        row("alpha", "tilth_forced", 0, True, 0.5), row("alpha", "tilth_forced", 1, True, 0.5),
         row("beta", "baseline", 0, True, 2.0), row("beta", "baseline", 1, True, 2.0),
-        row("beta", "tilth", 0, False, 3.0), row("beta", "tilth", 1, True, 3.0),
+        row("beta", "tilth_forced", 0, False, 3.0), row("beta", "tilth_forced", 1, True, 3.0),
     ]
 
 
@@ -826,7 +826,7 @@ def test_analyze_slices_by_label_when_calibrated(no_judge_calls: None) -> None:
     assert text.startswith("## Applicability\n")
     assert "| Label | Mode | Correctness | Cost/correct |" in text
     for label, task in (("strong", "alpha"), ("none", "beta")):
-        for mode in ("baseline", "tilth"):
+        for mode in ("baseline", "tilth_forced"):
             runs = [row for row in results if row["task"] == task and row["mode"] == mode]
             expected = (f"| {label} | {analyze.mode_label(mode)} | {analyze.correctness_pct(runs):.0f}% | "
                         f"{analyze._fmt_usd(analyze.cost_per_correct(runs)[0])} |")
