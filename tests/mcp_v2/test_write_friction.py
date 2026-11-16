@@ -393,6 +393,18 @@ class OwnFileEdits(WriteCase):
         self.refused(self.create("clobber\n"))
         self.assertEqual(self.text("n.txt"), merged)
 
+    def test_create_over_its_own_file_after_an_edit_under_a_partial_read_is_refused(self):
+        body = "".join(f"row {i}\n" for i in range(30))
+        self.applied(self.create(body))
+        (self.root / "n.txt").write_text(body.replace("row 25\n", "outside 25\n"))
+        tag = self.read_tag("n.txt", "1-5")
+        op = {"op": "replace", "start": 2, "end": 2, "content": "mine 1"}
+        self.applied(self.edit("n.txt", tag, op))
+        edited = self.text("n.txt")
+        self.assertIn("outside 25", edited)
+        self.refused(self.create("clobber\n"))
+        self.assertEqual(self.text("n.txt"), edited)
+
     def test_create_over_a_moved_file_is_refused_once_it_exists_again(self):
         self.applied(self.create("one\n"))
         self.applied(self.write({"path": "n.txt", "ops": [{"op": "move_file", "dest": "m.txt"}]}))
@@ -406,6 +418,46 @@ class OwnFileEdits(WriteCase):
         (self.root / "n.txt").write_text("one\n")
         self.refused(self.create("two\n"))
         self.assertEqual(self.text("n.txt"), "one\n")
+
+
+class HeldEditReceipts(WriteCase):
+    def test_a_no_op_receipt_reports_dropped_nested_matches(self):
+        (self.root / "a.txt").write_text("abc\n")
+        tag = self.read_tag("a.txt")
+        every = {"op": "replace_text", "old": "b", "new": "B", "all": True}
+        whole = {"op": "replace_text", "old": "abc", "new": "abc"}
+        receipt = self.applied(self.edit("a.txt", tag, every, whole))
+        self.assertIn("no change", receipt)
+        self.assertIn("1 nested match of op 1 left to op 2", receipt)
+        self.assertEqual(self.text("a.txt"), "abc\n")
+
+    def test_a_move_receipt_reports_dropped_nested_matches(self):
+        (self.root / "a.txt").write_text("abc\n")
+        tag = self.read_tag("a.txt")
+        every = {"op": "replace_text", "old": "b", "new": "B", "all": True}
+        whole = {"op": "replace_text", "old": "abc", "new": "xyz"}
+        move = {"op": "move_file", "dest": "b.txt"}
+        receipt = self.applied(self.edit("a.txt", tag, every, whole, move))
+        self.assertIn("moved", receipt)
+        self.assertIn("1 nested match of op 1 left to op 2", receipt)
+        self.assertEqual(self.text("b.txt"), "xyz\n")
+
+    def test_a_confirm_from_another_cwd_moves_to_the_original_destination(self):
+        sub = self.root / "sub"
+        sub.mkdir()
+        (sub / "f.rs").write_text(SOURCE)
+        tag = self.read_tag("sub/f.rs", "1-5")
+        edit = {"op": "replace", "start": CALL_LINES[5], "end": CALL_LINES[5], "content": "    bar(x) + y"}
+        move = {"op": "move_file", "dest": "moved.rs"}
+        refusal = self.refused(self.edit("sub/f.rs", tag, edit, move))
+        token = HOLD.search(refusal).group(1)
+        response = self.server.call(
+            "tilth_write",
+            {"cwd": str(sub), "edits": [{"path": "f.rs", "tag": token, "ops": []}]},
+        )
+        self.applied(response)
+        self.assertTrue((self.root / "moved.rs").exists())
+        self.assertFalse((sub / "moved.rs").exists())
 
 
 if __name__ == "__main__":

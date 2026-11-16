@@ -383,17 +383,23 @@ impl Session {
         }
     }
 
-    /// A tilth write left `key` holding `text`, with only content that the
-    /// agent authored or saw. A file that this session created stays tracked
-    /// at its new content. A held edit is stale by its file tag.
-    pub fn note_written(&self, key: &str, text: &str) {
-        if let Some(created) = self.write_memory().created.get_mut(key) {
-            created.digest = content_digest(text);
+    /// `key` was removed or moved away, or holds content that the agent did
+    /// not author.
+    /// Track `new_text` as the file's content after a write with no drift, but
+    /// only while the file matched what the session tracked before the write.
+    /// Otherwise the file holds lines the session never authored, so it stops
+    /// counting as created here. Held edits stay.
+    pub fn refresh_written(&self, key: &str, live: &str, new_text: &str) {
+        let mut memory = self.write_memory();
+        if let Some(created) = memory.created.get_mut(key) {
+            if created.digest == content_digest(live) {
+                created.digest = content_digest(new_text);
+            } else {
+                memory.created.remove(key);
+            }
         }
     }
 
-    /// `key` was removed or moved away, or holds content that the agent did
-    /// not author.
     pub fn forget_written(&self, key: &str) {
         let mut memory = self.write_memory();
         memory.held.retain(|(held, _), _| held != key);
@@ -1009,7 +1015,7 @@ mod tests {
     fn removing_a_file_drops_its_holds_and_a_write_keeps_them_for_the_tag_check() {
         let session = Session::new();
         session.hold_edit("/k", 1, 0x1234, held_section("k"));
-        session.note_written("/k", "new");
+        session.refresh_written("/k", "old", "new");
         assert!(session.has_held_edit("/k", 1));
         session.forget_written("/k");
         assert!(!session.has_held_edit("/k", 1));
@@ -1055,8 +1061,14 @@ mod tests {
         session.note_created("/k", "a");
         assert!(session.created_unchanged("/k", "a"));
         assert!(!session.created_unchanged("/k", "outside"));
-        session.note_written("/k", "b");
+        session.refresh_written("/k", "a", "b");
         assert!(session.created_unchanged("/k", "b"));
+        session.refresh_written("/k", "outside", "c");
+        assert!(
+            !session.created_unchanged("/k", "c"),
+            "a drifted file stops counting"
+        );
+        session.note_created("/k", "b");
         session.forget_written("/k");
         assert!(!session.created_unchanged("/k", "b"));
     }

@@ -256,17 +256,28 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
         resolve_edit(section, path, session, &live, ctx.cwd)
             .map_err(|e| show_unseen_matches(e, section, path, &live, ctx))?;
 
+    // Nested matches that an outer op consumed, for every receipt below.
+    let nested = if written.is_some() {
+        crate::edit::apply::nested_drops(path, &live, &section.ops)
+    } else {
+        Vec::new()
+    };
+
     // File ops take precedence over an in-place write.
     if let Some(op) = file_op {
-        return commit_file_op(&op, path, &new_text, &live, normalized, ctx);
+        let mut block = commit_file_op(&op, path, &new_text, &live, normalized, ctx)?;
+        push_nested_notes(&mut block, &nested);
+        return Ok(block);
     }
 
     // No-op guard: nothing changed.
     if new_text == live {
-        return Ok(format!(
+        let mut block = format!(
             "## {}\nno change (edit was a no-op)",
             crate::format::display_path(path)
-        ));
+        );
+        push_nested_notes(&mut block, &nested);
+        return Ok(block);
     }
 
     crate::util::atomic_write_bytes(path, new_text.as_bytes()).map_err(|e| {
@@ -279,20 +290,16 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
     ctx.cache.invalidate_alias(path, &canonical_or_raw(path));
     ctx.cache.update_after_write(path, &live, &new_text);
     session.record_read(path);
-    // A write with no drift holds only lines that the agent authored or saw.
-    // A merge can pull in an external change, so the file stops counting as
-    // one that the agent made.
+    // A write with no drift proves only that the tag matched the live file.
+    // Lines that the agent never authored or saw can still sit in it, so the
+    // file keeps counting as the agent's own only while it matched the digest
+    // that the session tracked before this write.
     let key = crate::edit::normalize_path_key(path);
     if written.is_some() {
-        session.note_written(&key, &new_text);
+        session.refresh_written(&key, &live, &new_text);
     } else {
         session.forget_written(&key);
     }
-    let nested = if written.is_some() {
-        crate::edit::apply::nested_drops(path, &live, &section.ops)
-    } else {
-        Vec::new()
-    };
 
     let (summary, mut seen_lines) = summarize_changes(&live, &new_text, written.as_ref());
     seen_lines.extend(carried_seen_lines(
@@ -327,7 +334,16 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
             );
         }
     }
-    for (op, dropped, outer) in nested {
+    push_nested_notes(&mut block, &nested);
+    if ctx.show_diff {
+        block.push_str(&render_bounded_diff(Some(&live), &new_text));
+    }
+    Ok(block)
+}
+
+/// Append one line per nested match that an outer op consumed.
+fn push_nested_notes(block: &mut String, nested: &[(usize, usize, usize)]) {
+    for &(op, dropped, outer) in nested {
         let noun = if dropped == 1 { "match" } else { "matches" };
         let _ = write!(
             block,
@@ -336,10 +352,21 @@ fn commit_section(section: &Section, path: &Path, ctx: &SectionCtx) -> Result<St
             outer + 1
         );
     }
-    if ctx.show_diff {
-        block.push_str(&render_bounded_diff(Some(&live), &new_text));
+}
+
+/// The held section with each relative `move_file` destination resolved
+/// against the refusing call's cwd, so a confirm from another cwd writes to
+/// the same place.
+fn anchor_destinations(section: &Section, cwd: &Path) -> Section {
+    let mut held = section.clone();
+    for op in &mut held.ops {
+        if let Op::Mv { dest } = op {
+            if let Ok(abs) = super::resolve_anchored(Path::new(dest.as_str()), cwd) {
+                *dest = abs.to_string_lossy().into_owned();
+            }
+        }
     }
-    Ok(block)
+    held
 }
 
 /// The provenance-teaching message for a `replace_text` `old` that did not
@@ -466,7 +493,7 @@ fn show_unseen_matches(
         path: path.to_path_buf(),
         text: live.to_string(),
         lines,
-        section: section.clone(),
+        section: anchor_destinations(section, ctx.cwd),
         tag,
         hold,
         fallback: error_block(path, &e),
