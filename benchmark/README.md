@@ -5,10 +5,19 @@ Automated evaluation of tilth's impact on AI agent code navigation.
 ## Codex headless benchmark
 
 Use `--runner codex` to exclude Claude and OpenCode model calls.
-It defaults to `gpt5` (`gpt-5.6-sol`) and the `baseline,tilth` arms.
+It defaults to `gpt5` (`gpt-5.6-sol`) and the `baseline,tilth_forced` arms.
 `--models all` selects only Codex models.
-The runner rejects other providers and `tilth_forced` before any model call.
-Codex cannot enforce the forced arm's tool restrictions.
+The runner rejects other providers before any model call.
+The `tilth_forced` arm enforces tilth-only mode on Codex with three parts.
+A model catalog override removes the patch tool.
+A `PreToolUse` hook runs one pinned `tilth hook`, built from the seed commit, never the arm's own binary, and denies shell file reads.
+The pin joins the run key as `hook_source_key`.
+Before the first paid cell, a zero-spend mock-provider probe (`benchmark/codex_probe.py`) runs the exact cell argv.
+It must show a denied repo-file `cat`, a benign command that runs, and no `apply_patch` in the request.
+After each cell, the runner replays every `command_execution` command through the hook and invalidates the cell as `hook_loosened` on any deny.
+Rows record `tool_restriction` (`codex-hook+catalog`), the catalog hash, and `codex_audited_commands`.
+Enforcement on a live provider is not verified; only the mock path proves it.
+Every Codex cell, baseline included, runs under a private `CODEX_HOME` that keeps saved authentication, so Codex run keys differ from earlier rows.
 
 Install and authenticate Codex CLI 0.154.0 (`codex login`).
 The [Codex non-interactive guide](https://learn.chatgpt.com/docs/non-interactive-mode) describes headless execution.
@@ -19,11 +28,11 @@ For synthetic tasks, run `python benchmark/fixtures/setup.py`.
 On a systemd host, exclude `/tmp/tilth_bench` from `/tmp` age cleanup once (see [Running benchmarks](#running-benchmarks)).
 Set `TILTH_BIN` to select a specific binary.
 The runner preserves saved Codex authentication and `CODEX_HOME`.
-It ignores user config and rules and disables skill search, plugins, hooks, apps, and multi-agent support.
+It ignores user config and rules and disables skill search, plugins, apps, and multi-agent support. It disables hooks except for the tilth-only arm, which enables its one pinned hook.
 It preserves `HOME`, `CODEX_HOME`, and saved authentication.
 It sets the disposable project to untrusted and omits project instructions.
 Both arms get the same task and guidance to batch independent reads.
-The tilth arm also gets explicit tilth-first guidance for source work. Native tools remain available.
+The tilth arm also gets explicit tilth-first guidance for source work. In a `tilth_forced` cell the hook denies native shell file reads and the catalog removes the patch tool; other tilth arms keep native tools.
 Each tilth arm configures only its selected MCP binary and requires at least one successful tilth MCP call.
 The Codex tilth arm approves only `tilth_write` through invocation-only tool configuration.
 Benchmark tasks target disposable repository copies. Native shell commands retain the `workspace-write` sandbox.
@@ -35,7 +44,7 @@ Run a bounded synthetic check without Claude calls:
 
 ```bash
 python benchmark/run.py --runner codex --tasks find_definition \
-  --models gpt5 --modes baseline,tilth --reps 1 --max-cells 2 --max-usd 2
+  --models gpt5 --modes baseline,tilth_forced --reps 1 --max-cells 2 --max-usd 2
 ```
 
 Run the curated, edit-only Luna 5.6 comparison at xhigh after setup and authentication:
@@ -44,7 +53,7 @@ Run the curated, edit-only Luna 5.6 comparison at xhigh after setup and authenti
 python benchmark/run.py --runner codex --models luna56 \
   --reasoning-effort xhigh \
   --tasks gin_edit_render_cascade,gin_edit_render_runtime \
-  --modes baseline,tilth --reps 3 --max-cells 12 --max-usd 40
+  --modes baseline,tilth_forced --reps 3 --max-cells 12 --max-usd 40
 ```
 
 This schedule has two tasks and 12 cells. Both tasks require cross-file repairs and use test-based grading.
@@ -163,7 +172,7 @@ A panel file may carry a top-level `"version": 2` (an integer; absent means vers
 
 ```bash
 python3 benchmark/run.py --panel benchmark/panels/gepa-v1.json --panel-split dev \
-  --models sonnet5 --modes baseline,tilth --reps 1 --max-usd 20
+  --models sonnet5 --modes baseline,tilth_forced --reps 1 --max-usd 20
 ```
 
 `panels.load_panel` is the only loader. It refuses these faults: an unknown key or family, a missing required member, and a hand-picked split. It also refuses a declared language that differs from the repo language or from `external.language_of` on the dataset row. It also refuses an external member that `external.preflight.admit` does not admit on this host.
@@ -295,7 +304,7 @@ Run three repetitions per arm, with no Claude calls:
 TILTH_BIN="$PWD/target/release/tilth" mise exec go@1.24.7 -- \
   python benchmark/run.py --runner codex --models luna56 \
   --reasoning-effort xhigh --tasks gin_edit_render_context \
-  --modes baseline,tilth --reps 3 --max-cells 6 --max-usd 20
+  --modes baseline,tilth_forced --reps 3 --max-cells 6 --max-usd 20
 ```
 
 This forward task retains Git metadata. Reference tests and solution files stay outside the candidate workspace.
@@ -475,11 +484,10 @@ v0.5.0 MCP instructions with top-weighted DO NOT rules reduced host tool usage t
 
 Each run invokes `claude -p` (Claude Code headless mode) with a code navigation question.
 
-**Three modes:**
+**Modes:**
 
 - **Baseline** — Claude Code built-in tools: Read, Edit, Grep, Glob, Bash
-- **tilth** — Built-in tools + tilth MCP server (hybrid mode)
-- **tilth_forced** — tilth MCP only; no built-in tools
+- **tilth_forced** — the tilth-only arm: tilth MCP only, no built-in file tools (Claude: strict by default; Codex: no `apply_patch`, hooked shell)
 - **wozcode** — Built-in tools + Woz Code plugin and its explicit MCP server; requires `--wozcode-plugin-dir`
 
 All selected modes use the same system prompt, model, and per-cell budget cap (default $1.00). The agent explores the codebase and returns a natural-language answer. Correctness is checked against ground-truth strings that must appear in the response.
@@ -564,7 +572,7 @@ python benchmark/run.py \
 # Legacy local A/B remains available for development checks
 python benchmark/run.py \
   --tasks fastapi_depends_processing,gin_middleware_chain \
-  --models sonnet --reps 1 --modes baseline,tilth --max-usd 5
+  --models sonnet --reps 1 --modes baseline,tilth_forced --max-usd 5
 
 # Local three-way Sonnet 5 comparison: one Gin renderer task, five matched repetitions.
 # Log in with claude /login or set CLAUDE_CODE_OAUTH_TOKEN outside this command. Use a dedicated CLAUDE_CONFIG_DIR;
@@ -573,19 +581,18 @@ TILTH_BIN=/absolute/path/to/target/release/tilth \
 CLAUDE_CONFIG_DIR=/absolute/path/to/isolated/config \
 python benchmark/run.py \
   --tasks gin_edit_render_context --models sonnet5 --reasoning-effort high \
-  --modes baseline,tilth,wozcode --wozcode-plugin-dir /absolute/path/to/wozcode \
-  --reps 5 --max-cells 15 --max-budget-usd 10 --max-usd 150 --arm-order-seed 20260929 \
-  --strict-file-tools
+  --modes baseline,tilth_forced,wozcode --wozcode-plugin-dir /absolute/path/to/wozcode \
+  --reps 5 --max-cells 15 --max-budget-usd 10 --max-usd 150 --arm-order-seed 20260929
 
-# Diagnostic only: remove built-in search tools and force the local tilth MCP
+# Claude runs are strict by default; pass --no-strict-file-tools to opt out
 python benchmark/run.py --tasks all --models haiku --reps 1 --modes tilth_forced --max-usd 20
 
 # Preamble arm: the tilth arms run with prompts/preamble.md as their system prompt
-python benchmark/run.py --tasks rg_search_dispatch --models haiku --reps 1 --modes baseline,tilth \
+python benchmark/run.py --tasks rg_search_dispatch --models haiku --reps 1 --modes baseline,tilth_forced \
   --preamble --max-usd 5
 ```
 
-`--strict-file-tools` gives the native arm Read, Edit, Write, Grep, Glob, and Bash. Both MCP arms get Bash and their own MCP tools, with no native file tools. All three arms guard Bash with `tilth hook` (exec form, `onFailure: block`, so a missing binary denies). A tilth arm runs its own binary with `hook --hint tilth`; the baseline runs the binary built at the hook commit with `hook --hint native`. The hook commit is the checkout's `HEAD` (the seed hook), even with `--candidate-sha`; `run_plan(strict_file_tools=True, hook_sha=...)` takes it explicitly. A strict run needs Claude CLI >= 2.1.295 (exec-form hooks and `onFailure: block`) and refuses an older one. The hook denies shell file reads, searches, and writes; see `src/hook`. Before any paid strict cell, the run probes every distinct hook binary (each tilth arm's binary with `--hint tilth`, the hook-commit build with `--hint native`) with one allow event (`go test ./...`, exit 0) and one deny event (`cat src/lib.rs`, exit 2, with the matching hint text). A binary that fails the probe, such as one built before `tilth hook` existed, refuses the run before any spend (`parser.error` in `run.py`, `HookProbeFailed` from `run_plan`). The wozcode arm has no native file tools, but its denials use `--hint native` and name them; read its denial text with that in mind. After each cell, the audit replays every Bash call through the hook binary built at the hook commit. A call that ran and that hook denies fails the cell as `hook_loosened`, whichever arm made it, so the seed hook is the floor for a candidate hook. This controls tool use, not code run by tests or MCP servers; it is not a security sandbox. Raw streams retain denied attempts, and result rows record `strict_file_tools`, `hook_source_key`, and the count of Bash calls that the hook-commit hook denies (a call that only a candidate hook denied is not counted).
+`--strict-file-tools` is the default for Claude runs (`--no-strict-file-tools` opts out; a mixed Claude and non-Claude run needs an explicit choice, and Codex and opencode never run strict). It gives the native arm Read, Edit, Write, Grep, Glob, and Bash. Both MCP arms get Bash and their own MCP tools, with no native file tools. All three arms guard Bash with `tilth hook` (exec form, `onFailure: block`, so a missing binary denies). A tilth arm runs its own binary with `hook --hint tilth`; the baseline runs the binary built at the hook commit with `hook --hint native`. The hook commit is the checkout's `HEAD` (the seed hook), even with `--candidate-sha`; `run_plan(strict_file_tools=True, hook_sha=...)` takes it explicitly. A strict run needs Claude CLI >= 2.1.295 (exec-form hooks and `onFailure: block`) and refuses an older one. The hook denies shell file reads, searches, and writes; see `src/hook`. Before any paid strict cell, the run probes every distinct hook binary (each tilth arm's binary with `--hint tilth`, the hook-commit build with `--hint native`) with one allow event (`go test ./...`, exit 0) and one deny event (`cat src/lib.rs`, exit 2, with the matching hint text). A binary that fails the probe, such as one built before `tilth hook` existed, refuses the run before any spend (`parser.error` in `run.py`, `HookProbeFailed` from `run_plan`). The wozcode arm has no native file tools, but its denials use `--hint native` and name them; read its denial text with that in mind. After each cell, the audit replays every Bash call through the hook binary built at the hook commit. A call that ran and that hook denies fails the cell as `hook_loosened`, whichever arm made it, so the seed hook is the floor for a candidate hook. This controls tool use, not code run by tests or MCP servers; it is not a security sandbox. Raw streams retain denied attempts, and result rows record `strict_file_tools`, `hook_source_key`, and the count of Bash calls that the hook-commit hook denies (a call that only a candidate hook denied is not counted).
 
 #### Preamble arm
 
@@ -630,7 +637,7 @@ To A/B the preamble appended to the stock prompt against the preamble that repla
 # stock prompt + appended preamble (tilth_stock becomes append_preamble)
 python benchmark/run.py --modes-json stock.json --preamble ...
 # the preamble replaces the system prompt (built-in tilth arm)
-python benchmark/run.py --modes tilth --preamble ...
+python benchmark/run.py --modes tilth_forced --preamble ...
 ```
 `run_plan(preamble=True)` is the same switch for library callers such as evolve.
 

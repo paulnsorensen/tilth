@@ -423,7 +423,7 @@ def test_a_stop_in_an_early_turn_skips_the_later_turns(fixture_repo, tmp_path) -
 def test_cells_keep_every_tilth_arm_and_skip_baseline(tmp_path) -> None:
     trajectory = tmp_path / "t.trajectory.jsonl"
     trajectory.write_text(json.dumps(read_call()) + "\n")
-    rows = [{"task": "synthetic", "mode": mode, "trajectory_path": str(trajectory)} for mode in ("baseline", "tilth", "tilth_forced")]
+    rows = [{"task": "synthetic", "mode": mode, "trajectory_path": str(trajectory)} for mode in ("baseline", "tilth_forced")]
     # --modes-json stock arms are not in run.MODES; their recorded tools decide.
     rows += [
         {"task": "synthetic", "mode": "tilth_stock", "trajectory_path": str(trajectory),
@@ -434,7 +434,7 @@ def test_cells_keep_every_tilth_arm_and_skip_baseline(tmp_path) -> None:
     rows_path = tmp_path / "rows.jsonl"
     rows_path.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
-    assert [row["mode"] for row in replay._cells(rows_path, None, 10)] == ["tilth", "tilth_forced", "tilth_stock"]
+    assert [row["mode"] for row in replay._cells(rows_path, None, 10)] == ["tilth_forced", "tilth_stock"]
 
 
 @needs_binary

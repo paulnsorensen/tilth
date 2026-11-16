@@ -153,13 +153,12 @@ def format_delta(baseline_val: float, tilth_val: float) -> str:
     return f"{sign}{pct_change:.0f}%"
 
 
-MODE_ORDER = ["no_tilth", "upstream", "fork", "baseline", "tilth", "tilth_forced"]
+MODE_ORDER = ["no_tilth", "upstream", "fork", "baseline", "tilth_forced"]
 MODE_LABELS = {
     "no_tilth": "no_tilth",
     "upstream": "upstream",
     "fork": "fork",
     "baseline": "baseline",
-    "tilth": "tilth-added",
     "tilth_forced": "tilth-only",
 }
 
@@ -828,6 +827,13 @@ def generate_report(results: list[dict]) -> str:
     warning = pricing_staleness_warning(PRICING_DATA["as_of"])
     if warning:
         lines.extend([warning, ""])
+    unknown_modes = [mode for mode in modes if mode not in MODE_ORDER]
+    if unknown_modes:
+        lines.extend([
+            f"_Note: unrecognized mode(s) {', '.join(unknown_modes)} shown under their stored names, "
+            "with no alias to a current mode._",
+            "",
+        ])
     lines.extend(_headline_section(valid_results, modes))
     lines.extend(_capability_section(valid_results, modes))
     lines.extend(_applicability_section(valid_results, modes))

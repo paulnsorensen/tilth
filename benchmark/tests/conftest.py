@@ -99,6 +99,9 @@ class Bench:
         self.monkeypatch.setattr(run, "run_single", fake_run_single)
 
     def main(self, *argv: str) -> int:
+        """Run `run.main()`; strict file tools default on for Claude, so these store tests opt out unless they choose."""
+        if not {"--strict-file-tools", "--no-strict-file-tools"} & set(argv):
+            argv = (*argv, "--no-strict-file-tools")
         self.monkeypatch.setattr(sys, "argv", ["run.py", *argv])
         try:
             run.main()

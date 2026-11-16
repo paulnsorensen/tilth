@@ -116,7 +116,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-branch", default="main",
                         help="the winner PR's base; --seed-sha must be on origin/<branch>, or on the local "
                              "branch when there is no remote-tracking ref (default: main)")
-    # Only the claude runner enforces the tilth_forced tool restriction that candidates run under.
+    # Candidates run under the strict Bash hook, which only the claude runner wires in evolve; a Codex
+    # tilth-only arm enforces its restriction through the catalog and the pinned hook, not through this path.
     claude_models = sorted(name for name in run.MODELS if run.RUNNERS[name] == "claude")
     parser.add_argument("--model", default="haiku", choices=claude_models, help="agent model for every cell")
     parser.add_argument("--reruns", type=int, default=3, help="re-runs R before a candidate is accepted (default 3)")
