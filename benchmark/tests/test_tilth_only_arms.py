@@ -1,8 +1,11 @@
 """Every tilth arm is tilth-only: no hybrid mode, strict by default on Claude, a real Codex arm."""
 
+import fcntl
+import io
 import json
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -284,12 +287,136 @@ def test_audit_refuses_a_command_item_without_text(tmp_path: Path) -> None:
         run._audit_codex_commands(_stream({"type": "command_execution"}), str(fake_hook(tmp_path)))
 
 
+def _events(*events: dict) -> str:
+    return "\n".join(json.dumps(event) for event in events)
+
+
+def _started(command: str, item_id: str) -> dict:
+    return {"type": "item.started", "item": {**_command(command), "id": item_id, "status": "in_progress"}}
+
+
+def _finished(command: str, item_id: str) -> dict:
+    return {"type": "item.completed", "item": {**_command(command), "id": item_id}}
+
+
+def test_audit_counts_a_command_that_only_started(tmp_path: Path) -> None:
+    raw = _events(_started("/usr/bin/zsh -lc ls", "item_1"))
+
+    assert run._audit_codex_commands(raw, str(fake_hook(tmp_path))) == 1
+
+
+def test_audit_refuses_a_denied_command_that_never_completed(tmp_path: Path) -> None:
+    raw = _events(_started("/usr/bin/zsh -lc 'cat src/main.rs'", "item_1"))
+
+    with pytest.raises(run.CodexHookLoosenedError, match="cat src/main.rs"):
+        run._audit_codex_commands(raw, str(fake_hook(tmp_path)))
+
+
+def test_audit_counts_one_command_once_across_started_and_completed(tmp_path: Path) -> None:
+    ls = "/usr/bin/zsh -lc ls"
+    raw = _events(_started(ls, "item_1"), _finished(ls, "item_1"), _started(ls, "item_2"))
+
+    assert run._audit_codex_commands(raw, str(fake_hook(tmp_path))) == 2
+
+
+def _probe_stream(*extra: dict) -> str:
+    """The stream a real Codex 0.166.0 run emits (see the codex_probe report): a hook-denied cat leaves no item."""
+    ls = "/usr/bin/zsh -lc ls"
+    errors = [{"type": "item.completed", "item": {"id": f"item_{n}", "type": "error", "message": "warning"}}
+              for n in range(3)]
+    return _events(*errors, *extra, _started(ls, "item_3"), _finished(ls, "item_3"),
+                   {"type": "item.completed", "item": {"id": "item_4", "type": "agent_message", "text": "done"}})
+
+
+def _fake_exec(stdout: str):
+    def fake(mode, hook_binary, extra_flags, keep, port):
+        done = subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
+        return done, ["--enable", "hooks", "-c", "hooks.PreToolUse=x"], []
+    return fake
+
+
+def _audit_problems(report: dict) -> list[str]:
+    return [p for p in codex_probe.problems(report) if "audit" in p or "command_execution" in p]
+
+
+def test_probe_audits_its_own_stream_and_finds_only_the_benign_ls(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(run, "_probe_hook", lambda *_a, **_k: None)
+    monkeypatch.setattr(codex_probe, "_exec", _fake_exec(_probe_stream()))
+
+    report = codex_probe.probe(run.MODES["tilth_forced"], str(fake_hook(tmp_path)), [], None)
+
+    assert (report["audited_commands"], report["audit_error"], report["denied_cat_items"]) == (1, None, 0)
+    assert [item["event"] for item in report["command_items"]] == ["item.started", "item.completed"]
+    assert _audit_problems(report) == []
+
+
+def test_probe_fails_when_a_denied_command_shows_up_in_its_stream(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    leaked = _started("/usr/bin/zsh -lc 'cat hello.txt'", "item_2")
+    monkeypatch.setattr(run, "_probe_hook", lambda *_a, **_k: None)
+    monkeypatch.setattr(codex_probe, "_exec", _fake_exec(_probe_stream(leaked)))
+
+    report = codex_probe.probe(run.MODES["tilth_forced"], str(fake_hook(tmp_path)), [], None)
+
+    assert "cat hello.txt" in report["audit_error"] and report["denied_cat_items"] == 1
+    assert len(_audit_problems(report)) == 2
+
+
+def test_probe_fails_when_the_stream_replays_more_than_the_benign_ls(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    extra = _finished("/usr/bin/zsh -lc 'git status'", "item_2")
+    monkeypatch.setattr(run, "_probe_hook", lambda *_a, **_k: None)
+    monkeypatch.setattr(codex_probe, "_exec", _fake_exec(_probe_stream(extra)))
+
+    report = codex_probe.probe(run.MODES["tilth_forced"], str(fake_hook(tmp_path)), [], None)
+
+    assert report["audited_commands"] == 2
+    assert any("replayed 2 commands" in problem for problem in codex_probe.problems(report))
+
+
+def test_probe_closes_its_mock_server_when_the_cell_fails(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    servers: list[codex_probe.ThreadingHTTPServer] = []
+
+    class Recorded(codex_probe.ThreadingHTTPServer):
+        def __init__(self, *args, **kwargs) -> None:
+            super().__init__(*args, **kwargs)
+            servers.append(self)
+
+    def boom(*_a):
+        raise RuntimeError("codex missing")
+
+    monkeypatch.setattr(codex_probe, "ThreadingHTTPServer", Recorded)
+    monkeypatch.setattr(run, "_probe_hook", lambda *_a, **_k: None)
+    monkeypatch.setattr(codex_probe, "_exec", boom)
+
+    with pytest.raises(RuntimeError, match="codex missing"):
+        codex_probe.probe(run.MODES["tilth_forced"], str(fake_hook(tmp_path)), [], None)
+
+    assert servers[0].socket.fileno() == -1
+
+
+def test_probe_starts_codex_through_the_host_runner(monkeypatch: pytest.MonkeyPatch, catalog: Path, tmp_path: Path) -> None:
+    seen: list[object] = []
+
+    def host(argv, env, agent_venv):
+        seen.append(agent_venv)
+        raise RuntimeError("routed")
+
+    monkeypatch.setattr(run, "check_codex_tool_surface", lambda *_a, **_k: [])
+    monkeypatch.setattr(run, "_host_runner_argv", host)
+    mode = run.replace(run.MODES["tilth_forced"], binary_path="/opt/tilth/bin/tilth")
+
+    with pytest.raises(RuntimeError, match="routed"):
+        codex_probe._exec(mode, str(fake_hook(tmp_path)), [], None, 1)
+
+    assert seen == [None]
+
+
 # --- the pre-spend live check ---
 
 
 def _report(**over: object) -> dict:
     report = {"argv_enables_hooks": True, "argv_disables_hooks": False, "cat_denied": True, "secret_leaked": False,
-              "ls_ran": True, "apply_patch_in_request": False}
+              "ls_ran": True, "apply_patch_in_request": False, "audited_commands": 1, "audit_error": None,
+              "denied_cat_items": 0}
     return {**report, **over}
 
 
@@ -304,6 +431,10 @@ def test_probe_problems_is_empty_for_an_enforcing_report() -> None:
     ({"apply_patch_in_request": True}, "apply_patch"),
     ({"argv_enables_hooks": False}, "enable hooks"),
     ({"argv_disables_hooks": True}, "enable hooks"),
+    ({"audited_commands": 0}, "replayed 0 commands"),
+    ({"audited_commands": 2}, "replayed 2 commands"),
+    ({"audit_error": "hook_loosened: ran cat"}, "stream audit refused the probe"),
+    ({"denied_cat_items": 1}, "emitted a command_execution item"),
 ])
 def test_probe_problems_names_each_way_the_hook_fails(over: dict, text: str) -> None:
     assert any(text in problem for problem in codex_probe.problems(_report(**over)))
@@ -368,7 +499,9 @@ def codex_cell(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, catalog: Path, a
 
     def fake_run(cmd, **kwargs):
         state["cmds"].append((cmd, kwargs.get("env")))
-        return subprocess.CompletedProcess(cmd, 0, stdout=state["stream"], stderr="")
+        if state.get("fail") == "timeout":
+            raise subprocess.TimeoutExpired(cmd, 1, output=state["stream"].encode())
+        return subprocess.CompletedProcess(cmd, 1 if state.get("fail") == "exit" else 0, stdout=state["stream"], stderr="")
 
     route_hook_to_real_process(monkeypatch, fake_run)
     monkeypatch.setattr(run, "check_codex_tool_surface",
@@ -413,7 +546,7 @@ def test_every_codex_cell_runs_under_an_isolated_home_that_keeps_auth(
     saved.mkdir()
     (saved / "auth.json").write_text('{"token": "t"}')
     monkeypatch.setenv("CODEX_HOME", str(saved))
-    codex_cell["stream"] = _codex_cell_stream("/usr/bin/zsh -lc ls").replace('"server": "tilth"', '"server": "tilth"')
+    codex_cell["stream"] = _codex_cell_stream("/usr/bin/zsh -lc ls")
     seen: list[str] = []
 
     def probe_env(cmd, **kwargs):
@@ -456,6 +589,214 @@ def test_run_plan_runs_the_codex_preflight_before_any_cell(
                       store_only=False, hook_sha="seed")
 
     assert events == ["preflight ['arm'] fake-tilth"]
+
+
+# --- a failed Codex cell is still audited; the run key and home carry the isolation ---
+
+
+class _FakeProc:
+    def __init__(self, stdout: str, returncode: int) -> None:
+        self.stdout, self.stderr, self.returncode = io.StringIO(stdout), io.StringIO(""), returncode
+
+    def wait(self) -> int:
+        return self.returncode
+
+    def kill(self) -> None:
+        pass
+
+
+class _InstantTimer:
+    def __init__(self, _interval: float, function) -> None:
+        self.function = function
+
+    def start(self) -> None:
+        self.function()
+
+    def cancel(self) -> None:
+        pass
+
+
+def _fail_cell(monkeypatch: pytest.MonkeyPatch, codex_cell: dict, tmp_path: Path, branch: str, failure: str) -> dict:
+    if branch == "run":
+        codex_cell["fail"] = failure
+        return _run_cell(tmp_path, "arm", hook_sha="seed")
+    real_popen = subprocess.Popen
+    stream, returncode = codex_cell["stream"], 1 if failure == "exit" else -9
+    monkeypatch.setattr(
+        run.subprocess, "Popen",
+        lambda cmd, **kwargs: _FakeProc(stream, returncode) if kwargs.get("bufsize") == 1 else real_popen(cmd, **kwargs))
+    if failure == "timeout":
+        monkeypatch.setattr(run.threading, "Timer", _InstantTimer)
+    return _run_cell(tmp_path, "arm", hook_sha="seed", stream_log_path=tmp_path / "streams" / "cell.jsonl")
+
+
+@pytest.mark.parametrize("branch", ["run", "stream"])
+@pytest.mark.parametrize("failure", ["timeout", "exit"])
+def test_a_failed_codex_cell_that_started_a_denied_command_is_invalid(
+    monkeypatch: pytest.MonkeyPatch, codex_cell: dict, tmp_path: Path, branch: str, failure: str
+) -> None:
+    codex_cell["stream"] = _events(_started("/usr/bin/zsh -lc 'cat src/main.rs'", "item_1"))
+
+    with pytest.raises(run.CodexHookLoosenedError, match="hook_loosened.*cat src/main.rs"):
+        _fail_cell(monkeypatch, codex_cell, tmp_path, branch, failure)
+
+
+@pytest.mark.parametrize("branch", ["run", "stream"])
+@pytest.mark.parametrize("failure, error, text", [
+    ("timeout", subprocess.TimeoutExpired, "timed out"),
+    ("exit", RuntimeError, "failed with code"),
+])
+def test_a_failed_codex_cell_with_allowed_commands_keeps_its_own_failure(
+    monkeypatch: pytest.MonkeyPatch, codex_cell: dict, tmp_path: Path, branch: str, failure: str, error: type, text: str
+) -> None:
+    codex_cell["stream"] = _events(_started("/usr/bin/zsh -lc ls", "item_1"))
+
+    with pytest.raises(error, match=text):
+        _fail_cell(monkeypatch, codex_cell, tmp_path, branch, failure)
+
+
+def _key_under(monkeypatch: pytest.MonkeyPatch, marker: str, **identity: object) -> str:
+    with monkeypatch.context() as patch:
+        patch.setattr(run, "_CODEX_HOME_ISOLATION", marker)
+        return _identity(**identity)["run_key"]
+
+
+@pytest.mark.parametrize("mode, hook_sha", [("baseline", None), ("tilth_forced", "seed")])
+def test_the_home_isolation_marker_keys_every_codex_arm(
+    monkeypatch: pytest.MonkeyPatch, catalog: Path, arm_task: None, mode: str, hook_sha: str | None
+) -> None:
+    monkeypatch.setattr(run, "_hook_source_key", lambda _sha, _repo=None: "tree:lock")
+
+    keys = {_key_under(monkeypatch, marker, mode=mode, hook_sha=hook_sha) for marker in ("v1", "v2")}
+
+    assert len(keys) == 2
+
+
+def test_the_home_isolation_marker_leaves_a_claude_key_alone(
+    monkeypatch: pytest.MonkeyPatch, catalog: Path, arm_task: None
+) -> None:
+    monkeypatch.setattr(run, "_hook_source_key", lambda _sha, _repo=None: "tree:lock")
+
+    keys = {_key_under(monkeypatch, marker, model="sonnet5", mode="baseline", hook_sha=None) for marker in ("v1", "v2")}
+
+    assert len(keys) == 1
+
+
+def test_a_codex_cell_follows_the_bare_flag_alone() -> None:
+    assert run._cell_bare("luna56", True, False) is False
+    assert run._cell_bare("luna56", False, True) is True
+    assert run._cell_bare("sonnet5", True, False) is True
+    assert run._cell_bare("sonnet5", False, False) is False
+
+
+def test_a_codex_cell_has_one_key_in_a_mixed_bare_run_and_a_codex_only_run(
+    monkeypatch: pytest.MonkeyPatch, catalog: Path, arm_task: None
+) -> None:
+    monkeypatch.setattr(run, "_hook_source_key", lambda _sha, _repo=None: "tree:lock")
+
+    def key(run_bare: bool) -> str:
+        bare = run._cell_bare("luna56", run_bare, False)
+        return run.cell_identity("arm_task", "tilth_forced", "luna56", 0, bare=bare, reasoning_effort=None,
+                                 max_budget_usd=1.0, strict_file_tools=False, hook_sha="seed")["run_key"]
+
+    assert key(True) == key(False)
+
+
+def test_the_copy_back_takes_a_lock_file_and_keeps_the_refreshed_token(tmp_path: Path) -> None:
+    host = tmp_path / "host"
+    host.mkdir()
+    (host / "auth.json").write_text('{"t": 1}')
+    env = {"CODEX_HOME": str(host)}
+
+    with run.isolated_codex_home(env, "lock-"):
+        (Path(env["CODEX_HOME"]) / "auth.json").write_text('{"t": 2}')
+
+    assert json.loads((host / "auth.json").read_text()) == {"t": 2}
+    assert (host / "auth.json.lock").is_file()
+
+
+def test_the_copy_back_waits_for_the_host_auth_lock(tmp_path: Path) -> None:
+    host = tmp_path / "host"
+    host.mkdir()
+    (host / "auth.json").write_text('{"t": 1}')
+    finished = threading.Event()
+
+    def cell() -> None:
+        env = {"CODEX_HOME": str(host)}
+        with run.isolated_codex_home(env, "wait-"):
+            (Path(env["CODEX_HOME"]) / "auth.json").write_text('{"t": 2}')
+        finished.set()
+
+    thread = threading.Thread(target=cell)
+    with open(host / "auth.json.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        thread.start()
+        assert not finished.wait(0.5)
+        assert json.loads((host / "auth.json").read_text()) == {"t": 1}
+        fcntl.flock(lock, fcntl.LOCK_UN)
+    thread.join(10)
+
+    assert finished.is_set() and json.loads((host / "auth.json").read_text()) == {"t": 2}
+
+
+_PROBE_FAILURES = [
+    run.InvalidCodexCellError("hook not enforcing"),
+    subprocess.TimeoutExpired("codex", 120),
+    subprocess.CalledProcessError(1, "codex"),
+    FileNotFoundError("codex"),
+    json.JSONDecodeError("bad stream", "x", 0),
+]
+
+
+@pytest.mark.parametrize("failure", _PROBE_FAILURES, ids=lambda failure: type(failure).__name__)
+def test_main_stops_before_any_cell_when_the_codex_preflight_fails(
+    bench, monkeypatch: pytest.MonkeyPatch, catalog: Path, capsys: pytest.CaptureFixture[str], failure: Exception
+) -> None:
+    monkeypatch.setitem(run.MODES, "arm", ModeConfig(
+        name="arm", tools=[], mcp_config_path="/tmp/tilth.json", description="test",
+        binary_path="/arms/own/tilth", tilth_version="test"))
+    monkeypatch.setattr(run, "_git", lambda *_a, **_k: "seedsha\n")
+    monkeypatch.setattr(run, "_hook_source_key", lambda *_a, **_k: "tree:lock")
+    monkeypatch.setattr(run, "build_candidate", lambda *_a, **_k: SimpleNamespace(binary_path="/pinned/tilth"))
+    monkeypatch.setattr(run, "_verify_mcp_servers", lambda *_a, **_k: None)
+
+    def refuse(modes, hook):
+        raise failure
+
+    monkeypatch.setattr(run, "preflight_codex_hooks", refuse)
+    bench.runner(lambda _path: pytest.fail("a cell started"))
+
+    code = bench.main("--tasks", "cell_a", "--models", "gpt5", "--modes", "arm", "--reps", "1", "--max-usd", "5")
+
+    assert code == 2
+    assert "Codex hook check failed; no cell ran" in capsys.readouterr().err
+    assert bench.calls == []
+
+
+@pytest.mark.parametrize("failure", _PROBE_FAILURES[1:], ids=lambda failure: type(failure).__name__)
+def test_run_plan_turns_a_probe_crash_into_an_invalid_cell_before_any_cell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, catalog: Path, arm_task: None, failure: Exception
+) -> None:
+    monkeypatch.setitem(run.MODES, "arm", ModeConfig(
+        name="arm", tools=[], mcp_config_path="/tmp/tilth.json", description="test",
+        binary_path="/arms/own/tilth", tilth_version="test"))
+    install_fake_hook(monkeypatch, tmp_path)
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(run, "cli_version", lambda *_a, **_k: "1.0")
+    events: list[str] = []
+
+    def crash(modes, hook):
+        raise failure
+
+    monkeypatch.setattr(run, "preflight_codex_hooks", crash)
+    monkeypatch.setattr(run, "run_single", lambda *_a, **_k: events.append("cell") or {})
+
+    with pytest.raises(run.InvalidCodexCellError, match="Codex hook check failed; no cell ran"):
+        run._run_plan([run.CellSpec("arm_task", "arm", "gpt5", 0)], panel=None, ledger=run.SpendLedger(max_usd=5.0),
+                      refreeze_baselines=False, output=None, cell_estimate_usd=1.0, max_budget_usd=1.0,
+                      store_only=False, hook_sha="seed")
+
+    assert events == []
 
 
 # --- the hook denies a bare shell, so write_stdin cannot start an unguarded one ---

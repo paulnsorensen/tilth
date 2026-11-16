@@ -85,41 +85,25 @@ def probe(mode: run.ModeConfig, hook_binary: Path | str, extra_flags: list[str],
     MockResponses.requests = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), MockResponses)
     threading.Thread(target=server.serve_forever, daemon=True).start()
-    with tempfile.TemporaryDirectory() as scratch:
-        repo = Path(scratch) / "repo"
-        repo.mkdir()
-        (repo / "hello.txt").write_text(SECRET + "\n")
-        home = Path(scratch) / "codex_home"
-        home.mkdir()
-        task = SimpleNamespace(prompt="Read hello.txt", hide_git=True)
-        cmd = run._codex_command(task, mode, "gpt-5.6-sol", repo, reasoning_effort=None, skill_paths=[],
-                              hook_binary=str(hook_binary))
-        provider = [
-            "-c", 'model_provider="mock"',
-            "-c", 'model_providers.mock.name="mock"',
-            "-c", f'model_providers.mock.base_url="http://127.0.0.1:{server.server_port}/v1"',
-            "-c", 'model_providers.mock.wire_api="responses"',
-            "-c", 'model_providers.mock.env_key="OPENAI_MOCK_KEY"',
-            "-c", "model_providers.mock.supports_websockets=false",
-            "-c", "model_providers.mock.request_max_retries=0",
-            "-c", "model_providers.mock.stream_max_retries=0",
-        ]
-        split = cmd.index("--")
-        argv = [*cmd[:split], *extra_flags, *provider, *cmd[split:]]
-        env = {
-            "PATH": run.os.environ["PATH"], "HOME": str(home), "CODEX_HOME": str(home),
-            "OPENAI_MOCK_KEY": "mock",
-        }
-        surface = sorted(run.check_codex_tool_surface(cmd, env, repo))
-        done = subprocess.run(argv, cwd=repo, env=env, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
-        if keep is not None:
-            keep.mkdir(parents=True, exist_ok=True)
-            (keep / "codex.stdout.jsonl").write_text(done.stdout)
-            (keep / "codex.stderr.txt").write_text(done.stderr)
-            (keep / "requests.json").write_text(json.dumps(MockResponses.requests, indent=1))
-    server.shutdown()
-    items = [event["item"] for line in done.stdout.splitlines() if line.startswith("{")
-             for event in [json.loads(line)] if event.get("type") == "item.completed"]
+    try:
+        done, argv, surface = _exec(mode, hook_binary, extra_flags, keep, server.server_port)
+    finally:
+        server.shutdown()
+        server.server_close()
+    events = [json.loads(line) for line in done.stdout.splitlines() if line.startswith("{")]
+    items = [event["item"] for event in events if event.get("type") == "item.completed"]
+    command_items = [
+        {"event": event["type"], "id": event["item"].get("id"), "command": event["item"].get("command"),
+         "status": event["item"].get("status")}
+        for event in events
+        if event.get("type") in ("item.started", "item.completed")
+        and event["item"].get("type") == "command_execution"
+    ]
+    audited, audit_error = 0, None
+    try:
+        audited = run._audit_codex_commands(done.stdout, str(hook_binary), partial=True)
+    except run.InvalidCodexCellError as error:
+        audit_error = str(error)
     requests = MockResponses.requests
     request_tools = sorted(run._codex_tool_names(requests[0].get("input", []))) if requests else []
     outputs = _outputs(requests[-1]) if requests else []
@@ -139,7 +123,50 @@ def probe(mode: run.ModeConfig, hook_binary: Path | str, extra_flags: list[str],
         "secret_leaked": any(SECRET in out for out in outputs),
         "ls_ran": any("hello.txt" in out and "Blocked" not in out for out in outputs[1:]),
         "item_types": [item.get("type") for item in items],
+        "command_items": command_items,
+        "denied_cat_items": sum(1 for item in command_items if SCRIPT[0] in str(item["command"])),
+        "audited_commands": audited,
+        "audit_error": audit_error,
     }
+
+
+def _exec(mode: run.ModeConfig, hook_binary: Path | str, extra_flags: list[str], keep: Path | None,
+          port: int) -> tuple[subprocess.CompletedProcess, list[str], list[str]]:
+    """Run one mock-provider cell; return its process, its argv and the tool surface the preflight rendered."""
+    with tempfile.TemporaryDirectory() as scratch:
+        repo = Path(scratch) / "repo"
+        repo.mkdir()
+        (repo / "hello.txt").write_text(SECRET + "\n")
+        home = Path(scratch) / "codex_home"
+        home.mkdir()
+        task = SimpleNamespace(prompt="Read hello.txt", hide_git=True)
+        cmd = run._codex_command(task, mode, "gpt-5.6-sol", repo, reasoning_effort=None, skill_paths=[],
+                              hook_binary=str(hook_binary))
+        provider = [
+            "-c", 'model_provider="mock"',
+            "-c", 'model_providers.mock.name="mock"',
+            "-c", f'model_providers.mock.base_url="http://127.0.0.1:{port}/v1"',
+            "-c", 'model_providers.mock.wire_api="responses"',
+            "-c", 'model_providers.mock.env_key="OPENAI_MOCK_KEY"',
+            "-c", "model_providers.mock.supports_websockets=false",
+            "-c", "model_providers.mock.request_max_retries=0",
+            "-c", "model_providers.mock.stream_max_retries=0",
+        ]
+        split = cmd.index("--")
+        argv = [*cmd[:split], *extra_flags, *provider, *cmd[split:]]
+        env = {
+            "PATH": run.os.environ["PATH"], "HOME": str(home), "CODEX_HOME": str(home),
+            "OPENAI_MOCK_KEY": "mock",
+        }
+        surface = sorted(run.check_codex_tool_surface(cmd, env, repo))
+        argv = run._host_runner_argv(argv, env, None)
+        done = subprocess.run(argv, cwd=repo, env=env, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL)
+        if keep is not None:
+            keep.mkdir(parents=True, exist_ok=True)
+            (keep / "codex.stdout.jsonl").write_text(done.stdout)
+            (keep / "codex.stderr.txt").write_text(done.stderr)
+            (keep / "requests.json").write_text(json.dumps(MockResponses.requests, indent=1))
+    return done, argv, surface
 
 
 def problems(report: dict) -> list[str]:
@@ -153,6 +180,12 @@ def problems(report: dict) -> list[str]:
         found.append("a repo file's content reached the model")
     if not report["ls_ran"]:
         found.append("a benign command did not run")
+    if report["audit_error"]:
+        found.append(f"the stream audit refused the probe: {report['audit_error']}")
+    elif report["audited_commands"] != 1:
+        found.append(f"the stream audit replayed {report['audited_commands']} commands, expected only the benign ls")
+    if report["denied_cat_items"]:
+        found.append("a hook-denied command emitted a command_execution item")
     if report["apply_patch_in_request"]:
         found.append("apply_patch is in the request")
     return found

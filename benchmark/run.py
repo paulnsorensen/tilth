@@ -8,6 +8,7 @@ Records token usage, cost, correctness, and tool usage to JSONL format.
 
 import argparse
 import atexit
+import fcntl
 import functools
 import hashlib
 import inspect
@@ -289,6 +290,17 @@ def _is_json(data: bytes) -> bool:
 
 
 @contextmanager
+def _host_auth_lock(host_auth: Path):
+    """Hold an exclusive ``flock`` on a sibling lock file of ``host_auth`` while the caller compares and copies."""
+    with open(host_auth.with_name(host_auth.name + ".lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+@contextmanager
 def isolated_codex_home(env: dict[str, str], prefix: str):
     """Point ``env`` at a temp CODEX_HOME that holds only a copy of the host's ``auth.json``.
 
@@ -296,7 +308,8 @@ def isolated_codex_home(env: dict[str, str], prefix: str):
     instructions, and it finds hooks, rules, plugins, and agents there. A token that Codex refreshes during the
     call is copied back to the host file, also after a failed or killed call. It is not copied back when it is
     not valid JSON (a kill during the refresh can truncate it), or when the host file changed during the call:
-    another Codex process then refreshed it, and its newer token stays.
+    another Codex process then refreshed it, and its newer token stays. A lock file beside the host file
+    serializes that compare and the copy-back across concurrent runs.
     """
     host_auth = Path(env.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
     seed = host_auth.read_bytes() if host_auth.is_file() else None
@@ -309,9 +322,10 @@ def isolated_codex_home(env: dict[str, str], prefix: str):
             yield
         finally:
             if seed is not None and call_auth.is_file() and (refreshed := call_auth.read_bytes()) != seed:
-                current = host_auth.read_bytes() if host_auth.is_file() else None
-                if current == seed and _is_json(refreshed):
-                    _copy_private(call_auth, host_auth)
+                with _host_auth_lock(host_auth):
+                    current = host_auth.read_bytes() if host_auth.is_file() else None
+                    if current == seed and _is_json(refreshed):
+                        _copy_private(call_auth, host_auth)
 
 
 def budget_capped(stream: str) -> bool:
@@ -1181,6 +1195,10 @@ def _command_template(
             else part for i, part in enumerate(cmd)]
 
 
+# Keys every Codex cell: rows recorded under the host CODEX_HOME must not match isolated-home rows.
+_CODEX_HOME_ISOLATION = "isolated-codex-home-v1"
+
+
 def _codex_hooked(runner: str, mode: ModeConfig) -> bool:
     """A Codex tilth-only cell: its shell runs behind the pinned hook and its patch tool is off."""
     return runner == "codex" and bool(mode.mcp_config_path)
@@ -1240,6 +1258,7 @@ def cell_identity(
                 max_budget_usd=max_budget_usd, strict_file_tools=strict_file_tools,
             ),
             hook_source_key=hook_source_key,
+            home_isolation=_CODEX_HOME_ISOLATION if runner == "codex" else None,
         ),
         "task_digest": _cell_task_digest(task),
         "env_fingerprint": env_fingerprint(task),
@@ -1531,28 +1550,37 @@ class CodexHookLoosenedError(InvalidCodexCellError):
     """A Codex tilth-only cell ran a shell command that the pinned hook denies."""
 
 
-def _audit_codex_commands(raw: str, hook_binary: str) -> int:
+def _audit_codex_commands(raw: str, hook_binary: str, *, partial: bool = False) -> int:
     """Replay every ``command_execution`` of a Codex stream through the pinned hook; return the count.
 
-    A denied command emits no stream item. A command in the stream that the hook denies therefore ran
-    because the cell's own hook did not block it: a hook that crashes or times out does not block.
+    A hook-denied command emits no stream item, not even ``item.started`` (Codex 0.166.0, checked by
+    ``codex_probe``). A command in the stream that the hook denies therefore ran because the cell's own
+    hook did not block it: a hook that crashes or times out does not block. Both ``item.started`` and
+    ``item.completed`` count, so a command still running when the cell was killed is audited. Each item id
+    counts once. ``partial`` skips a line that is not JSON: a killed process can leave a truncated last line.
     """
-    replayed = 0
-    for line in raw.splitlines():
+    commands: dict[str, str | None] = {}
+    for number, line in enumerate(raw.splitlines()):
         if not line.strip():
             continue
-        event = json.loads(line)
-        item = event.get("item") if event.get("type") == "item.completed" else None
+        try:
+            event = json.loads(line)
+        except ValueError:
+            if partial:
+                continue
+            raise
+        item = event.get("item") if event.get("type") in ("item.started", "item.completed") else None
         if not isinstance(item, dict) or item.get("type") != "command_execution":
             continue
         command = item.get("command")
-        if not isinstance(command, str):
+        commands[str(item.get("id", f"line-{number}"))] = command if isinstance(command, str) else None
+    for command in commands.values():
+        if command is None:
             raise CodexHookLoosenedError("hook_loosened: a Codex command_execution item has no command text")
         if _hook_replay(hook_binary, command, hint="tilth", host="codex"):
             raise CodexHookLoosenedError(
                 f"hook_loosened: Codex tilth-only cell ran a command the hook denies: {command}")
-        replayed += 1
-    return replayed
+    return len(commands)
 
 
 def check_codex_hook_live(mode: ModeConfig, hook_binary: str) -> None:
@@ -1981,6 +2009,8 @@ def _run_single_cell(
         if runner == "codex":
             stream_log_path.with_suffix(".stderr").write_text(stderr_text)
         if timed_out:
+            if codex_hooked:
+                _audit_codex_commands("".join(stdout_chunks), hook_binary, partial=True)
             raise subprocess.TimeoutExpired(cmd, timeout_s)
 
         result = subprocess.CompletedProcess(
@@ -1990,15 +2020,22 @@ def _run_single_cell(
             stderr=stderr_text,
         )
     else:
-        result = subprocess.run(
-            cmd,
-            cwd=str(repo_path),
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout_s,
-            env=env,
-        )
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=str(repo_path),
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                env=env,
+            )
+        except subprocess.TimeoutExpired as expired:
+            if codex_hooked:
+                seen = expired.stdout
+                _audit_codex_commands(
+                    seen.decode(errors="replace") if isinstance(seen, bytes) else seen or "", hook_binary, partial=True)
+            raise
         if runner == "claude":
             auth.check_captured(result.stdout)
     elapsed_ms = int((time.time() - start_time) * 1000)
@@ -2009,6 +2046,8 @@ def _run_single_cell(
         raise QuotaExhaustedError(f"claude -p hit a usage limit: {quota}")
 
     if result.returncode != 0:
+        if codex_hooked:
+            _audit_codex_commands(result.stdout, hook_binary, partial=True)
         runner_name = {"codex": "codex exec", "opencode": "opencode run"}.get(runner, "claude -p")
         # The real cause (e.g. a provider ContentFilterError) streams as a late
         # {"type":"error",...} event; a head-truncated dump hides it. Surface it.
@@ -2497,6 +2536,15 @@ def _preamble_file(text: str) -> Path:
     )
 
 
+def _cell_bare(model_name: str, run_bare: bool, flag_bare: bool) -> bool:
+    """The ``bare`` a cell runs and keys under: a Codex cell follows ``--bare`` alone.
+
+    The run-wide ``bare`` also turns on for strict Claude, experiments and the woz plugin. Those must not
+    change a Codex cell's key, so a Codex-only run and a mixed run key the same Codex cell alike.
+    """
+    return flag_bare if RUNNERS[model_name] == "codex" else run_bare
+
+
 def planned_identity(cell: CellSpec, *, max_budget_usd: float = DEFAULT_MAX_BUDGET_USD,
                      strict_file_tools: bool = False, hook_sha: str | None = None,
                      hook_repo: Path | None = None) -> dict:
@@ -2658,7 +2706,10 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
             _refuse_baseline_drift(pending, history)
         codex_modes = {cell.mode for cell, _ in pending if _codex_hooked(RUNNERS[cell.model], MODES[cell.mode])}
         if codex_modes:
-            preflight_codex_hooks(codex_modes, build_candidate(hook_sha, repo=hook_repo).binary_path)
+            try:
+                preflight_codex_hooks(codex_modes, build_candidate(hook_sha, repo=hook_repo).binary_path)
+            except (subprocess.SubprocessError, OSError, ValueError) as error:
+                raise InvalidCodexCellError(f"Codex hook check failed; no cell ran: {error}") from error
 
     rows: list[dict] = []
     run_max_cost: float | None = None
@@ -3361,7 +3412,7 @@ Examples:
                         task_name, model_name, rep, mode_name, tuple(arm_order), arm_index,
                         cell_identity(
                             task_name, mode_name, model_name, rep,
-                            bare=bare, reasoning_effort=args.reasoning_effort,
+                            bare=_cell_bare(model_name, bare, args.bare), reasoning_effort=args.reasoning_effort,
                             max_budget_usd=args.max_budget_usd,
                             strict_file_tools=args.strict_file_tools, hook_sha=hook_sha,
                         ),
@@ -3425,8 +3476,8 @@ Examples:
         if codex_preflight and any(_codex_hooked(RUNNERS[cell.model_name], MODES[cell.mode_name]) for cell in pending):
             try:
                 preflight_codex_hooks(codex_preflight, hook_binary)
-            except (HookProbeFailed, InvalidCodexCellError) as error:
-                parser.error(f"Codex hook check failed, no cell ran: {error}")
+            except (HookProbeFailed, InvalidCodexCellError, subprocess.SubprocessError, OSError, ValueError) as error:
+                parser.error(f"Codex hook check failed; no cell ran: {error}")
 
     # Include the model in the filename when one process owns one model.
     model_suffix = f"_{models[0]}" if len(models) == 1 else ""
@@ -3632,7 +3683,7 @@ Examples:
                     rep,
                     verbose=args.verbose,
                     stream_log_path=stream_log_path,
-                    bare=bare,
+                    bare=_cell_bare(model_name, bare, args.bare),
                     reasoning_effort=args.reasoning_effort,
                     max_budget_usd=args.max_budget_usd,
                     strict_file_tools=args.strict_file_tools,
