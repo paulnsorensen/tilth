@@ -20,8 +20,8 @@ use std::path::Path;
 use thiserror::Error;
 
 use super::apply::{
-    anchor_lines, apply_ops, find_all_text_spans, lower_ops, match_text_span, ApplyError,
-    ApplyResult, NewlineIndex,
+    anchor_lines, apply_ops, find_all_text_spans, kept_multi_spans, lower_ops, match_text_span,
+    ApplyError, ApplyResult, NewlineIndex,
 };
 use super::mismatch::MismatchError;
 use super::parser::Op;
@@ -184,7 +184,8 @@ fn check_text_swap_overlap(
     exact: ExactSwap,
 ) -> Result<(), MismatchError> {
     let lines = NewlineIndex::new(&snapshot.text);
-    for op in ops {
+    let kept = kept_spans_of(snapshot, path, ops);
+    for (i, op) in ops.iter().enumerate() {
         if let Op::TextSwap { old, .. } = op {
             if let Ok((start, end, normalized)) = match_text_span(&snapshot.text, old) {
                 // A whitespace-normalized match does not prove the agent holds
@@ -194,7 +195,7 @@ fn check_text_swap_overlap(
                 }
             }
         }
-        let unseen = unseen_matches(snapshot, &lines, path, op);
+        let unseen = unseen_matches(snapshot, &lines, op, kept.get(i).and_then(Option::as_ref));
         let Some(&(lo, hi)) = unseen.first() else {
             continue;
         };
@@ -225,25 +226,20 @@ fn check_text_swap_overlap(
 fn unseen_matches(
     snapshot: &Snapshot,
     lines: &NewlineIndex,
-    path: &Path,
     op: &Op,
+    kept: Option<&Vec<(usize, usize)>>,
 ) -> Vec<(u32, u32)> {
-    let (spans, every_line) = match op {
-        Op::TextSwapAll { old, count, .. } => {
-            (find_all_text_spans(&snapshot.text, old, *count), false)
-        }
-        Op::Rewrite { pattern, count, .. } => (
-            rewrite_match_spans(path, &snapshot.text, pattern, *count),
-            true,
-        ),
+    let every_line = match op {
+        Op::TextSwapAll { .. } => false,
+        Op::Rewrite { .. } => true,
         _ => return Vec::new(),
     };
-    let Ok(spans) = spans else {
+    let Some(spans) = kept else {
         return Vec::new();
     };
     spans
-        .into_iter()
-        .map(|(start, end)| lines.content_line_span(start, end))
+        .iter()
+        .map(|&(start, end)| lines.content_line_span(start, end))
         .filter(|&(lo, hi)| {
             if every_line {
                 (lo..=hi).any(|l| !snapshot.seen_lines.contains(&l))
@@ -265,9 +261,13 @@ pub(crate) fn unseen_match_spans(
     ops: &[Op],
 ) -> Option<Vec<(u32, u32)>> {
     let lines = NewlineIndex::new(&snapshot.text);
+    let kept = kept_spans_of(snapshot, path, ops);
     let spans: Vec<(u32, u32)> = ops
         .iter()
-        .flat_map(|op| unseen_matches(snapshot, &lines, path, op))
+        .enumerate()
+        .flat_map(|(i, op)| {
+            unseen_matches(snapshot, &lines, op, kept.get(i).and_then(Option::as_ref))
+        })
         .collect();
     if spans.is_empty() {
         return None;
@@ -287,6 +287,72 @@ pub(crate) fn unseen_match_spans(
         .extend(spans.iter().flat_map(|&(lo, hi)| lo..=hi));
     gated_apply(&shown, path, ops).ok()?;
     Some(spans)
+}
+
+/// Rounds and lines [`unseen_anchor_lines`] works through before it gives up.
+const MAX_UNSEEN_ROUNDS: usize = 8;
+const MAX_UNSEEN_LINES: usize = 400;
+
+/// Every line the gate refuses as never displayed when `ops` are the only
+/// reason that [`gated_apply`] refuses. Once these lines count as displayed,
+/// `ops` apply. Only lines that exist in the snapshot count. `None` when the
+/// gate accepts `ops`, when another failure comes first, and when the lines
+/// or the rounds exceed a bounded amount.
+pub(crate) fn unseen_anchor_lines(
+    snapshot: &Snapshot,
+    path: &Path,
+    ops: &[Op],
+) -> Option<Vec<u32>> {
+    let total = u32::try_from(snapshot.text.lines().count()).unwrap_or(u32::MAX);
+    let mut shown = snapshot.clone();
+    let mut added: Vec<u32> = Vec::new();
+    // One more pass than rounds, so the last round's addition is still checked.
+    for _ in 0..=MAX_UNSEEN_ROUNDS {
+        let result = gated_apply(&shown, path, ops);
+        let Err(EditError::Mismatch(MismatchError::UnseenAnchor {
+            line,
+            reread_lo,
+            reread_hi,
+            reads,
+            ..
+        })) = result
+        else {
+            return (result.is_ok() && !added.is_empty()).then(|| {
+                added.sort_unstable();
+                added
+            });
+        };
+        let before = added.len();
+        let spans = if reads.is_empty() {
+            vec![(reread_lo, reread_hi), (line, line)]
+        } else {
+            reads
+        };
+        for (lo, hi) in spans {
+            for l in lo.max(1)..=hi.min(total) {
+                if shown.seen_lines.insert(l) {
+                    added.push(l);
+                }
+            }
+        }
+        if added.len() == before || added.len() > MAX_UNSEEN_LINES {
+            return None;
+        }
+    }
+    None
+}
+
+/// The matches of the multi-match ops in `ops` that the edit applies, one slot
+/// per op (see [`kept_multi_spans`]); empty when `ops` has no such op.
+fn kept_spans_of(snapshot: &Snapshot, path: &Path, ops: &[Op]) -> Vec<Option<Vec<(usize, usize)>>> {
+    if ops
+        .iter()
+        .any(|op| matches!(op, Op::TextSwapAll { .. } | Op::Rewrite { .. }))
+    {
+        kept_multi_spans(path, &snapshot.text, ops)
+    } else {
+        Vec::new()
+    }
 }
 
 fn span_overlaps_seen(snapshot: &Snapshot, lo: u32, hi: u32) -> bool {

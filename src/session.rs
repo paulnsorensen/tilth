@@ -6,8 +6,51 @@ use std::sync::{Mutex, MutexGuard};
 
 use serde_json::Value;
 
-use crate::edit::seen_store::{SeenRecord, SeenStore};
+use crate::edit::parser::Section;
+use crate::edit::seen_store::{content_digest, SeenRecord, SeenStore};
 use crate::edit::snapshots::SnapshotStore;
+
+/// Most refused sections that a session holds for a confirm at once.
+pub(crate) const MAX_HELD_EDITS: usize = 64;
+/// Most bytes that the held sections of a session take, by [`held_size`].
+pub(crate) const MAX_HELD_BYTES: usize = 4 << 20;
+/// Most files that a session tracks as created by `create_file`.
+const MAX_CREATED_FILES: usize = 1024;
+
+/// The bytes that holding `section` takes.
+pub(crate) fn held_size(section: &Section) -> usize {
+    format!("{section:?}").len()
+}
+
+/// A refused section and the file tag that its refusal was made against.
+struct Held {
+    tag: u16,
+    section: Section,
+    bytes: usize,
+    seq: u64,
+}
+
+/// The digest of a created file's content, as tilth last wrote it.
+struct Created {
+    digest: u64,
+    seq: u64,
+}
+
+/// `tilth_write` state that outlives one call.
+#[derive(Default)]
+struct WriteMemory {
+    /// Path key to the content that tilth last wrote to a file that this
+    /// session created with `create_file`. The oldest entry leaves first.
+    created: HashMap<String, Created>,
+    /// Sections refused for unseen lines, keyed by path key and hold id,
+    /// held until a confirm applies them. The oldest hold leaves first.
+    held: HashMap<(String, u32), Held>,
+    /// Orders `created` and `held` by age.
+    seq: u64,
+    /// Hold ids handed out so far, plus a per-session seed.
+    holds_issued: u32,
+    hold_seed: u32,
+}
 
 const BATCH_NUDGE_LIMIT: u8 = 2;
 const NUDGE_MAX_CHARS: usize = 120;
@@ -123,6 +166,7 @@ pub struct Session {
     /// The seen lines of `snapshots`, saved per checkout so that a resumed
     /// agent session (a new tilth process) keeps them.
     seen_store: Mutex<SeenStore>,
+    write_memory: Mutex<WriteMemory>,
     /// Cumulative token estimates: sum of full-file baseline tokens and
     /// tokens actually returned across all reads in this session.
     baseline_tokens: AtomicU64,
@@ -148,6 +192,7 @@ impl Session {
             expanded: Mutex::new(HashMap::new()),
             snapshots: Mutex::new(SnapshotStore::new()),
             seen_store: Mutex::new(SeenStore::from_env()),
+            write_memory: Mutex::new(WriteMemory::default()),
             baseline_tokens: AtomicU64::new(0),
             saved_tokens: AtomicU64::new(0),
             batch_nudges: Mutex::new(BatchNudgeState::default()),
@@ -239,6 +284,135 @@ impl Session {
     /// Move the snapshot history from `from` to `to` (a renamed file).
     pub fn relocate_snapshot(&self, from: &Path, to: &Path) {
         self.snapshots().relocate(from, to);
+    }
+
+    fn write_memory(&self) -> MutexGuard<'_, WriteMemory> {
+        self.write_memory
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// A fresh id for a hold. Ids do not repeat within a session, and a
+    /// session seeds them apart from other sessions.
+    pub fn next_hold_id(&self) -> u32 {
+        let mut memory = self.write_memory();
+        if memory.hold_seed == 0 {
+            memory.hold_seed = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(1, |d| d.subsec_nanos() | 1);
+        }
+        memory.holds_issued = memory.holds_issued.wrapping_add(1);
+        memory
+            .hold_seed
+            .wrapping_add(memory.holds_issued.wrapping_mul(0x9E37_79B1))
+            & crate::edit::tag::HOLD_MASK
+    }
+
+    /// Hold a section that a refusal displayed, until a confirm for `key`
+    /// with hold `id` applies it. `tag` is the file tag of the refusal. The
+    /// oldest holds leave when the count or the bytes exceed their bound.
+    pub fn hold_edit(&self, key: &str, id: u32, tag: u16, section: Section) {
+        let mut memory = self.write_memory();
+        memory.seq += 1;
+        let seq = memory.seq;
+        let bytes = held_size(&section);
+        memory.held.insert(
+            (key.to_string(), id),
+            Held {
+                tag,
+                section,
+                bytes,
+                seq,
+            },
+        );
+        let mut total: usize = memory.held.values().map(|h| h.bytes).sum();
+        while memory.held.len() > MAX_HELD_EDITS || total > MAX_HELD_BYTES {
+            let Some(oldest) = memory
+                .held
+                .iter()
+                .min_by_key(|(_, h)| h.seq)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            if let Some(gone) = memory.held.remove(&oldest) {
+                total -= gone.bytes;
+            }
+        }
+    }
+
+    /// Take the held section for `key` with hold `id`, and the file tag that
+    /// it was refused against. A held section is used once.
+    pub fn take_held_edit(&self, key: &str, id: u32) -> Option<(u16, Section)> {
+        self.write_memory()
+            .held
+            .remove(&(key.to_string(), id))
+            .map(|h| (h.tag, h.section))
+    }
+
+    /// Whether `key` still holds the edit with hold `id`.
+    #[cfg(test)]
+    pub fn has_held_edit(&self, key: &str, id: u32) -> bool {
+        self.write_memory()
+            .held
+            .contains_key(&(key.to_string(), id))
+    }
+
+    /// A `create_file` made `key`, which now holds `text`.
+    pub fn note_created(&self, key: &str, text: &str) {
+        let mut memory = self.write_memory();
+        memory.seq += 1;
+        let seq = memory.seq;
+        memory.created.insert(
+            key.to_string(),
+            Created {
+                digest: content_digest(text),
+                seq,
+            },
+        );
+        while memory.created.len() > MAX_CREATED_FILES {
+            let Some(oldest) = memory
+                .created
+                .iter()
+                .min_by_key(|(_, c)| c.seq)
+                .map(|(k, _)| k.clone())
+            else {
+                break;
+            };
+            memory.created.remove(&oldest);
+        }
+    }
+
+    /// Track `new_text` as the file's content after a write with no drift, but
+    /// only while the file matched what the session tracked before the write.
+    /// Otherwise the file holds lines the session never authored, so it stops
+    /// counting as created here. Held edits stay.
+    pub fn refresh_written(&self, key: &str, live: &str, new_text: &str) {
+        let mut memory = self.write_memory();
+        if let Some(created) = memory.created.get_mut(key) {
+            if created.digest == content_digest(live) {
+                created.digest = content_digest(new_text);
+            } else {
+                memory.created.remove(key);
+            }
+        }
+    }
+
+    /// `key` was removed or moved away, or holds content that the agent did
+    /// not author. Drop its held edits and its created state.
+    pub fn forget_written(&self, key: &str) {
+        let mut memory = self.write_memory();
+        memory.held.retain(|(held, _), _| held != key);
+        memory.created.remove(key);
+    }
+
+    /// Whether this session created `key` with `create_file` and `live` is
+    /// still the content that tilth last wrote to it.
+    pub fn created_unchanged(&self, key: &str, live: &str) -> bool {
+        self.write_memory()
+            .created
+            .get(key)
+            .is_some_and(|c| c.digest == content_digest(live))
     }
 
     pub fn record_read(&self, path: &Path) {
@@ -788,5 +962,114 @@ mod tests {
         session.record_search("TODO: fix");
         session.record_search("TODO: fix");
         assert!(session.summary().contains("TODO: fix (2)"));
+    }
+
+    fn held_section(path: &str) -> Section {
+        Section {
+            path: path.into(),
+            tag: Some(0x1234),
+            hold: None,
+            ops: vec![],
+        }
+    }
+
+    fn big_section(bytes: usize) -> Section {
+        Section {
+            path: "k".into(),
+            tag: Some(0x1234),
+            hold: None,
+            ops: vec![crate::edit::parser::Op::TextSwap {
+                old: "a".into(),
+                new: "b".repeat(bytes),
+            }],
+        }
+    }
+
+    #[test]
+    fn a_held_edit_is_taken_once_for_its_key_and_id() {
+        let session = Session::new();
+        session.hold_edit("/k", 7, 0x1234, held_section("k"));
+        assert!(session.take_held_edit("/k", 8).is_none());
+        assert!(session.take_held_edit("/other", 7).is_none());
+        let (tag, _) = session.take_held_edit("/k", 7).expect("held");
+        assert_eq!(tag, 0x1234, "the hold keeps the tag it was made against");
+        assert!(session.take_held_edit("/k", 7).is_none());
+    }
+
+    #[test]
+    fn two_holds_on_one_key_and_tag_coexist() {
+        let session = Session::new();
+        let (a, b) = (session.next_hold_id(), session.next_hold_id());
+        assert_ne!(a, b);
+        let mut first = held_section("k");
+        first.path = "first".into();
+        let mut second = held_section("k");
+        second.path = "second".into();
+        session.hold_edit("/k", a, 0x1234, first);
+        session.hold_edit("/k", b, 0x1234, second);
+        assert_eq!(session.take_held_edit("/k", b).unwrap().1.path, "second");
+        assert_eq!(session.take_held_edit("/k", a).unwrap().1.path, "first");
+    }
+
+    #[test]
+    fn removing_a_file_drops_its_holds_and_a_write_keeps_them_for_the_tag_check() {
+        let session = Session::new();
+        session.hold_edit("/k", 1, 0x1234, held_section("k"));
+        session.refresh_written("/k", "old", "new");
+        assert!(session.has_held_edit("/k", 1));
+        session.forget_written("/k");
+        assert!(!session.has_held_edit("/k", 1));
+    }
+
+    #[test]
+    fn the_oldest_hold_leaves_first_when_the_count_bound_is_hit() {
+        let session = Session::new();
+        for id in 0..=u32::try_from(MAX_HELD_EDITS).unwrap() {
+            session.hold_edit("/k", id, 0x1234, held_section("k"));
+        }
+        assert!(!session.has_held_edit("/k", 0), "the oldest hold left");
+        for id in 1..=u32::try_from(MAX_HELD_EDITS).unwrap() {
+            assert!(session.has_held_edit("/k", id), "hold {id} stays");
+        }
+    }
+
+    #[test]
+    fn the_oldest_hold_leaves_first_when_the_byte_bound_is_hit() {
+        let session = Session::new();
+        let size = MAX_HELD_BYTES / 3;
+        for id in 0..4 {
+            session.hold_edit("/k", id, 0x1234, big_section(size));
+        }
+        assert!(!session.has_held_edit("/k", 0), "the oldest hold left");
+        assert!(session.has_held_edit("/k", 3), "the newest hold stays");
+    }
+
+    #[test]
+    fn the_created_map_drops_its_oldest_entry_at_the_bound() {
+        let session = Session::new();
+        for i in 0..=MAX_CREATED_FILES {
+            session.note_created(&format!("/f{i}"), "a");
+        }
+        assert!(!session.created_unchanged("/f0", "a"));
+        assert!(session.created_unchanged(&format!("/f{MAX_CREATED_FILES}"), "a"));
+    }
+
+    #[test]
+    fn only_a_created_unchanged_file_counts_as_the_sessions_own() {
+        let session = Session::new();
+        assert!(!session.created_unchanged("/k", "a"));
+        session.note_created("/k", "a");
+        assert!(session.created_unchanged("/k", "a"));
+        assert!(!session.created_unchanged("/k", "outside"));
+        session.refresh_written("/k", "a", "b");
+        assert!(session.created_unchanged("/k", "b"));
+        session.refresh_written("/k", "outside", "c");
+        assert!(
+            !session.created_unchanged("/k", "c"),
+            "a drifted file stops counting"
+        );
+        session.note_created("/k", "b");
+        session.forget_written("/k");
+        assert!(!session.created_unchanged("/k", "b"));
     }
 }
