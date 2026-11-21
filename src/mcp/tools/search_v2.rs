@@ -26,6 +26,16 @@ const REGEX_METACHARS: &[char] = &[
     '\\', '+', '*', '?', '(', ')', '[', ']', '|', '^', '$', '{', '}',
 ];
 
+/// The inner pattern of a `/pattern/` regex query, as in the CLI's `classify`.
+/// A wrapper with no regex metacharacter inside stays for the literal route.
+fn slash_regex(query: &str) -> Option<&str> {
+    let inner = query.strip_prefix('/')?.strip_suffix('/')?;
+    inner
+        .chars()
+        .any(|c| REGEX_METACHARS.contains(&c))
+        .then_some(inner)
+}
+
 mod continuations;
 use continuations::{Follow, Target};
 
@@ -898,10 +908,12 @@ fn route_query(
     }
 
     // 2. regex — contains a regex metacharacter (`.` and `/` don't count).
+    // A `/pattern/` wrapper is the CLI's regex syntax, so search its inner text.
     // A glob naming one exact existing file is single-file-bounded by
     // `search::exact_glob_target` inside the walker — no separate short-circuit needed here.
-    if query.chars().any(|c| REGEX_METACHARS.contains(&c)) {
-        let search_result = crate::search::search_regex_raw_budgeted(query, cwd, glob, budget)?;
+    let pattern = slash_regex(query).unwrap_or(query);
+    if pattern.chars().any(|c| REGEX_METACHARS.contains(&c)) {
+        let search_result = crate::search::search_regex_raw_budgeted(pattern, cwd, glob, budget)?;
         let mut result = raw_result(query, "regex", &search_result);
         set_preview(
             &mut result,
@@ -3113,6 +3125,17 @@ mod tests {
     fn route_regex_resolves_metachar_pattern() {
         let resp = single_query(r"fn\s+detect_file_type").expect("regex query succeeds");
         assert_eq!(resp["results"][0]["resolved_as"], "regex");
+    }
+
+    /// `/pattern/` searches the inner pattern, as the CLI does. The slashes
+    /// used to stay in the regex, so the query could never match.
+    #[test]
+    fn route_regex_searches_inside_a_slash_wrapper() {
+        let resp = single_query(r"/fn\s+detect_file_type\(/").expect("regex query succeeds");
+        let result = &resp["results"][0];
+        assert_eq!(result["resolved_as"], "regex", "{resp}");
+        assert_eq!(result["status"], "ok", "{resp}");
+        assert!(result["total_found"].as_u64() >= Some(1), "{resp}");
     }
 
     #[test]
