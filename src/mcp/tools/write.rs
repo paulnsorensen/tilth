@@ -530,6 +530,11 @@ fn has_line_anchor(ops: &[Op]) -> bool {
 /// a rejection that asks the agent to resend it only costs a round trip. The
 /// filled section then takes the tagged path, seen-lines gate included. Every
 /// other section, and every `create_file` section, passes through unchanged.
+///
+/// Text ops match on content, so any snapshot of the live content serves.
+/// Line numbers carry no content check, so a line-anchored section is filled
+/// only when the agent's latest view of the file is a read of the live
+/// content. After a write, the numbers of an earlier view can be stale.
 fn fill_live_tag<'a>(
     section: &'a Section,
     path: &Path,
@@ -543,10 +548,15 @@ fn fill_live_tag<'a>(
     }
     let key = crate::edit::normalize_path_key(path);
     let live_tag = compute_file_hash(live);
-    let Some(snap) = session.snapshots().by_tag(&key, live_tag) else {
-        return Cow::Borrowed(section);
+    let store = session.snapshots();
+    let snap = if has_line_anchor(&section.ops) {
+        store
+            .head(path)
+            .filter(|_| !store.head_recorded_by_write(path))
+    } else {
+        store.by_tag(&key, live_tag)
     };
-    if snap.text != live {
+    if snap.is_none_or(|snap| snap.text != live) {
         return Cow::Borrowed(section);
     }
     let mut section = section.clone();
@@ -2926,6 +2936,41 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             original.replacen("l2\n", "edited\n", 1)
         );
+    }
+
+    /// Line numbers carry no content check. After a write shifts lines, the
+    /// numbers of the earlier view are stale, so a tagless line op is not
+    /// filled from the write's snapshot and cannot land on a shifted line.
+    #[test]
+    fn tagless_line_op_after_a_write_is_not_filled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shift.rs");
+        let mut original = String::new();
+        for n in 1..=80 {
+            let _ = writeln!(original, "l{n}");
+        }
+        std::fs::write(&path, &original).unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let run = |ops: Value| {
+            let args = json!({"cwd": dir.path(), "edits": edits(&path, None, ops)});
+            match super::tool_write(&args, &session, &bloom, &cache) {
+                Ok(out) => out,
+                Err(e) => e,
+            }
+        };
+        let spec = format!("{}#1-80", path.to_str().unwrap());
+        read_tag(dir.path(), &spec, "shift.rs#", &session, &cache);
+
+        let insert = run(json!([{"op": "insert_after", "line": 10, "content": "a\nb\nc"}]));
+        assert!(insert.contains("applied"), "{insert}");
+        let shifted = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(shifted.lines().nth(49), Some("l47"));
+
+        // Line 50 of the read was l50; it is now line 53.
+        let stale = run(json!([{"op": "replace", "start": 50, "end": 50, "content": "edited"}]));
+        assert!(!stale.contains("applied"), "{stale}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), shifted);
     }
 
     #[test]
