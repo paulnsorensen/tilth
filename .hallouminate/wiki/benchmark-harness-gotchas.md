@@ -146,6 +146,17 @@ Grade in a fresh fixture copy, as `express_edit_example_start` now does for both
 
 A grader that shares one cargo target dir across grades must lock it from the mtime refresh through the last cargo command.
 Otherwise two parallel grades can build each other's sources. `rg_edit_flow_migration` holds `TARGET_DIR/.grade.lock` for the whole grade (PR #371).
+
+## Cargo 1.100 build-dir layout breaks ripgrep 13 integration tests
+
+Cargo 1.100 runs test executables from `target/debug/build/<pkg>/<hash>/out/`, not `target/debug/deps/`.
+ripgrep 13 finds `rg` from the parent of `env::current_exe()`, so every integration test fails.
+The gold patch of `burntsushi__ripgrep-2209` then grades 0/1 and the verdict is `gold_unresolved`.
+Setting `__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT=1` restores the old layout.
+A shell variable does not reach grading, because `toolchain_env` keeps only `_KEPT_KEYS` (`benchmark/external/proc.py`).
+So `toolchain_env` sets the variable itself, and `build_runner_env` (`benchmark/run.py`) sets it for rust tasks.
+The agent's `cargo test` then sees the same layout as the grade.
+Editing `proc.py` changes `package_digest`, so every external instance is admitted again on the next run.
 ## Related GEPA gotchas
 
 The October 2026 GEPA overhaul gotchas moved to [Benchmark GEPA overhaul gotchas](benchmark-gepa-gotchas.md). That page covers the bare flag, quota events, gepa 0.1.4, and external-task data.

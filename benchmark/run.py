@@ -393,6 +393,8 @@ def build_runner_env(
     env["DISABLE_AUTOUPDATER"] = "1"
     if language is not None:
         env.update(external.proc.c_build_env(language))
+    if language == "rust":
+        env[external.proc.CARGO_OLD_BUILD_LAYOUT_KEY] = "1"  # same cargo layout as the grade
     if language == "javascript":
         env["PATH"] = str(external.javascript.node_bin()) + os.pathsep + env.get("PATH", "")
 

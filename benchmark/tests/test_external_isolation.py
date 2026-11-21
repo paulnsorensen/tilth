@@ -14,6 +14,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import run
 import external.data
 import external.proc
 import external.swebench_ml
@@ -33,6 +34,16 @@ def test_toolchain_env_drops_credentials_and_swaps_home(tmp_path: Path) -> None:
     assert env["CARGO_HOME"] == "/opt/cargo"
     assert env["RUSTUP_HOME"] == "/home/real/.rustup"
     assert env["UV_PYTHON_INSTALL_DIR"] == "/home/real/.local/share/uv/python"
+
+
+def test_toolchain_env_opts_out_of_the_cargo_new_build_layout(tmp_path: Path) -> None:
+    assert external.proc.toolchain_env(tmp_path, {"PATH": "/bin"})["__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT"] == "1"
+
+
+def test_rust_agent_env_opts_out_of_the_cargo_new_build_layout() -> None:
+    key = "__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT"
+    assert run.build_runner_env("claude", ambient={}, tilth_bin=None, language="rust")[key] == "1"
+    assert key not in run.build_runner_env("claude", ambient={}, tilth_bin=None, language="python")
 
 
 @pytest.mark.parametrize("relative", ["../escape.py", "/etc/escape.py", "tests/../../escape.py", ""])
