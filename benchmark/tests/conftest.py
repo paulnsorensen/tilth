@@ -99,6 +99,9 @@ class Bench:
         self.monkeypatch.setattr(run, "run_single", fake_run_single)
 
     def main(self, *argv: str) -> int:
+        """Run `run.main()`; strict file tools default on for Claude, so these store tests opt out unless they choose."""
+        if not {"--strict-file-tools", "--no-strict-file-tools"} & set(argv):
+            argv = (*argv, "--no-strict-file-tools")
         self.monkeypatch.setattr(sys, "argv", ["run.py", *argv])
         try:
             run.main()
@@ -119,6 +122,16 @@ def hermetic_version_probes(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep host toolchain and agent CLI probes out of every test's subprocess stubs."""
     monkeypatch.setattr(run, "_probe_version", lambda argv: f"{argv[0]} test-version")
     monkeypatch.setattr(run, "_run_probe", lambda argv: f"{argv[0]} test-version")
+
+
+REAL_CODEX_CATALOG_FILE = run._codex_catalog_file
+HERMETIC_CODEX_CATALOG = Path("/hermetic/codex-catalogs/catalog-hermetic.json")
+
+
+@pytest.fixture(autouse=True)
+def hermetic_codex_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the real ``codex debug models`` out of every test; catalog tests restore ``REAL_CODEX_CATALOG_FILE``."""
+    monkeypatch.setattr(run, "_codex_catalog_file", lambda: HERMETIC_CODEX_CATALOG)
 
 
 @pytest.fixture(autouse=True)

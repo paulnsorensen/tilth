@@ -53,7 +53,8 @@ def results(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
 
 def _argv(mode: run.ModeConfig, model: str) -> list[str]:
     cmd, _ = run._runner_command(TASK, mode, mode.name, model, Path("/work/repo"), bare=True, reasoning_effort=None,
-                                 max_budget_usd=1.0, strict_file_tools=False, skill_paths=[])
+                                 max_budget_usd=1.0, strict_file_tools=False, skill_paths=[],
+                                 strict_hook_binary="/pinned/seed/tilth")
     return cmd
 
 
@@ -88,7 +89,7 @@ def test_claude_preamble_arm_replaces_the_system_prompt_with_the_tree_preamble(t
 
 def test_codex_preamble_arm_sets_the_model_instructions_file(tree) -> None:
     repo, first, _second = tree
-    mode = run.preamble_mode(run.MODES["tilth"], run.read_preamble(first, repo=repo))
+    mode = run.preamble_mode(run.MODES["tilth_forced"], run.read_preamble(first, repo=repo))
 
     cmd = _argv(mode, "luna56")
 
@@ -99,22 +100,23 @@ def test_codex_preamble_arm_sets_the_model_instructions_file(tree) -> None:
     assert developer.startswith("Your current working directory is: /work/repo\n")
     assert run.SYSTEM_PROMPT not in developer
     assert cmd.index("--") > cmd.index(f"model_instructions_file={json.dumps(str(instructions_file))}")
-    stock = _argv(run.MODES["tilth"], "luna56")
+    stock = _argv(run.MODES["tilth_forced"], "luna56")
     assert not any(arg.startswith("model_instructions_file=") for arg in stock)
     assert json.loads(_config(stock, "developer_instructions")) == run.SYSTEM_PROMPT + "\n" + developer
 
 
 def _identity(monkeypatch: pytest.MonkeyPatch, mode_name: str, model: str, text: str | None) -> dict:
     base = run.MODES[mode_name]
+    monkeypatch.setattr(run, "_hook_source_key", lambda _sha, _repo=None: "tree:lock")
     monkeypatch.setitem(run.MODES, mode_name, base if text is None else run.preamble_mode(base, text))
     try:
         return run.cell_identity("preamble_task", mode_name, model, 0, bare=True, reasoning_effort=None,
-                                 max_budget_usd=1.0, strict_file_tools=False)
+                                 max_budget_usd=1.0, strict_file_tools=False, hook_sha="seed")
     finally:
         monkeypatch.setitem(run.MODES, mode_name, base)
 
 
-@pytest.mark.parametrize(("mode_name", "model"), [("tilth_forced", "sonnet5"), ("tilth", "luna56")])
+@pytest.mark.parametrize(("mode_name", "model"), [("tilth_forced", "sonnet5"), ("tilth_forced", "luna56")])
 def test_the_preamble_text_keys_the_cell(monkeypatch: pytest.MonkeyPatch, mode_name: str, model: str) -> None:
     stock = _identity(monkeypatch, mode_name, model, None)
     first = _identity(monkeypatch, mode_name, model, PREAMBLE_A)
@@ -129,10 +131,10 @@ def test_the_preamble_text_keys_the_cell(monkeypatch: pytest.MonkeyPatch, mode_n
 
 def test_the_key_ignores_where_the_codex_instructions_file_lives(monkeypatch: pytest.MonkeyPatch,
                                                                 tmp_path: Path) -> None:
-    first = _identity(monkeypatch, "tilth", "luna56", PREAMBLE_A)
+    first = _identity(monkeypatch, "tilth_forced", "luna56", PREAMBLE_A)
     monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "elsewhere")
 
-    assert _identity(monkeypatch, "tilth", "luna56", PREAMBLE_A)["run_key"] == first["run_key"]
+    assert _identity(monkeypatch, "tilth_forced", "luna56", PREAMBLE_A)["run_key"] == first["run_key"]
 
 
 def test_a_preamble_arm_without_text_is_unbuildable() -> None:
@@ -145,19 +147,20 @@ def test_a_preamble_arm_without_text_is_unbuildable() -> None:
 def test_the_cli_flag_reads_the_checkout_and_patches_only_tilth_arms(monkeypatch: pytest.MonkeyPatch, tree) -> None:
     repo, first, _second = tree
     monkeypatch.setattr(run, "REPO_ROOT", repo)
-    for name in ("baseline", "tilth", "tilth_forced"):
+    for name in ("baseline", "tilth_forced"):
         monkeypatch.setitem(run.MODES, name, run.MODES[name])
 
-    run._apply_preamble(["baseline", "tilth"], ["sonnet5"], None, None)
+    run._apply_preamble(["baseline", "tilth_forced"], ["sonnet5"], None, None)
 
-    assert run.MODES["tilth"].preamble == PREAMBLE_B
+    assert run.MODES["tilth_forced"].preamble == PREAMBLE_B
     assert run.MODES["baseline"].prompt_mode == "replace"
+    monkeypatch.setitem(run.MODES, "tilth_forced", replace(run.MODES["tilth_forced"], prompt_mode="append", preamble=None))
     run._apply_preamble(["tilth_forced"], ["sonnet5"], None, first)
     assert run.MODES["tilth_forced"].preamble == PREAMBLE_A
 
 
 @pytest.mark.parametrize(("modes", "models", "message"), [
-    (["tilth"], ["gpt5mini"], "Claude and Codex"),
+    (["tilth_forced"], ["gpt5mini"], "Claude and Codex"),
     (["baseline"], ["sonnet5"], "no selected arm serves tilth"),
 ])
 def test_the_cli_flag_refuses_unsupported_runs(modes, models, message) -> None:
@@ -256,7 +259,7 @@ def _modes_file(tmp_path: Path, *entries: dict) -> Path:
 
 def _tilth_entry(name: str, prompt_mode: str) -> dict:
     return {"name": name, "tools": ["Bash"], "description": name, "prompt_mode": prompt_mode,
-            "mcp_config_path": run.MODES["tilth"].mcp_config_path}
+            "mcp_config_path": run.MODES["tilth_forced"].mcp_config_path}
 
 
 def test_a_modes_file_places_a_preamble_per_arm(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, tree) -> None:

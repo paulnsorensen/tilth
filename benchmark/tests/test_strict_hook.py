@@ -727,13 +727,16 @@ def test_strict_guidance_is_hashed_into_the_strict_key(monkeypatch: pytest.Monke
     assert before != after
 
 
-def test_strict_plan_refuses_a_non_claude_cell(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_strict_applies_per_runner_so_a_non_claude_cell_keeps_its_plain_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
     world = _strict_world(monkeypatch, tmp_path)
     non_claude = next(model for model, runner in run.RUNNERS.items() if runner != "claude")
+    cell = run.CellSpec(DEV[0], "baseline", non_claude, 0)
+    keys = [run.planned_identity(cell, max_budget_usd=1.0, strict_file_tools=strict, hook_sha=world.seed_sha,
+                                 hook_repo=world.repo)["run_key"] for strict in (True, False)]
 
-    with pytest.raises(ValueError, match="requires Claude models"):
-        _plan(world, [run.CellSpec(DEV[0], "baseline", non_claude, 0)], strict_file_tools=True,
-              hook_sha=world.seed_sha)
+    assert keys[0] == keys[1]
 
 
 def test_strict_plan_reports_a_hook_sha_without_src_hook_as_a_build_failure(

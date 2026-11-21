@@ -49,7 +49,7 @@ def test_run_plan_rows_carry_panel_stamp(world, monkeypatch: pytest.MonkeyPatch)
         real_store(row, path=path)
 
     monkeypatch.setattr(baselines, "store", checking_store)
-    plan(world, cells(*CHEAP, *DEV, *TEST) + cells(*DEV, mode="tilth"), sha=world.seed_sha)
+    plan(world, cells(*CHEAP, *DEV, *TEST) + cells(*DEV, mode="tilth_forced"), sha=world.seed_sha)
 
     rows = world.stored()
     assert stored_without_stamp == []
@@ -363,14 +363,14 @@ def test_candidate_build_keys_on_the_full_sha(candidate_repo) -> None:
 
 
 def test_candidate_cells_record_candidate_identity(world) -> None:
-    rows = plan(world, cells(*DEV, mode="tilth"), sha=world.seed_sha)
+    rows = plan(world, cells(*DEV, mode="tilth_forced"), sha=world.seed_sha)
 
     assert world.builds == [world.seed_sha]
-    assert [call[3] for call in world.runner_calls("tilth")] == [world.seed_sha] * len(DEV)
+    assert [call[3] for call in world.runner_calls("tilth_forced")] == [world.seed_sha] * len(DEV)
     for row in rows:
         assert row["git_sha"] == row["variant"]["git_sha"] == world.seed_sha
         assert row["binary_sha256"] == row["variant"]["binary_sha256"] == f"sha256-of-{world.seed_sha}"
-    assert run.MODES["tilth"].git_sha is None
+    assert run.MODES["tilth_forced"].git_sha is None
 
 
 def test_run_py_candidate_sha_flag(bench, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -381,10 +381,10 @@ def test_run_py_candidate_sha_flag(bench, monkeypatch: pytest.MonkeyPatch) -> No
         return run.CandidateBuild(git_sha=sha, binary_path="/bin/true", binary_sha256="sha256-candidate")
 
     monkeypatch.setattr(run, "build_candidate", fake_build)
-    monkeypatch.setitem(run.MODES, "tilth", run.replace(run.MODES["tilth"], binary_path="/bin/true"))
+    monkeypatch.setitem(run.MODES, "tilth_forced", run.replace(run.MODES["tilth_forced"], binary_path="/bin/true"))
     bench.runner(lambda _stream: 0.1)
 
-    assert bench.main("--tasks", "cell_a", "--modes", "tilth", "--models", "sonnet5", "--reps", "1",
+    assert bench.main("--tasks", "cell_a", "--modes", "tilth_forced", "--models", "sonnet5", "--reps", "1",
                       "--max-usd", "5", "--candidate-sha", "abc123") == 0
 
     assert built == ["abc123"]
@@ -444,9 +444,9 @@ def test_run_plan_reports_any_build_failure_as_candidate_build_failed(world, mon
 
     monkeypatch.setattr(run, "_build_candidate", failing)
     with pytest.raises(run.CandidateBuildFailed, match="fatal: invalid reference"):
-        plan(world, cells(*DEV, mode="tilth"), sha=world.seed_sha)
+        plan(world, cells(*DEV, mode="tilth_forced"), sha=world.seed_sha)
     assert world.runner_calls() == []
-    assert run.MODES["tilth"].git_sha is None
+    assert run.MODES["tilth_forced"].git_sha is None
 
 
 # --- config-level failures stop the plan as main aborts the run ---

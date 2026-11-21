@@ -125,7 +125,7 @@ def rollout(directory: Path, index: int = 0, **fields: object) -> tuple[dict, st
             "output": LONG_OUTPUT + f" ROLLOUT[{index:02d}]", "is_error": False}
     sidecar.write_text(json.dumps(call) + "\n")
     row = {
-        "task": "rg_search_dispatch", "mode": "tilth", "model": "claude-sonnet-5", "repetition": index,
+        "task": "rg_search_dispatch", "mode": "tilth_forced", "model": "claude-sonnet-5", "repetition": index,
         "num_turns": 3, "num_tool_calls": 1, "tool_calls": {"Bash": 1}, "total_cost_usd": 0.12,
         "duration_ms": 900, "result_text": f"Final answer ROLLOUT[{index:02d}]\nIt is \"ReadByLine\" AGENT_GT",
         "correct": True, "pass_rate": 1.0, "f2p_passed": 3, "f2p_output": "SECRET_GT f2p output",
@@ -785,9 +785,9 @@ def report_rows() -> list[dict]:
                 "result_text": f"{task}-{mode}-{repetition}", "capability": "trace"}
     return [
         row("alpha", "baseline", 0, True, 1.0), row("alpha", "baseline", 1, False, 1.0),
-        row("alpha", "tilth", 0, True, 0.5), row("alpha", "tilth", 1, True, 0.5),
+        row("alpha", "tilth_forced", 0, True, 0.5), row("alpha", "tilth_forced", 1, True, 0.5),
         row("beta", "baseline", 0, True, 2.0), row("beta", "baseline", 1, True, 2.0),
-        row("beta", "tilth", 0, False, 3.0), row("beta", "tilth", 1, True, 3.0),
+        row("beta", "tilth_forced", 0, False, 3.0), row("beta", "tilth_forced", 1, True, 3.0),
     ]
 
 
@@ -826,7 +826,7 @@ def test_analyze_slices_by_label_when_calibrated(no_judge_calls: None) -> None:
     assert text.startswith("## Applicability\n")
     assert "| Label | Mode | Correctness | Cost/correct |" in text
     for label, task in (("strong", "alpha"), ("none", "beta")):
-        for mode in ("baseline", "tilth"):
+        for mode in ("baseline", "tilth_forced"):
             runs = [row for row in results if row["task"] == task and row["mode"] == mode]
             expected = (f"| {label} | {analyze.mode_label(mode)} | {analyze.correctness_pct(runs):.0f}% | "
                         f"{analyze._fmt_usd(analyze.cost_per_correct(runs)[0])} |")

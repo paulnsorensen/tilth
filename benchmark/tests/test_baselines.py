@@ -35,7 +35,7 @@ _CELL = {
     "cli_version": "2.1.0",
     "reasoning_effort": None,
     "timeout_s": 600,
-    "mode": "tilth",
+    "mode": "tilth_forced",
     "repetition": 0,
     "git_sha": "a" * 40,
     "binary_sha256": "b" * 64,
@@ -302,7 +302,6 @@ def test_no_tilth_arm_is_drift_checked_as_a_baseline(bench, monkeypatch: pytest.
 
 def test_tilth_arm_is_not_a_stock_arm() -> None:
     assert run.is_stock_arm(run.MODES["baseline"])
-    assert not run.is_stock_arm(run.MODES["tilth"])
     assert not run.is_stock_arm(run.MODES["tilth_forced"])
 
 

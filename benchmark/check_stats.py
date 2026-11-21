@@ -65,7 +65,7 @@ def check_pairing() -> None:
     # baseline vs tilth across 3 reps; rep2 baseline ERRORED (no cost, correct=False).
     runs = []
     for rep in range(3):
-        runs.append({"task": "t1", "model": "sonnet", "mode": "tilth",
+        runs.append({"task": "t1", "model": "sonnet", "mode": "tilth_forced",
                      "repetition": rep, "correct": True, "total_cost_usd": 0.05})
     for rep in (0, 1):
         runs.append({"task": "t1", "model": "sonnet", "mode": "baseline",
@@ -208,7 +208,7 @@ def check_power_readout() -> None:
         for i, (bc, tc) in enumerate(pattern):
             out.append({"task": f"t{i}", "model": "m", "mode": "baseline",
                         "repetition": 0, "correct": bc, "total_cost_usd": 0.1})
-            out.append({"task": f"t{i}", "model": "m", "mode": "tilth",
+            out.append({"task": f"t{i}", "model": "m", "mode": "tilth_forced",
                         "repetition": 0, "correct": tc, "total_cost_usd": 0.05})
         return out
 

@@ -67,12 +67,19 @@ binary's prompt surface is in question.**
 
 The September benchmark adds explicit Codex isolation and a forward-migration grader, documented in [Tool Efficiency Report: tilth versus WOZCODE](sources/tilth-versus-wozcode-2026-09.md).[^sept-harness]
 These are properties of the extracted harness commit, not claims that every installed runner supports them.
-Codex scheduling rejects other providers and `tilth_forced` before inference.
+Codex scheduling rejects other providers before inference.
+As of the tilth-only arm, `tilth_forced` runs on Codex too.
 The runner disables discovered skills explicitly; `skip_host_skill_discovery` alone is insufficient in CLI 0.154.0.
-It disables skill search, plugins, hooks, apps, and delegation for the measured invocation.
+It disables skill search, plugins, apps, and delegation for the measured invocation.
+The baseline also disables hooks. The tilth-only arm keeps a hooked shell instead (see below).
 The tilth server is required. A missing successful MCP call or detected skill-access attempt invalidates the run.
 Codex lacks Claude's init inventory, so an empty `available_tools` field does not prove MCP absence.
-The tilth arm retains native tools and receives explicit MCP-first guidance.
+The tilth-only arm has no `apply_patch`: the harness copies `codex debug models` with `apply_patch_tool_type=null` and `tool_mode="default"` and passes it as `-c model_catalog_json=<path>`.
+Its shell stays but runs behind an inline `hooks.PreToolUse` that calls `tilth hook --host codex --hint tilth`.
+Inline hooks need `--dangerously-bypass-hook-trust`; without it the hook never fires and `cat` runs.
+A zero-spend preflight (`codex debug prompt-input` with the same flags) must show no `apply_patch` tool before any cell runs.
+The built-in base instructions still say "use apply_patch" as text; only the `preamble` prompt mode replaces them.
+`benchmark/codex_probe.py` proves the hook denial against a mock Responses server with no model spend.
 Invocation-only write approval enables `tilth_write`; it neither changes global settings nor confines MCP paths.
 
 The small Luna selection uses two test-graded Gin repairs and excludes read-only, single-file, history-only, and keyword-graded tasks.
@@ -275,5 +282,6 @@ A zero-spend probe ran each agent process's real argv against a local server tha
 - `skip_host_skill_discovery` does not stop `~/.agents/skills`. Only the per-path `skills.config` entries do (`run.codex_skills_off`).
 - Deep diagnosis now uses the cells' isolation flags and per-path skill switches. It also uses the runner env allowlist and `run.isolated_codex_home`, a temp `CODEX_HOME` that holds only a copy of `auth.json`. A refreshed token goes back to the host file.
 - To probe Codex with no spend, add a provider with `-c model_provider=<name>` and `model_providers.<name>.base_url`, `wire_api="responses"`, and `env_key`. Start the `env_key` name with `OPENAI_`, so the runner env allowlist keeps it.
+- `--disable multi_agent` does not remove Codex's v2 collaboration tools (`spawn_agent`, `send_message`, `wait_agent`). The model catalog's per-model `multi_agent_version` does. `run._codex_catalog_file` sets it to null, and `codex_probe.problems()` refuses `spawn_agent` and `apply_patch` in the request.
 
 _Source: PR #277 at 411e183; stock-prompt A/B run log, `systemd-tmpfiles-clean` journal (2026-11-02), and the A/B `rows.jsonl` cost sum (local, untracked); 2026-11-05 capture probe (local, untracked) · Updated: 2026-11-05 · Supersedes: no historical measurements; narrows general claims to their measured configurations_

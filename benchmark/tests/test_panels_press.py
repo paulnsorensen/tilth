@@ -114,8 +114,8 @@ def test_paired_loader_counts_contaminated_panel_rows_incorrect(tmp_path: Path) 
     import paired
 
     rows = [{"task": "t", "mode": "baseline", "correct": True, "panel_name": "p", "contaminated": True},
-            {"task": "t", "mode": "tilth", "correct": True, "contaminated": True},
-            {"task": "t", "mode": "tilth", "correct": True, "panel_name": "p", "contaminated": False}]
+            {"task": "t", "mode": "tilth_forced", "correct": True, "contaminated": True},
+            {"task": "t", "mode": "tilth_forced", "correct": True, "panel_name": "p", "contaminated": False}]
     path = tmp_path / "results.jsonl"
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
 

@@ -49,7 +49,7 @@ def _drive_main(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *extra: str, ru
     monkeypatch.setattr(run, "run_single", runner or timeout)
     monkeypatch.setattr(sys, "argv", ["run.py", "--tasks", "cli_task", "--models", "sonnet5",
                                       "--modes", "baseline", "--reps", "1", "--max-cells", "1",
-                                      "--max-usd", "100", *extra])
+                                      "--max-usd", "100", "--no-strict-file-tools", *extra])
     run.main()
     return results
 
@@ -112,7 +112,7 @@ def test_a_failed_first_clone_prints_the_clean_error_and_exits_1(monkeypatch, tm
     monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
     monkeypatch.setattr(sys, "argv", ["run.py", "--tasks", "boom_task", "--models", "sonnet5",
                                       "--modes", "baseline", "--reps", "1", "--max-cells", "1",
-                                      "--max-usd", "100"])
+                                      "--max-usd", "100", "--no-strict-file-tools"])
 
     with pytest.raises(SystemExit) as exit_info:
         run.main()
@@ -212,7 +212,7 @@ def test_main_aborts_with_the_kind_specific_message(monkeypatch, tmp_path, capsy
     monkeypatch.setattr(run, "run_single", unavailable)
     monkeypatch.setattr(sys, "argv", ["run.py", "--tasks", "cli_task", "--models", "sonnet5",
                                       "--modes", "baseline", "--reps", "1", "--max-cells", "1",
-                                      "--max-usd", "100"])
+                                      "--max-usd", "100", "--no-strict-file-tools"])
     with pytest.raises(SystemExit):
         run.main()
 
