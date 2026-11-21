@@ -124,6 +124,16 @@ def hermetic_version_probes(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(run, "_run_probe", lambda argv: f"{argv[0]} test-version")
 
 
+REAL_CODEX_CATALOG_FILE = run._codex_catalog_file
+HERMETIC_CODEX_CATALOG = Path("/hermetic/codex-catalogs/catalog-hermetic.json")
+
+
+@pytest.fixture(autouse=True)
+def hermetic_codex_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the real ``codex debug models`` out of every test; catalog tests restore ``REAL_CODEX_CATALOG_FILE``."""
+    monkeypatch.setattr(run, "_codex_catalog_file", lambda: HERMETIC_CODEX_CATALOG)
+
+
 @pytest.fixture(autouse=True)
 def hermetic_claude_pin(monkeypatch: pytest.MonkeyPatch) -> None:
     """Spawn plain ``claude`` and skip the pin check; tests of the pin restore the real functions."""

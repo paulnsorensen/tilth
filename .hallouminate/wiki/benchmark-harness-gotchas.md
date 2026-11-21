@@ -282,5 +282,6 @@ A zero-spend probe ran each agent process's real argv against a local server tha
 - `skip_host_skill_discovery` does not stop `~/.agents/skills`. Only the per-path `skills.config` entries do (`run.codex_skills_off`).
 - Deep diagnosis now uses the cells' isolation flags and per-path skill switches. It also uses the runner env allowlist and `run.isolated_codex_home`, a temp `CODEX_HOME` that holds only a copy of `auth.json`. A refreshed token goes back to the host file.
 - To probe Codex with no spend, add a provider with `-c model_provider=<name>` and `model_providers.<name>.base_url`, `wire_api="responses"`, and `env_key`. Start the `env_key` name with `OPENAI_`, so the runner env allowlist keeps it.
+- `--disable multi_agent` does not remove Codex's v2 collaboration tools (`spawn_agent`, `send_message`, `wait_agent`). The model catalog's per-model `multi_agent_version` does. `run._codex_catalog_file` sets it to null, and `codex_probe.problems()` refuses `spawn_agent` and `apply_patch` in the request.
 
 _Source: PR #277 at 411e183; stock-prompt A/B run log, `systemd-tmpfiles-clean` journal (2026-11-02), and the A/B `rows.jsonl` cost sum (local, untracked); 2026-11-05 capture probe (local, untracked) · Updated: 2026-11-05 · Supersedes: no historical measurements; narrows general claims to their measured configurations_

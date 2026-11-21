@@ -316,7 +316,7 @@ def isolated_codex_home(env: dict[str, str], prefix: str):
     with tempfile.TemporaryDirectory(prefix=prefix) as home:
         call_auth = Path(home) / "auth.json"
         if seed is not None:
-            _copy_private(host_auth, call_auth)
+            _write_private(call_auth, seed)
         env["CODEX_HOME"] = home
         try:
             yield
@@ -325,7 +325,7 @@ def isolated_codex_home(env: dict[str, str], prefix: str):
                 with _host_auth_lock(host_auth):
                     current = host_auth.read_bytes() if host_auth.is_file() else None
                     if current == seed and _is_json(refreshed):
-                        _copy_private(call_auth, host_auth)
+                        _write_private(host_auth, refreshed)
 
 
 def budget_capped(stream: str) -> bool:
@@ -464,6 +464,13 @@ def _codex_skill_paths(repo_path: Path, env: Mapping[str, str]) -> list[str]:
 
 class InvalidCodexCellError(RuntimeError):
     """A Codex cell broke benchmark isolation or did not use required MCP."""
+
+
+class CodexSurfaceError(InvalidCodexCellError):
+    """The zero-spend tool-surface check failed or timed out before any model call, so the cell costs nothing."""
+
+
+CODEX_FORBIDDEN_TOOLS = frozenset({"apply_patch", "spawn_agent"})
 
 
 _CODEX_FILE_ITEMS = frozenset({"file_change", "file_edit", "file_write"})
@@ -680,6 +687,23 @@ def _skill_audit_fields(mode: ModeConfig, run_result) -> dict:
         "bundled_skills_exposed": sorted(s for s in run_result.skills if not s.startswith(prefix)),
     }
 
+
+
+def _write_private(destination: Path, data: bytes) -> None:
+    descriptor, temp_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.",
+        dir=destination.parent,
+    )
+    temp_path = Path(temp_name)
+    try:
+        try:
+            os.fchmod(descriptor, 0o600)
+            os.write(descriptor, data)
+        finally:
+            os.close(descriptor)
+        os.replace(temp_path, destination)
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def _copy_private(source: Path, destination: Path) -> None:
@@ -1504,6 +1528,9 @@ def _codex_catalog_file() -> Path:
     for model in models:
         model["apply_patch_tool_type"] = None
         model["tool_mode"] = "default"
+        # `--disable multi_agent` leaves the v2 collaboration tools (spawn_agent, ...); this per-model key removes them.
+        model["multi_agent_version"] = None
+        model.pop("multi_agent_reasoning_effort", None)
     data = json.dumps(catalog, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return _write_content_addressed(
         RESULTS_DIR / "configs" / "codex-catalogs" / f"catalog-{hashlib.sha256(data).hexdigest()}.json", data,
@@ -1583,26 +1610,28 @@ def _audit_codex_commands(raw: str, hook_binary: str, *, partial: bool = False) 
     return len(commands)
 
 
-def check_codex_hook_live(mode: ModeConfig, hook_binary: str) -> None:
+def check_codex_hook_live(mode: ModeConfig, hook_binary: str, model_id: str) -> None:
     """Run the zero-spend mock-provider probe on one arm's real argv; raise when it does not enforce."""
     # The probe imports ``run``; as a script this module is ``__main__``, so name it to avoid a second copy.
     sys.modules.setdefault("run", sys.modules[__name__])
     import codex_probe
-    found = codex_probe.problems(codex_probe.probe(mode, hook_binary, [], None))
+    found = codex_probe.problems(codex_probe.probe(mode, hook_binary, [], None, model_id))
     if found:
-        raise InvalidCodexCellError(f"Codex hook live check failed for {mode.name}: {'; '.join(found)}")
+        raise InvalidCodexCellError(
+            f"Codex hook live check failed for {mode.name} on {model_id}: {'; '.join(found)}")
 
 
-def preflight_codex_hooks(mode_names, hook_binary: str) -> None:
+def preflight_codex_hooks(mode_models, hook_binary: str) -> None:
     """Refuse a run, before any spend, when the pinned hook or a Codex tilth-only argv does not enforce.
 
+    ``mode_models`` holds the ``(mode name, model id)`` pairs the run will use; each gets its own probe.
     The hook is probed with the Codex host flag first: a binary without a ``hook`` subcommand exits 2,
     which looks like a deny, so the allow probe must see exit 0. Raises ``HookProbeFailed`` or
     ``InvalidCodexCellError``.
     """
     _probe_hook(hook_binary, "tilth", host="codex")
-    for name in sorted(mode_names):
-        check_codex_hook_live(MODES[name], hook_binary)
+    for name, model_id in sorted(mode_models):
+        check_codex_hook_live(MODES[name], hook_binary, model_id)
 
 
 def check_codex_tool_surface(cmd: list[str], env: Mapping[str, str], cwd: Path,
@@ -1612,15 +1641,18 @@ def check_codex_tool_surface(cmd: list[str], env: Mapping[str, str], cwd: Path,
     The argv resolves ``codex`` as the exec does. The goal tools appear only in the real request, not in
     this rendering, so the live probe checks the request tools too.
     """
-    proc = subprocess.run(
-        _host_runner_argv(_codex_prompt_input_argv(cmd), env, agent_venv),
-        capture_output=True, text=True, timeout=60, env=dict(env), cwd=str(cwd),
-    )
+    try:
+        proc = subprocess.run(
+            _host_runner_argv(_codex_prompt_input_argv(cmd), env, agent_venv),
+            capture_output=True, text=True, timeout=60, env=dict(env), cwd=str(cwd),
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise CodexSurfaceError(f"codex debug prompt-input did not finish: {error}") from error
     if proc.returncode != 0:
-        raise InvalidCodexCellError(f"codex debug prompt-input failed with code {proc.returncode}: {proc.stderr.strip()}")
+        raise CodexSurfaceError(f"codex debug prompt-input failed with code {proc.returncode}: {proc.stderr.strip()}")
     names = _codex_tool_names(json.loads(proc.stdout)[0].get("tools") or [])
-    if "apply_patch" in names or "exec_command" not in names:
-        raise InvalidCodexCellError(f"Codex tilth-only tool surface is wrong: {sorted(names)}")
+    if names & CODEX_FORBIDDEN_TOOLS or "exec_command" not in names:
+        raise CodexSurfaceError(f"Codex tilth-only tool surface is wrong: {sorted(names)}")
     return names
 
 
@@ -2065,7 +2097,8 @@ def _run_single_cell(
         if final.get("is_error") is not False or final.get("subtype") != "success":
             raise RuntimeError(f"claude -p did not complete successfully: {final.get('subtype', 'missing result')}")
 
-    # Parse output based on runner
+    # Audit first: parse_codex_json raises on a failed stream, which would skip the replay.
+    codex_audited = _audit_codex_commands(result.stdout, hook_binary) if codex_hooked else 0
     if runner == "codex":
         run_result = parse_codex_json(result.stdout, model_id)
     elif runner == "opencode":
@@ -2078,7 +2111,6 @@ def _run_single_cell(
             result.stdout, bool(mode.mcp_config_path), skill_paths, skill_roots,
             tilth_only=bool(mode.mcp_config_path),
         )
-    codex_audited = _audit_codex_commands(result.stdout, hook_binary) if codex_hooked else 0
 
     run_result.task_name = task_name
     run_result.mode_name = mode_name
@@ -2239,7 +2271,16 @@ def resolve_strict_file_tools(requested: bool | None, models: list[str]) -> bool
 
 def select_modes(value: str | None, runner: str | None) -> list[str]:
     """The stock arm and the tilth-only arm, on every runner that can enforce it."""
-    return parse_comma_list(value or ("baseline,tilth_forced" if runner == "codex" else "all"), MODES, "modes")
+    default = {"codex": "baseline,tilth_forced", "opencode": ",".join(_opencode_modes())}.get(runner or "", "all")
+    return parse_comma_list(value or default, MODES, "modes")
+
+
+def _opencode_supports(mode_name: str) -> bool:
+    return mode_name in OPENCODE_CONFIGS or bool(getattr(MODES.get(mode_name), "opencode_config_path", None))
+
+
+def _opencode_modes() -> list[str]:
+    return sorted(name for name in MODES if _opencode_supports(name))
 
 
 def parse_comma_list(value: str, valid_options: dict, name: str) -> list[str]:
@@ -2707,7 +2748,10 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
         codex_modes = {cell.mode for cell, _ in pending if _codex_hooked(RUNNERS[cell.model], MODES[cell.mode])}
         if codex_modes:
             try:
-                preflight_codex_hooks(codex_modes, build_candidate(hook_sha, repo=hook_repo).binary_path)
+                preflight_codex_hooks(
+                    {(cell.mode, MODELS[cell.model]) for cell, _ in pending
+                     if _codex_hooked(RUNNERS[cell.model], MODES[cell.mode])},
+                    build_candidate(hook_sha, repo=hook_repo).binary_path)
             except (subprocess.SubprocessError, OSError, ValueError) as error:
                 raise InvalidCodexCellError(f"Codex hook check failed; no cell ran: {error}") from error
 
@@ -2819,6 +2863,11 @@ def _run_plan(cells: list[CellSpec], *, panel, ledger: SpendLedger, refreeze_bas
                                 bare=True, max_budget_usd=cell_cap,
                                 **({"strict_file_tools": strict_file_tools, "hook_sha": hook_sha,
                                     "hook_repo": hook_repo} if hook_sha is not None else {}))
+        except CodexSurfaceError as error:
+            # The check ran before the model: nothing was spent, so the estimate is not charged.
+            fail({"infra": "codex_surface", "error": f"infra:codex_surface: {error}",
+                  "correctness_reason": f"Surface check failed: {error}"}, charge=0.0)
+            raise PlanStopped("codex-surface", str(error), rows) from error
         except InvalidCodexCellError as error:
             fail({"error": f"invalid_codex_cell: {error}", "correctness_reason": f"Invalid cell: {error}"})
             raise PlanStopped("invalid-cell", str(error), rows) from error
@@ -2998,9 +3047,17 @@ def _select_arms(args: argparse.Namespace, models: list[str], timestamp: str) ->
             raise ValueError("--modes-json skill and prompt_mode arms require Claude models")
     else:
         requested_modes = args.modes or ("baseline,tilth_forced,wozcode" if args.wozcode_plugin_dir else None)
-        modes = select_modes(requested_modes, args.runner)
+        runners = {RUNNERS[model] for model in models}
+        modes = select_modes(requested_modes, args.runner or (next(iter(runners)) if len(runners) == 1 else None))
         if "wozcode" in modes and not args.wozcode_plugin_dir:
             raise ValueError("wozcode mode requires --wozcode-plugin-dir")
+    for model in models:
+        if RUNNERS[model] == "opencode":
+            unsupported = [name for name in modes if not _opencode_supports(name)]
+            if unsupported:
+                raise ValueError(
+                    f"opencode model {model} has no config for mode(s) {', '.join(unsupported)}; "
+                    f"supported: {', '.join(_opencode_modes())}")
     return modes, experiment
 
 
@@ -3475,7 +3532,9 @@ Examples:
         # Zero spend: a mock provider, once per run, before the first paid cell.
         if codex_preflight and any(_codex_hooked(RUNNERS[cell.model_name], MODES[cell.mode_name]) for cell in pending):
             try:
-                preflight_codex_hooks(codex_preflight, hook_binary)
+                preflight_codex_hooks(
+                    {(cell.mode_name, MODELS[cell.model_name]) for cell in pending
+                     if _codex_hooked(RUNNERS[cell.model_name], MODES[cell.mode_name])}, hook_binary)
             except (HookProbeFailed, InvalidCodexCellError, subprocess.SubprocessError, OSError, ValueError) as error:
                 parser.error(f"Codex hook check failed; no cell ran: {error}")
 
@@ -3697,6 +3756,19 @@ Examples:
                 result.update(cell.identity)
                 result["reused"] = False
                 result.setdefault("trajectory_path", None)
+
+            except CodexSurfaceError as error:
+                # The check ran before the model: nothing was spent, so the estimate is not charged.
+                print(f"  ✗ CODEX SURFACE CHECK FAILED: {error}")
+                record_failure({
+                    **record_metadata,
+                    "infra": "codex_surface",
+                    "error": f"infra:codex_surface: {error}",
+                    "correct": False,
+                    "correctness_reason": f"Surface check failed: {error}",
+                }, stream_log_path, runner, 0.0)
+                print("\nAborting run: Codex tool surface check failed; no model call ran.")
+                sys.exit(1)
 
             except InvalidCodexCellError as error:
                 print(f"  ✗ INVALID CODEX CELL: {error}")

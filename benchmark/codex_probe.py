@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import run  # noqa: E402
 
+DEFAULT_MODEL = "gpt-5.6-sol"
 SECRET = "probe-secret-line"
 SCRIPT = ("cat hello.txt", "ls")
 
@@ -71,12 +72,18 @@ class MockResponses(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
 
+def request_tool_names(request: dict) -> list[str]:
+    """Tool names a Responses request offers: the declared ``tools`` field and the ``input`` items."""
+    return sorted(run._codex_tool_names(request.get("tools") or []) | run._codex_tool_names(request.get("input") or []))
+
+
 def _outputs(request: dict) -> list[str]:
     return [str(item.get("output")) for item in request.get("input", []) if item.get("type") == "function_call_output"]
 
 
-def probe(mode: run.ModeConfig, hook_binary: Path | str, extra_flags: list[str], keep: Path | None) -> dict:
-    """Run the mock-provider cell for ``mode`` with ``hook_binary`` as its hook; return the report.
+def probe(mode: run.ModeConfig, hook_binary: Path | str, extra_flags: list[str], keep: Path | None,
+          model_id: str = DEFAULT_MODEL) -> dict:
+    """Run the mock-provider cell for ``mode`` on ``model_id`` with ``hook_binary`` as its hook; return the report.
 
     Raises ``HookProbeFailed`` first when the hook binary has no working ``hook`` subcommand, so a binary that
     only prints a usage error (exit 2, which reads as a deny) never passes as an enforcing hook.
@@ -86,7 +93,7 @@ def probe(mode: run.ModeConfig, hook_binary: Path | str, extra_flags: list[str],
     server = ThreadingHTTPServer(("127.0.0.1", 0), MockResponses)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     try:
-        done, argv, surface = _exec(mode, hook_binary, extra_flags, keep, server.server_port)
+        done, argv, surface = _exec(mode, hook_binary, extra_flags, keep, server.server_port, model_id)
     finally:
         server.shutdown()
         server.server_close()
@@ -105,7 +112,7 @@ def probe(mode: run.ModeConfig, hook_binary: Path | str, extra_flags: list[str],
     except run.InvalidCodexCellError as error:
         audit_error = str(error)
     requests = MockResponses.requests
-    request_tools = sorted(run._codex_tool_names(requests[0].get("input", []))) if requests else []
+    request_tools = request_tool_names(requests[0]) if requests else []
     outputs = _outputs(requests[-1]) if requests else []
     return {
         "argv_has_catalog": any(part.startswith(run._CODEX_CATALOG_KEY) for part in argv),
@@ -118,6 +125,7 @@ def probe(mode: run.ModeConfig, hook_binary: Path | str, extra_flags: list[str],
         "request_count": len(requests),
         "request_tools": request_tools,
         "apply_patch_in_request": "apply_patch" in request_tools,
+        "spawn_agent_in_request": "spawn_agent" in request_tools,
         "tool_outputs": outputs,
         "cat_denied": any("Blocked" in out for out in outputs[:1]) and not any(SECRET in out for out in outputs),
         "secret_leaked": any(SECRET in out for out in outputs),
@@ -131,7 +139,7 @@ def probe(mode: run.ModeConfig, hook_binary: Path | str, extra_flags: list[str],
 
 
 def _exec(mode: run.ModeConfig, hook_binary: Path | str, extra_flags: list[str], keep: Path | None,
-          port: int) -> tuple[subprocess.CompletedProcess, list[str], list[str]]:
+          port: int, model_id: str) -> tuple[subprocess.CompletedProcess, list[str], list[str]]:
     """Run one mock-provider cell; return its process, its argv and the tool surface the preflight rendered."""
     with tempfile.TemporaryDirectory() as scratch:
         repo = Path(scratch) / "repo"
@@ -140,7 +148,7 @@ def _exec(mode: run.ModeConfig, hook_binary: Path | str, extra_flags: list[str],
         home = Path(scratch) / "codex_home"
         home.mkdir()
         task = SimpleNamespace(prompt="Read hello.txt", hide_git=True)
-        cmd = run._codex_command(task, mode, "gpt-5.6-sol", repo, reasoning_effort=None, skill_paths=[],
+        cmd = run._codex_command(task, mode, model_id, repo, reasoning_effort=None, skill_paths=[],
                               hook_binary=str(hook_binary))
         provider = [
             "-c", 'model_provider="mock"',
@@ -186,8 +194,8 @@ def problems(report: dict) -> list[str]:
         found.append(f"the stream audit replayed {report['audited_commands']} commands, expected only the benign ls")
     if report["denied_cat_items"]:
         found.append("a hook-denied command emitted a command_execution item")
-    if report["apply_patch_in_request"]:
-        found.append("apply_patch is in the request")
+    for name in sorted(run.CODEX_FORBIDDEN_TOOLS & set(report["request_tools"])):
+        found.append(f"{name} is in the request")
     return found
 
 
@@ -195,13 +203,14 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--tilth-bin", type=Path, required=True)
     parser.add_argument("--hook-bin", type=Path, help="hook binary; defaults to --tilth-bin")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help="Codex model id the run will use")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--keep", type=Path, help="directory for the raw stream, stderr and request bodies")
     parser.add_argument("--extra", action="append", default=[], help="extra codex exec flag, repeatable")
     args = parser.parse_args()
     tilth_bin = args.tilth_bin.resolve()
     mode = replace(run.MODES["tilth_forced"], binary_path=str(tilth_bin))
-    report = probe(mode, (args.hook_bin or tilth_bin).resolve(), args.extra, args.keep)
+    report = probe(mode, (args.hook_bin or tilth_bin).resolve(), args.extra, args.keep, args.model)
     args.out.write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report, indent=2))
     return 1 if problems(report) else 0

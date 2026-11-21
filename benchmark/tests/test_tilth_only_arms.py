@@ -17,7 +17,7 @@ sys.path.insert(0, str(BENCH))
 import codex_probe
 import config
 import run
-from conftest import StoreTask
+from conftest import REAL_CODEX_CATALOG_FILE, StoreTask
 from config import ModeConfig
 from test_strict_hook import fake_hook, install_fake_hook, route_hook_to_real_process
 
@@ -250,6 +250,7 @@ def test_strict_flag_keys_a_claude_cell_only_in_a_mixed_run(
 def test_codex_catalog_payload_shape_mismatch_names_the_codex_version(
     monkeypatch: pytest.MonkeyPatch, payload: str
 ) -> None:
+    monkeypatch.setattr(run, "_codex_catalog_file", REAL_CODEX_CATALOG_FILE)
     run._codex_catalog_file.cache_clear()
     monkeypatch.setattr(run.subprocess, "run", lambda cmd, **_k: SimpleNamespace(returncode=0, stdout=payload, stderr=""))
     monkeypatch.setattr(run, "cli_version", lambda name, **_k: "9.9.9")
@@ -329,7 +330,7 @@ def _probe_stream(*extra: dict) -> str:
 
 
 def _fake_exec(stdout: str):
-    def fake(mode, hook_binary, extra_flags, keep, port):
+    def fake(mode, hook_binary, extra_flags, keep, port, model_id):
         done = subprocess.CompletedProcess([], 0, stdout=stdout, stderr="")
         return done, ["--enable", "hooks", "-c", "hooks.PreToolUse=x"], []
     return fake
@@ -405,7 +406,7 @@ def test_probe_starts_codex_through_the_host_runner(monkeypatch: pytest.MonkeyPa
     mode = run.replace(run.MODES["tilth_forced"], binary_path="/opt/tilth/bin/tilth")
 
     with pytest.raises(RuntimeError, match="routed"):
-        codex_probe._exec(mode, str(fake_hook(tmp_path)), [], None, 1)
+        codex_probe._exec(mode, str(fake_hook(tmp_path)), [], None, 1, "gpt-5.6-sol")
 
     assert seen == [None]
 
@@ -415,7 +416,7 @@ def test_probe_starts_codex_through_the_host_runner(monkeypatch: pytest.MonkeyPa
 
 def _report(**over: object) -> dict:
     report = {"argv_enables_hooks": True, "argv_disables_hooks": False, "cat_denied": True, "secret_leaked": False,
-              "ls_ran": True, "apply_patch_in_request": False, "audited_commands": 1, "audit_error": None,
+              "ls_ran": True, "request_tools": ["exec_command"], "audited_commands": 1, "audit_error": None,
               "denied_cat_items": 0}
     return {**report, **over}
 
@@ -428,7 +429,8 @@ def test_probe_problems_is_empty_for_an_enforcing_report() -> None:
     ({"cat_denied": False}, "did not deny"),
     ({"secret_leaked": True}, "reached the model"),
     ({"ls_ran": False}, "benign command"),
-    ({"apply_patch_in_request": True}, "apply_patch"),
+    ({"request_tools": ["exec_command", "apply_patch"]}, "apply_patch is in the request"),
+    ({"request_tools": ["exec_command", "spawn_agent"]}, "spawn_agent is in the request"),
     ({"argv_enables_hooks": False}, "enable hooks"),
     ({"argv_disables_hooks": True}, "enable hooks"),
     ({"audited_commands": 0}, "replayed 0 commands"),
@@ -444,19 +446,79 @@ def test_live_check_fails_the_run_when_the_probe_finds_a_problem(monkeypatch: py
     monkeypatch.setattr(codex_probe, "probe", lambda *_a, **_k: _report(cat_denied=False))
 
     with pytest.raises(run.InvalidCodexCellError, match="live check failed.*did not deny"):
-        run.check_codex_hook_live(run.MODES["tilth_forced"], "/pinned/seed/tilth")
+        run.check_codex_hook_live(run.MODES["tilth_forced"], "/pinned/seed/tilth", "gpt-5.6-sol")
+
+
+def test_probe_reads_tools_declared_in_the_top_level_tools_field() -> None:
+    request = {"tools": [{"type": "function", "name": "exec_command"}, {"type": "function", "name": "apply_patch"},
+                         {"type": "namespace", "name": "multi", "tools": [{"name": "spawn_agent"}]}],
+               "input": [{"type": "message", "role": "user"}]}
+
+    assert codex_probe.request_tool_names(request) == ["apply_patch", "exec_command", "multi", "spawn_agent"]
+    report = _report(request_tools=codex_probe.request_tool_names(request))
+    assert any("apply_patch is in the request" in problem for problem in codex_probe.problems(report))
+
+
+def test_probe_still_reads_tool_names_found_in_input() -> None:
+    assert codex_probe.request_tool_names({"input": [{"name": "apply_patch"}]}) == ["apply_patch"]
+
+
+def test_the_catalog_removes_apply_patch_and_the_v2_collaboration_tools(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    payload = json.dumps({"models": [{"slug": "m", "apply_patch_tool_type": "freeform", "tool_mode": "x",
+                                      "multi_agent_version": "v2", "multi_agent_reasoning_effort": "low"}]})
+    monkeypatch.setattr(run, "_codex_catalog_file", REAL_CODEX_CATALOG_FILE)
+    run._codex_catalog_file.cache_clear()
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path)
+    monkeypatch.setattr(run.subprocess, "run", lambda cmd, **_k: SimpleNamespace(returncode=0, stdout=payload, stderr=""))
+    try:
+        model = json.loads(run._codex_catalog_file().read_text())["models"][0]
+    finally:
+        run._codex_catalog_file.cache_clear()
+
+    assert model["apply_patch_tool_type"] is None and model["tool_mode"] == "default"
+    assert model["multi_agent_version"] is None and "multi_agent_reasoning_effort" not in model
+
+
+def test_the_live_check_probes_the_model_the_run_uses(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+    monkeypatch.setattr(codex_probe, "probe", lambda mode, hook, extra, keep, model_id: seen.append(model_id) or _report())
+
+    run.check_codex_hook_live(run.MODES["tilth_forced"], "/pinned/seed/tilth", "luna-x")
+
+    assert seen == ["luna-x"]
+
+
+def test_the_surface_check_refuses_spawn_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    _prompt_input(monkeypatch, [{"name": "functions", "tools": [{"name": "exec_command"}, {"name": "spawn_agent"}]}])
+
+    with pytest.raises(run.InvalidCodexCellError, match="tool surface"):
+        run.check_codex_tool_surface(_codex_argv("tilth_forced"), {}, Path("/work/repo"))
+
+
+def test_a_surface_check_timeout_is_a_zero_spend_surface_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def hang(*_a: object, **_k: object) -> None:
+        raise subprocess.TimeoutExpired("codex", 60)
+
+    monkeypatch.setattr(run.subprocess, "run", hang)
+
+    with pytest.raises(run.CodexSurfaceError, match="did not finish"):
+        run.check_codex_tool_surface(_codex_argv("tilth_forced"), {}, Path("/work/repo"))
 
 
 def test_preflight_runs_the_live_check_for_every_arm_with_the_pinned_hook(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     seen: list[tuple[str, str]] = []
-    monkeypatch.setattr(run, "check_codex_hook_live", lambda mode, hook: seen.append((mode.name, hook)))
+    monkeypatch.setattr(run, "check_codex_hook_live", lambda mode, hook, model: seen.append((mode.name, hook, model)))
     monkeypatch.setitem(run.MODES, "fork_arm", run.replace(run.MODES["tilth_forced"], name="fork_arm"))
 
-    run.preflight_codex_hooks({"tilth_forced", "fork_arm"}, str(fake_hook(tmp_path)))
+    run.preflight_codex_hooks({("tilth_forced", "m1"), ("fork_arm", "m1"), ("tilth_forced", "m2")},
+                              str(fake_hook(tmp_path)))
 
-    assert seen == [("fork_arm", str(tmp_path / "fake-tilth")), ("tilth_forced", str(tmp_path / "fake-tilth"))]
+    hook = str(tmp_path / "fake-tilth")
+    assert seen == [("fork_arm", hook, "m1"), ("tilth_forced", hook, "m1"), ("tilth_forced", hook, "m2")]
 
 
 def test_a_hook_binary_without_a_hook_subcommand_fails_loudly(
@@ -469,7 +531,7 @@ def test_a_hook_binary_without_a_hook_subcommand_fails_loudly(
     monkeypatch.setattr(run, "check_codex_hook_live", lambda *_a: pytest.fail("the live check ran"))
 
     with pytest.raises(run.HookProbeFailed, match="expected 0"):
-        run.preflight_codex_hooks({"tilth_forced"}, str(stub))
+        run.preflight_codex_hooks({("tilth_forced", "m1")}, str(stub))
 
 
 # --- wiring: the cell and the plan reach the preflight, the audit, and the isolated home ---
@@ -588,7 +650,7 @@ def test_run_plan_runs_the_codex_preflight_before_any_cell(
                       refreeze_baselines=False, output=None, cell_estimate_usd=1.0, max_budget_usd=1.0,
                       store_only=False, hook_sha="seed")
 
-    assert events == ["preflight ['arm'] fake-tilth"]
+    assert events == ["preflight [('arm', 'gpt-5.6-sol')] fake-tilth"]
 
 
 # --- a failed Codex cell is still audited; the run key and home carry the isolation ---
@@ -836,3 +898,87 @@ def test_analyze_renders_a_legacy_mode_with_a_note_and_no_alias() -> None:
 
     assert "unrecognized mode(s) tilth" in report and "no alias" in report
     assert "tilth_forced" not in report
+
+
+def test_a_turn_failed_stream_with_a_denied_command_is_hook_loosened_not_a_parse_error(
+    codex_cell: dict, tmp_path: Path
+) -> None:
+    codex_cell["stream"] = _events(
+        _finished("/usr/bin/zsh -lc 'cat src/main.rs'", "item_1"),
+        {"type": "turn.failed", "error": {"message": "boom"}},
+    )
+
+    with pytest.raises(run.CodexHookLoosenedError, match="hook_loosened"):
+        _run_cell(tmp_path, "arm", hook_sha="seed")
+
+
+def test_the_private_codex_home_holds_the_bytes_read_as_the_seed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    host = tmp_path / "host"
+    host.mkdir()
+    host_auth = host / "auth.json"
+    host_auth.write_text('{"t": 1}')
+    real = run.tempfile.TemporaryDirectory
+
+    def racing(*args, **kwargs):
+        host_auth.write_text('{"t": 9}')
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(run.tempfile, "TemporaryDirectory", racing)
+    env = {"CODEX_HOME": str(host)}
+
+    with run.isolated_codex_home(env, "seed-"):
+        assert (Path(env["CODEX_HOME"]) / "auth.json").read_text() == '{"t": 1}'
+
+
+def test_the_opencode_default_modes_are_only_the_supported_ones() -> None:
+    modes = run.select_modes(None, "opencode")
+
+    assert "baseline" in modes
+    assert "tilth_forced" not in modes
+    assert all(run._opencode_supports(name) for name in modes)
+
+
+@pytest.mark.parametrize("explicit_runner", ["opencode", None])
+def test_an_unsupported_mode_for_an_opencode_model_is_refused_up_front(explicit_runner: str | None) -> None:
+    args = SimpleNamespace(experiment=None, modes_json=None, modes="baseline,tilth_forced",
+                           wozcode_plugin_dir=None, runner=explicit_runner, candidate_sha=None)
+
+    with pytest.raises(ValueError, match="opencode model gpt5mini has no config.*tilth_forced"):
+        run._select_arms(args, ["gpt5mini"], "ts")
+
+
+def test_a_mixed_runner_default_still_refuses_opencode_unsupported_modes() -> None:
+    args = SimpleNamespace(experiment=None, modes_json=None, modes=None,
+                           wozcode_plugin_dir=None, runner=None, candidate_sha=None)
+
+    with pytest.raises(ValueError, match="opencode model gpt5mini"):
+        run._select_arms(args, ["gpt5", "gpt5mini"], "ts")
+
+
+def test_a_surface_check_failure_stops_the_plan_at_zero_charge(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, catalog: Path, arm_task: None
+) -> None:
+    monkeypatch.setitem(run.MODES, "arm", ModeConfig(
+        name="arm", tools=[], mcp_config_path="/tmp/tilth.json", description="test",
+        binary_path="/arms/own/tilth", tilth_version="test"))
+    install_fake_hook(monkeypatch, tmp_path)
+    monkeypatch.setattr(run, "RESULTS_DIR", tmp_path / "results")
+    monkeypatch.setattr(run, "cli_version", lambda *_a, **_k: "1.0")
+    monkeypatch.setattr(run, "preflight_codex_hooks", lambda *_a, **_k: None)
+
+    def surface_fails(*_a, **_k):
+        raise run.CodexSurfaceError("codex debug prompt-input did not finish: timed out")
+
+    monkeypatch.setattr(run, "run_single", surface_fails)
+
+    with pytest.raises(run.PlanStopped) as stopped:
+        run._run_plan([run.CellSpec("arm_task", "arm", "gpt5", 0)], panel=SimpleNamespace(stamp=lambda _task: {}),
+                      ledger=run.SpendLedger(max_usd=5.0), refreeze_baselines=False, output=None,
+                      cell_estimate_usd=1.0, max_budget_usd=1.0, store_only=False, hook_sha="seed")
+
+    assert stopped.value.reason == "codex-surface"
+    [row] = stopped.value.rows
+    assert row["infra"] == "codex_surface"
+    assert row["charged_usd"] == 0.0
