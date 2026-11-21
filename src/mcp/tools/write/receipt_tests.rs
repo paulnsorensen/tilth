@@ -310,7 +310,7 @@ fn missing_tag_error_stays_generic_for_a_file_never_displayed() {
 }
 
 #[test]
-fn unseen_line_error_names_the_exact_read_range() {
+fn unseen_line_error_shows_the_line_and_names_the_confirm() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("f.txt"), rows(100)).unwrap();
     let session = Session::new();
@@ -323,7 +323,10 @@ fn unseen_line_error_names_the_exact_read_range() {
     )
     .expect_err("line 50 was never displayed");
     assert!(
-        err.contains("f.txt#") && err.contains("to cover line 50"),
+        err.contains("never displayed")
+            && err.contains(&format!("[f.txt#{tag}]"))
+            && err.contains("\n50:")
+            && err.contains("\"ops\":[]"),
         "{err}"
     );
 }

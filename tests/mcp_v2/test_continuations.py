@@ -39,15 +39,15 @@ class Continuations(unittest.TestCase):
         self.assertFalse(harness.tool_is_error(result), result)
         return json.loads(harness.tool_result_text(result))
 
-    def test_all_hints_follow_in_order_and_preserve_scope(self):
+    def test_every_kind_follows_a_result_target_and_preserves_scope(self):
         first = self.run_entries([{
             "query": "root", "glob": "{fixture.ts,fixture.test.ts,helper.ts}",
         }])
-        hints = first["hints"]
+        self.assertNotIn("hints", first)
+        target = first["results"][0]["target"]
+        kinds = ["fetch_callers", "fetch_callees", "fetch_siblings", "fetch_tests"]
+        hints = [{"kind": kind, "target": target} for kind in kinds]
         expected = ["production_caller", "leaf", "sibling", "test_root"]
-        self.assertEqual([h["kind"] for h in hints], [
-            "fetch_callers", "fetch_callees", "fetch_siblings", "fetch_tests",
-        ])
         requests = [harness.initialize_request(1)]
         for req_id in range(2, 5):
             requests.append(harness.tools_call_request(req_id, "tilth_search", {
@@ -60,11 +60,14 @@ class Continuations(unittest.TestCase):
             text = harness.tool_result_text(response)
             payload = json.loads(text)
             self.assertNotIn("TIP:", text)
-            self.assertEqual(payload["hints"], [])
+            self.assertNotIn("hints", payload)
             self.assertEqual(len(payload["results"]), 4)
             for result, needle, hint in zip(payload["results"], expected, hints):
                 self.assertEqual(result["resolved_as"], hint["kind"])
-                self.assertEqual(result["target"], hint["target"])
+                echoed = {k: v for k, v in hint["target"].items() if k != "tag"}
+                self.assertEqual(
+                    {k: v for k, v in result["target"].items() if k != "tag"}, echoed
+                )
                 self.assertEqual(result["status"], "ok")
                 # The duplicate preview payload is dropped for every follow
                 # kind; canonical arrays carry the identities (#238).

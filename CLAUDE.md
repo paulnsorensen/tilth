@@ -128,10 +128,10 @@ python benchmark/fixtures/setup.py
 python benchmark/run.py --models sonnet --reps 3 --tasks all --modes all --max-usd 150
 
 # Specific tasks
-python benchmark/run.py --models haiku --reps 3 --tasks rg_search_dispatch,rg_trait_implementors --modes tilth --max-usd 5
+python benchmark/run.py --models haiku --reps 3 --tasks rg_search_dispatch,rg_trait_implementors --modes tilth_forced --max-usd 5
 
 # Models: sonnet, opus, haiku (claude CLI aliases), sonnet46, sonnet5, opus5, haiku45 (pinned IDs), gpt5, luna56, o3, gpt5mini
-# Modes: baseline (built-in tools), tilth (built-in + tilth MCP), tilth_forced (tilth MCP only)
+# Modes: baseline (built-in tools), tilth_forced (tilth MCP only; Claude runs strict by default, --no-strict-file-tools opts out)
 # --preamble: tilth arms run with prompts/preamble.md as their system prompt (Claude and Codex models only);
 #   evolve's --preamble also evolves that file as a text component
 # Tasks: all, or comma-separated names from benchmark/tasks/*.py

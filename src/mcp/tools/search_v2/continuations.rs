@@ -31,21 +31,6 @@ pub(super) struct Target {
 }
 
 impl Target {
-    pub(super) fn hints(&self) -> Vec<Value> {
-        if self.line.is_none() {
-            return Vec::new();
-        }
-        [
-            "fetch_callers",
-            "fetch_callees",
-            "fetch_siblings",
-            "fetch_tests",
-        ]
-        .iter()
-        .map(|kind| json!({"kind": kind, "target": self}))
-        .collect()
-    }
-
     pub(super) fn allows(&self, path: &Path, cwd: &Path) -> bool {
         let canonical_cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
         let canonical_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -182,8 +167,13 @@ impl Follow {
         {
             return Err("follow target requires line and name; use null for file targets".into());
         }
-        let follow: Self = serde_json::from_value(value.clone())
-            .map_err(|e| format!("invalid follow hint: {e}"))?;
+        // A result's `target` carries the read `tag` for edits; it is not part of the identity.
+        let mut value = value.clone();
+        if let Some(target) = value.get_mut("target").and_then(Value::as_object_mut) {
+            target.remove("tag");
+        }
+        let follow: Self =
+            serde_json::from_value(value).map_err(|e| format!("invalid follow hint: {e}"))?;
         if follow.target.line.is_none() {
             return Err("this continuation requires a symbol target".into());
         }
@@ -383,7 +373,7 @@ mod tests {
     }
 
     #[test]
-    fn emitted_hints_validate_against_follow_schema() {
+    fn emitted_targets_validate_against_follow_schema() {
         let tools = crate::mcp::tools::definitions::tool_definitions();
         let search = tools.iter().find(|t| t["name"] == "tilth_search").unwrap();
         let follow = &search["inputSchema"]["properties"]["queries"]["items"]["oneOf"][2]
@@ -405,24 +395,41 @@ mod tests {
             scope: ".".into(),
             glob: Some("*.rs".into()),
         };
-        let hints = target.hints();
-        assert_eq!(hints.len(), 4);
-        for hint in hints {
-            assert!(kinds.contains(&hint["kind"]), "kind not in schema: {hint}");
-            let emitted = hint["target"].as_object().unwrap();
-            for key in emitted.keys() {
-                assert!(props.contains_key(key), "schema lacks emitted key {key}");
-            }
-            for key in &required {
-                assert!(emitted.contains_key(*key), "hint lacks required key {key}");
-            }
-            let occ = props["occurrence"]["items"]["minimum"].as_u64().unwrap();
-            assert!(emitted["occurrence"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|n| n.as_u64().unwrap() >= occ));
+        for kind in [
+            "fetch_callers",
+            "fetch_callees",
+            "fetch_siblings",
+            "fetch_tests",
+        ] {
+            assert!(kinds.contains(&json!(kind)), "kind not in schema: {kind}");
         }
+        let emitted = json!(target);
+        let emitted = emitted.as_object().unwrap();
+        for key in emitted.keys() {
+            assert!(props.contains_key(key), "schema lacks emitted key {key}");
+        }
+        assert!(props.contains_key("tag"), "schema lacks the result tag");
+        for key in &required {
+            assert!(
+                emitted.contains_key(*key),
+                "target lacks required key {key}"
+            );
+        }
+        let occ = props["occurrence"]["items"]["minimum"].as_u64().unwrap();
+        assert!(emitted["occurrence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|n| n.as_u64().unwrap() >= occ));
+    }
+
+    #[test]
+    fn follow_accepts_a_result_target_with_its_read_tag() {
+        let tmp = scoped_fixture();
+        let cwd = tmp.path();
+        let mut hint = follow_hint(cwd, "fetch_callees", &Value::Null);
+        hint["target"]["tag"] = json!("26FA");
+        assert_eq!(run(cwd, &hint)["items"][0]["name"], "leaf");
     }
 
     #[test]
@@ -473,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn hints_omit_null_optional_keys() {
+    fn targets_omit_null_optional_keys() {
         let target = Target {
             path: "root.ts".into(),
             line: Some(2),
@@ -482,9 +489,8 @@ mod tests {
             scope: ".".into(),
             glob: None,
         };
-        let hint = &target.hints()[0];
         assert_eq!(
-            hint["target"],
+            json!(target),
             json!({"path": "root.ts", "line": 2, "name": "root", "scope": "."})
         );
     }

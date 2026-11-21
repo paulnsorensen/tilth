@@ -61,8 +61,9 @@ def test_turns_tools_and_result_text():
     r = parse_opencode_json(_FIXTURE_NDJSON)
     assert r.num_turns == 2, r.num_turns
     assert len(r.turns) == 2, len(r.turns)
-    # Final assistant text is the LAST text event, not the first partial.
-    assert r.result_text == "final answer", repr(r.result_text)
+    # result_text accumulates text events across turns (8fe4eeb7, #109), so a
+    # short wrap-up turn cannot discard an earlier answer. Grading is substring.
+    assert r.result_text == "thinking...\nfinal answer", repr(r.result_text)
     assert r.session_id == "ses_x", r.session_id
     counts = tool_call_counts(r)
     assert counts == {"tilth_search": 1}, counts

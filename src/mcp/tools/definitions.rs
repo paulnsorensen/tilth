@@ -42,7 +42,7 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
                                     "properties": {
                                         "follow": {
                                             "type": "object",
-                                            "description": "One unchanged server-emitted continuation hint.",
+                                            "description": "A fetch kind with one result's own `target`, unchanged.",
                                             "required": ["kind", "target"],
                                             "additionalProperties": false,
                                             "properties": {
@@ -57,6 +57,7 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
                                                         "line": {"type": "integer", "minimum": 1, "maximum": 4_294_967_295_u64},
                                                         "name": {"type": "string", "minLength": 1},
                                                         "glob": {"type": ["string", "null"]},
+                                                        "tag": {"type": "string"},
                                                         "occurrence": {"type": "array", "items": {"type": "integer", "minimum": 0}, "minItems": 2, "maxItems": 2}
                                                     }
                                                 }
@@ -125,7 +126,7 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
             "properties": {
                 "edits": {
                     "type": "array",
-                    "description": "Up to 20 `{path, tag?, ops}` sections; copy read tags.",
+                    "description": "Up to 50 `{path, tag?, ops}` sections; copy read tags.",
                     "items": {
                         "type": "object",
                         "required": ["path", "ops"],
@@ -173,7 +174,7 @@ pub(in crate::mcp) fn tool_definitions() -> Vec<Value> {
 /// The shared `cwd` schema property. The description text is model-facing
 /// and must always tell the model to set `cwd` explicitly.
 fn cwd_property() -> Value {
-    serde_json::json!({ "type": "string", "description": "Absolute checkout directory; always set this explicitly. Relative paths/scopes anchor here; absolute paths pass; shell cwd is invisible." })
+    serde_json::json!({ "type": "string", "description": "Absolute checkout directory; always set this explicitly. Relative paths anchor here." })
 }
 
 #[cfg(test)]

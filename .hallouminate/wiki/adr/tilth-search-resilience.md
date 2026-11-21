@@ -54,10 +54,11 @@ _Source: checkout source and live MCP query comparison · Updated: 2026-09-29_
 ### ADR-003: Qualified names and pasted declarations route to definitions [status: accepted]
 
 - **Context:** A qualified name such as `Owner::name` fell to a literal search. A pasted declaration line such as `pub fn run(&self) -> Guard` went to the regex route on its parentheses and returned 0 matches.
-- **Decision:** PR #443 adds a route before the regex route in `src/mcp/tools/search_v2.rs`. The order is now: path, Go signature, declaration shape, regex, signature-prefix normalization, filename-shaped miss, symbol or ambiguous, literal, miss.
+- **Decision:** PR #443 adds a route before the regex route in `src/mcp/tools/search_v2.rs` (`route_query`). The order is now: path, Go signature, declaration shape, regex, signature-prefix normalization, filename-shaped miss, dotted file name, symbol or ambiguous, literal.
   1. The route reduces the query to its last path segment and resolves the definitions of that name.
   2. A qualifier keeps only the definitions that its owner holds: an impl block, an outline container, a Go receiver, or a C++ out-of-line declarator.
   3. When the qualifier keeps none, every definition of the name returns, and the diagnostic names the owners found.
-  4. A query with regex syntax stays a pattern. A bare identifier and `keyword name` keep the identifier and signature-prefix routes. A bare dotted name with no definition (`os.path.join`) falls through to the later routes.
+  4. A query shaped like a file name (`Logger.log`) waits for the dotted-file-name route after the filename-shaped miss. That route is strict: it returns only the definitions that the owner holds. When the owner holds none, the query falls through to the later routes, and rule 3 does not apply.
+  5. `declaration_shape` refuses a query that contains `\`, `[`, `]`, `|`, `+`, `?`, `^`, `$`, or `.*`, so the query stays a regex pattern. Parentheses and `*` do not make a query a pattern: `run(foo)` goes to the declaration route. A bare identifier and `keyword name` keep the identifier and signature-prefix routes. A bare dotted name with no definition (`os.path.join`) falls through to the later routes.
 - **Open:** The evolve round `tools-sonnet-r1` proposed the same route and failed on a changed `route_identifier` signature ([[../benchmark-gepa-v3-evolve]]). Treat the shipped route as unmeasured by the evolve panel.
 - **Verification:** `tests/mcp_v2/test_search_qualified_declaration.py`.

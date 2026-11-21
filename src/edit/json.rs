@@ -17,7 +17,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::parser::{parse_sections, BlockAnchor, BlockMode, Cursor, Op, Section};
-use super::tag::parse_tag;
+use super::tag::{parse_hold, parse_tag};
 
 /// One `{path, tag?, ops}` section as it arrives on the wire. `ops` stays as
 /// raw `Value`s so each op's deserialize error can be tagged with its verb and
@@ -282,17 +282,29 @@ fn op_error_hint(verb: &str) -> &'static str {
 }
 
 fn lower_section(index: usize, raw: RawSection) -> Result<Section, String> {
-    let tag = match raw.tag {
-        None => None,
+    let (tag, hold) = match raw.tag {
+        None => (None, None),
         Some(t) => {
             let stripped = t.strip_prefix('#').unwrap_or(t.as_str());
-            Some(parse_tag(stripped).ok_or_else(|| {
-                format!(
-                    "edits[{index}] (path {:?}): tag {t:?} is not a 4-hex-digit tag from a \
-                     tilth_read — run tilth_read on the path to mint a fresh tag",
-                    raw.path
-                )
-            })?)
+            if let Some(id) = parse_hold(stripped) {
+                if !raw.ops.is_empty() {
+                    return Err(format!(
+                        "edits[{index}] (path {:?}): hold token {t:?} confirms a held edit, so \
+                         send it with ops: []",
+                        raw.path
+                    ));
+                }
+                (None, Some(id))
+            } else {
+                let tag = parse_tag(stripped).ok_or_else(|| {
+                    format!(
+                        "edits[{index}] (path {:?}): tag {t:?} is not a 4-hex-digit tag from a \
+                         tilth_read — run tilth_read on the path to mint a fresh tag",
+                        raw.path
+                    )
+                })?;
+                (Some(tag), None)
+            }
         }
     };
     let mut ops = Vec::with_capacity(raw.ops.len());
@@ -307,9 +319,7 @@ fn lower_section(index: usize, raw: RawSection) -> Result<Section, String> {
                 ));
             }
             Some(v) if !VALID_OPS.contains(&v) => {
-                let suggestion = suggest_op(v)
-                    .map(|s| format!(" Did you mean {s}?"))
-                    .unwrap_or_default();
+                let suggestion = suggest_op(v).map_or_default(|s| format!(" Did you mean {s}?"));
                 return Err(format!(
                     "edits[{index}].ops[{j}] (path {:?}): op {v:?} is not a valid op — valid \
                      ops are {}.{suggestion} {}",
@@ -333,6 +343,7 @@ fn lower_section(index: usize, raw: RawSection) -> Result<Section, String> {
     Ok(Section {
         path: raw.path,
         tag,
+        hold,
         ops,
     })
 }
@@ -346,9 +357,9 @@ pub fn lower_edits(edits: &Value) -> Result<Vec<Section>, String> {
         .ok_or("`edits` must be a JSON array of {path, tag?, ops} section objects")?;
     // Enforce the batch cap up front, before allocating or deserializing any
     // section — an oversized array is rejected without paying to lower it.
-    if arr.len() > 20 {
+    if arr.len() > 50 {
         return Err(format!(
-            "batch write limited to 20 sections (got {}); split into calls of at most 20 sections",
+            "batch write limited to 50 sections (got {}); split into calls of at most 50 sections",
             arr.len()
         ));
     }

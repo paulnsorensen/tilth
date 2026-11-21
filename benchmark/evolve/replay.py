@@ -6,8 +6,9 @@ server in a fresh fixture workspace and measures result size and error status. I
 candidate: ``replay_cell`` reports, ``compare`` diffs two reports, and nothing here is wired into the loop.
 
 Recorded Bash is never executed. A Bash call the recorded run never ran (a hook blocked it) or one on a
-small read-only allowlist is skipped; any other Bash call ends the replay, because its file effects are
-unknown and later calls may depend on them. Tags are never repaired and reads are never inserted.
+small read-only allowlist is skipped; so is a build or test command (``cargo test``, ``npm test``, ...), counted
+as ``skipped_build_bash``, since it writes only build output. Any other Bash call ends the replay, because its
+file effects are unknown and later calls may depend on them. A chain row replays all its turns, one server each. Tags are never repaired and reads are never inserted.
 """
 
 import argparse
@@ -35,9 +36,21 @@ CALL_TIMEOUT_S = 120
 PERSISTED_MARKER = "<persisted-output>"
 OLD_MTIME = 946684800  # 2000-01-01: older than every recorded `if_modified_since`, so unchanged files stay unchanged
 
-READ_ONLY_COMMANDS = frozenset({"cd", "ls", "pwd", "git", "find", "head", "tail", "cut", "wc"})
+READ_ONLY_COMMANDS = frozenset({
+    "cd", "ls", "pwd", "git", "find", "head", "tail", "cut", "wc", "grep", "sort", "uniq", "tr", "echo",
+})
+# Exact stderr redirects that name no file in the workspace.
+SAFE_REDIRECTS = (["2", ">&", "1"], ["2", ">", "/dev/null"])
 GIT_READ_ONLY = frozenset({"status", "diff", "log", "show"})
 FIND_FORBIDDEN = frozenset({"-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls"})
+# Build and test commands write only build output, so skipping them leaves the tree later tilth calls see unchanged.
+BUILD_SUBCOMMANDS = {
+    "cargo": frozenset({"test", "check", "build", "clippy", "nextest"}),
+    "go": frozenset({"test", "build", "vet"}),
+}
+NPX_TEST_RUNNERS = frozenset({"mocha", "jest", "vitest"})
+ENV_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+BUILD_WRITING_FLAGS = frozenset({"-w", "--write", "-o", "--output", "--out-dir", "--target-dir", "-i"})
 
 
 def _text(output: object) -> str:
@@ -54,53 +67,108 @@ def _text_len(output: object) -> int:
     return len(_text(output))
 
 
-def read_only_bash(command: str) -> bool:
-    """True when every simple command in ``command`` is on the audited read-only allowlist.
+def _simple_commands(command: str) -> list[list[str]] | None:
+    """Split ``command`` into simple-command argv lists, or None when it could write or nest.
 
-    Redirection, background jobs, substitution, and subshells are refused outright, so the check cannot
-    pass a command that writes. The caller never runs the command either way.
+    Background jobs, substitution, subshells, and every redirect except ``SAFE_REDIRECTS``
+    (``2>&1`` and ``2>/dev/null``, which name no workspace file) are refused outright.
     """
     if "`" in command or "$(" in command or "\n" in command.strip():
-        return False
+        return None
     lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     try:
         tokens = list(lexer)
     except ValueError:
-        return False
+        return None
     simple: list[list[str]] = [[]]
-    for token in tokens:
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if tokens[index:index + 3] in SAFE_REDIRECTS:
+            index += 3
+            continue
+        index += 1
         if token in {";", "&&", "||", "|"}:
             simple.append([])
         elif set(token) <= set("();&|<>"):
-            return False
+            return None
         else:
             simple[-1].append(token)
-    for argv in simple:
-        if not argv:
-            continue
-        name = argv[0]
-        if name not in READ_ONLY_COMMANDS:
+    return [argv for argv in simple if argv]
+
+
+def read_only_bash(command: str) -> bool:
+    """True when every simple command in ``command`` is on the audited read-only allowlist.
+
+    The caller never runs the command either way.
+    """
+    commands = _simple_commands(command)
+    return commands is not None and all(_read_only_argv(argv) for argv in commands)
+
+
+def _read_only_argv(argv: list[str]) -> bool:
+    name = argv[0]
+    if name not in READ_ONLY_COMMANDS:
+        return False
+    if name == "git":
+        rest = [arg for arg in argv[1:] if arg != "-C" and not arg.startswith("/")]
+        sub = next((arg for arg in rest if not arg.startswith("-")), None)
+        if sub not in GIT_READ_ONLY or any(arg.startswith("--output") for arg in argv):
             return False
-        if name == "git":
-            rest = [arg for arg in argv[1:] if arg != "-C" and not arg.startswith("/")]
-            sub = next((arg for arg in rest if not arg.startswith("-")), None)
-            if sub not in GIT_READ_ONLY or any(arg.startswith("--output") for arg in argv):
-                return False
-        if name == "find" and FIND_FORBIDDEN & set(argv):
-            return False
+    if name == "find" and FIND_FORBIDDEN & set(argv):
+        return False
+    if name == "sort" and any(arg == "-o" or arg.startswith("--output") for arg in argv[1:]):
+        return False
     return True
 
 
+def _build_command(argv: list[str]) -> bool:
+    name, args = argv[0], argv[1:]
+    if any(arg in BUILD_WRITING_FLAGS or arg.startswith("--fix") for arg in args):
+        return False
+    sub = next((arg for arg in args if not arg.startswith(("-", "+"))), None)
+    if name == "cargo" and sub == "fmt":
+        return "--check" in args
+    if name in BUILD_SUBCOMMANDS:
+        return sub in BUILD_SUBCOMMANDS[name]
+    if name == "npm":
+        return sub == "test" or (sub == "run" and args[args.index("run") + 1:][:1] in (["test"], ["build"]))
+    if name == "npx":
+        return sub in NPX_TEST_RUNNERS
+    if name == "python" or name == "python3":
+        return args[:2] == ["-m", "pytest"]
+    return name == "pytest"
+
+
+def build_bash(command: str) -> bool:
+    """True when ``command`` builds or tests: at least one simple command is an audited build/test
+    invocation and every other one is read-only. Formatters (except ``cargo fmt --check``),
+    ``--fix``/``--write`` flags, redirects to files, and anything unlisted are refused. The caller
+    never runs the command.
+    """
+    commands = _simple_commands(command)
+    if not commands:
+        return False
+    # `NODE_ENV=test npx mocha` sets the environment of one command; it writes nothing.
+    commands = [argv[next((i for i, arg in enumerate(argv) if not ENV_ASSIGNMENT.match(arg)), len(argv)):] for argv in commands]
+    if any(not argv for argv in commands) or not any(_build_command(argv) for argv in commands):
+        return False
+    return all(_build_command(argv) or _read_only_argv(argv) for argv in commands)
+
+
 def bash_disposition(call: dict) -> str | None:
-    """``blocked`` or ``allowlisted`` when the Bash call is safe to skip, else None."""
+    """``blocked``, ``allowlisted``, or ``build`` when the Bash call is safe to skip, else None."""
     output = call.get("output")
     text = output if isinstance(output, str) else ""
     if call.get("is_error") and text.startswith(HOOK_BLOCKED):
         return "blocked"
     command = (call.get("input") or {}).get("command")
-    if isinstance(command, str) and read_only_bash(command):
-        return "allowlisted"
+    if isinstance(command, str):
+        if read_only_bash(command):
+            return "allowlisted"
+        if build_bash(command):
+            return "build"
     return None
 
 
@@ -235,12 +303,14 @@ def prepare_workspace(row: dict, workdir: Path) -> Path:
     """A fresh checkout of the task's fixture at its pinned revision, without grading assets or tests run.
 
     A local task clones its fixture repo (leaving that repo's metadata untouched) and applies its
-    mutations; an external task exports its prepared tree. The workspace never carries a built
-    environment: replay only needs source files.
+    mutations; an external task exports its prepared tree. A chain's members are prepared one per turn
+    by ``replay_cell``, as ``run._run_chain`` does. The workspace never carries a built environment:
+    replay only needs source files.
     """
     import external
     import run
 
+    run._register_chains([row["task"]])
     task = run.TASKS.get(row["task"])
     if task is not None and task.fixture_path is not None:
         source = run.get_repo_path(task.repo)
@@ -251,7 +321,8 @@ def prepare_workspace(row: dict, workdir: Path) -> Path:
             ["git", "-C", str(workspace), "checkout", "--quiet", "--detach", revision],
         ):
             subprocess.run(argv, check=True, capture_output=True, text=True)
-        task.prepare(workspace)
+        if not getattr(task, "members", ()):
+            task.prepare(workspace)
         if getattr(task, "hide_git", False):
             shutil.rmtree(workspace / ".git", ignore_errors=True)
         return workspace
@@ -274,20 +345,77 @@ def _age_files(workspace: Path) -> None:
                 pass
 
 
+def _read_calls(path: Path) -> list[dict]:
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
 def load_trajectory(row: dict) -> list[dict]:
     path = row.get("trajectory_path")
     if not path or not Path(path).is_file():
         raise FileNotFoundError(f"trajectory missing for {row.get('task')}: {path}")
-    calls = []
-    for line in Path(path).read_text().splitlines():
-        if line.strip():
-            calls.append(json.loads(line))
-    return calls
+    return _read_calls(Path(path))
+
+
+HIT_HEADER = re.compile(r"^### (?P<path>[^\s#:]+)(?:#[0-9A-Fa-f]+)?:(?P<line>\d+)", re.MULTILINE)
+
+
+def search_hits(text: str) -> list[str]:
+    """The sorted ``path:line`` hits a search response lists, without file tags, so two binaries'
+    responses can be compared for the same hits whatever else they print."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = text
+    strings: list[str] = []
+    stack = [data]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, str):
+            strings.append(value)
+        elif isinstance(value, dict):
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return sorted({f"{m['path']}:{m['line']}" for s in strings for m in HIT_HEADER.finditer(s)})
+
+
+def chain_members(row: dict) -> tuple:
+    """The member tasks of a ``chain:`` row in turn order; any other row has none."""
+    import run
+
+    run._register_chains([row["task"]])
+    return tuple(getattr(run.TASKS.get(row["task"]), "members", ()))
+
+
+TURN_FILE = re.compile(r"^(?P<stem>.+)\.turn(?P<turn>\d+)\.trajectory\.jsonl$")
+
+
+def load_turns(row: dict) -> list[list[dict]]:
+    """The recorded calls per turn: a chain row's ``.turn1`` file plus its sibling ``.turnN`` files in order.
+
+    Any other row is a single turn.
+    """
+    first = load_trajectory(row)
+    match = TURN_FILE.match(Path(row["trajectory_path"]).name)
+    if match is None:
+        return [first]
+    siblings = {}
+    for sibling in Path(row["trajectory_path"]).parent.iterdir():
+        found = TURN_FILE.match(sibling.name)
+        if found and found["stem"] == match["stem"]:
+            siblings[int(found["turn"])] = sibling
+    return [first if number == int(match["turn"]) else _read_calls(path) for number, path in sorted(siblings.items())]
 
 
 def replay_cell(row: dict, binary: Path, *, workdir: Path) -> dict:
-    """Replay the row's recorded tilth calls against ``binary`` in a fresh workspace under ``workdir``."""
-    trajectory = load_trajectory(row)
+    """Replay the row's recorded tilth calls against ``binary`` in a fresh workspace under ``workdir``.
+
+    Each recorded turn gets its own server on the shared workspace, as each chain sub-task does in a real run.
+    Call indices count across turns; each call entry also carries its ``turn``.
+    """
+    turns = load_turns(row)
+    trajectory = [call for turn in turns for call in turn]
+    members = chain_members(row)
     workdir.mkdir(parents=True, exist_ok=True)
     workspace = prepare_workspace(row, workdir).resolve()
     _age_files(workspace)
@@ -295,60 +423,72 @@ def replay_cell(row: dict, binary: Path, *, workdir: Path) -> dict:
     new_root = str(workspace)
     report: dict = {
         "task": row["task"], "total_calls": len(trajectory), "replayed_calls": 0, "skipped_bash": 0,
+        "skipped_build_bash": 0, "turns": len(turns), "servers_started": 0,
         "stopped_at": None, "unremapped_paths": [], "calls": [], "file_hashes": {},
     }
     touched: set[str] = set()
-    server = McpServer(Path(binary).resolve(), workspace, workdir / "server.stderr")
-    try:
-        for index, call in enumerate(trajectory):
-            name = str(call.get("name") or "")
-            if name == "Bash":
-                if bash_disposition(call) is None:
-                    report["stopped_at"] = {"index": index, "reason": "bash outside the read-only allowlist"}
+    offset = 0
+    for turn_number, turn_calls in enumerate(turns, 1):
+        if turn_number <= len(members):
+            members[turn_number - 1].prepare(workspace)
+        server = McpServer(Path(binary).resolve(), workspace, workdir / f"server.turn{turn_number}.stderr")
+        report["servers_started"] += 1
+        try:
+            for position, call in enumerate(turn_calls):
+                index = offset + position
+                name = str(call.get("name") or "")
+                if name == "Bash":
+                    disposition = bash_disposition(call)
+                    if disposition is None:
+                        report["stopped_at"] = {"index": index, "reason": "bash outside the read-only allowlist"}
+                        break
+                    report["skipped_build_bash" if disposition == "build" else "skipped_bash"] += 1
+                    continue
+                tool = name.removeprefix(TOOL_PREFIX)
+                if not name.startswith(TOOL_PREFIX) or tool not in TILTH_TOOLS:
+                    report["stopped_at"] = {"index": index, "reason": f"tool {name!r} is not replayable"}
                     break
-                report["skipped_bash"] += 1
-                continue
-            tool = name.removeprefix(TOOL_PREFIX)
-            if not name.startswith(TOOL_PREFIX) or tool not in TILTH_TOOLS:
-                report["stopped_at"] = {"index": index, "reason": f"tool {name!r} is not replayable"}
-                break
-            arguments = call.get("input") or {}
-            if old_root:
-                arguments = remap(arguments, old_root, new_root)
-            outside = unremapped(arguments, new_root)
-            report["unremapped_paths"] += outside
-            recorded_error = bool(call.get("is_error")) or (tool == "tilth_write" and _section_failed(_text(call.get("output"))))
-            if tool == "tilth_write":
-                if outside:
-                    # The server trusts absolute paths, so this write would land outside the temp workspace.
-                    report["stopped_at"] = {"index": index, "reason": "write names a path outside the workspace"}
+                arguments = call.get("input") or {}
+                if old_root:
+                    arguments = remap(arguments, old_root, new_root)
+                outside = unremapped(arguments, new_root)
+                report["unremapped_paths"] += outside
+                recorded_error = bool(call.get("is_error")) or (tool == "tilth_write" and _section_failed(_text(call.get("output"))))
+                if tool == "tilth_write":
+                    if outside:
+                        # The server trusts absolute paths, so this write would land outside the temp workspace.
+                        report["stopped_at"] = {"index": index, "reason": "write names a path outside the workspace"}
+                        break
+                    if call.get("output") is None:
+                        report["stopped_at"] = {"index": index, "reason": "recorded write has no result"}
+                        break
+                    touched |= _touched(arguments, workspace)
+                try:
+                    text, replayed_error = server.call(tool, arguments)
+                    replayed_error = replayed_error or (tool == "tilth_write" and _section_failed(text))
+                except RuntimeError as error:
+                    report["stopped_at"] = {"index": index, "reason": f"server failure: {error}"}
                     break
-                if call.get("output") is None:
-                    report["stopped_at"] = {"index": index, "reason": "recorded write has no result"}
+                if old_root:
+                    text = text.replace(new_root, old_root)
+                report["replayed_calls"] += 1
+                report["calls"].append({
+                    "index": index, "turn": turn_number, "tool": tool, "recorded_chars": _text_len(call.get("output")),
+                    "replayed_chars": len(text), "recorded_error": recorded_error, "replayed_error": replayed_error,
+                    "recorded_truncated": PERSISTED_MARKER in _text(call.get("output")),
+                    **({"hits": search_hits(text)} if tool == "tilth_search" else {}),
+                })
+                if tool == "tilth_write" and replayed_error != recorded_error:
+                    report["stopped_at"] = {
+                        "index": index,
+                        "reason": f"divergent write: recorded error={recorded_error}, replayed error={replayed_error}: {text[:300]}",
+                    }
                     break
-                touched |= _touched(arguments, workspace)
-            try:
-                text, replayed_error = server.call(tool, arguments)
-                replayed_error = replayed_error or (tool == "tilth_write" and _section_failed(text))
-            except RuntimeError as error:
-                report["stopped_at"] = {"index": index, "reason": f"server failure: {error}"}
-                break
-            if old_root:
-                text = text.replace(new_root, old_root)
-            report["replayed_calls"] += 1
-            report["calls"].append({
-                "index": index, "tool": tool, "recorded_chars": _text_len(call.get("output")),
-                "replayed_chars": len(text), "recorded_error": recorded_error, "replayed_error": replayed_error,
-                "recorded_truncated": PERSISTED_MARKER in _text(call.get("output")),
-            })
-            if tool == "tilth_write" and replayed_error != recorded_error:
-                report["stopped_at"] = {
-                    "index": index,
-                    "reason": f"divergent write: recorded error={recorded_error}, replayed error={replayed_error}: {text[:300]}",
-                }
-                break
-    finally:
-        server.close()
+        finally:
+            server.close()
+        if report["stopped_at"] is not None:
+            break
+        offset += len(turn_calls)
     report["file_hashes"] = {name: _hash(workspace / name) for name in sorted(touched)}
     report["unremapped_paths"] = sorted(set(report["unremapped_paths"]))
     return report
@@ -385,11 +525,25 @@ def _chars_by_tool(report: dict, key: str) -> dict[str, int]:
     return totals
 
 
+def _tilth_row(row: dict) -> bool:
+    """True when the row's cell ran tilth: its recorded tools or MCP servers name tilth, else its mode is a
+    built-in tilth arm. A ``--modes-json`` arm such as ``tilth_stock`` is not in ``run.MODES``."""
+    import run
+
+    tools = row.get("available_tools") or []
+    servers = row.get("mcp_servers") or []
+    if tools or servers:
+        return any(str(tool).startswith(TOOL_PREFIX) for tool in tools) or any(
+            isinstance(server, dict) and server.get("name") == "tilth" for server in servers)
+    mode = run.MODES.get(row.get("mode"))
+    return mode is not None and run._is_tilth_arm(mode)
+
+
 def _cells(rows_path: Path, task: str | None, limit: int) -> list[dict]:
     rows = [json.loads(line) for line in rows_path.read_text().splitlines() if line.strip()]
     chosen = [
         row for row in rows
-        if row.get("mode") == "tilth_forced" and (task is None or row.get("task") == task)
+        if _tilth_row(row) and (task is None or row.get("task") == task)
         and row.get("trajectory_path") and Path(row["trajectory_path"]).is_file()
     ]
     return chosen[:limit]
@@ -410,7 +564,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     cells = _cells(args.rows, args.task, args.limit)
     if not cells:
-        print("no tilth_forced cell with a readable trajectory matched", file=sys.stderr)
+        print("no tilth-arm cell with a readable trajectory matched", file=sys.stderr)
         return 1
     print(f"{'task':40} rep cover  recorded  replayed  trunc  stop")
     for row in cells:

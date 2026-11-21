@@ -230,14 +230,54 @@ Session 2026-08-02; spec at the durable corpus
 [^seen-persist]: `src/edit/seen_store.rs`; `src/session.rs` (`take_unsaved_seen`, `save_seen`, `persisted_seen`); `src/mcp/mod.rs` (`run_tool_with_timeout`); `src/mcp/tools/write.rs` (`resolve_edit`, `carried_seen_lines`). Decision: November 4, 2026, from the stock A/B trajectory diagnosis, cause 3.
 
 
-### ADR-012: Unseen-match refusals print the matches (amends ADR-009) [status: accepted]
+### ADR-012: Held-edit confirms, nested-match drops, a 50-section cap, and own-file overwrite (amends ADR-005, ADR-009, ADR-010) [status: accepted]
+
+- **Approval:** This is a guard change. The user approved the seen-gate confirm, the 50-section cap, and own-file edits on 2026-11-15. The nested-match rule is not a guard change.
+- **Context:** In the goal 6 powered comparison (`powered-comparison-plan.md`), 31 of 309 `tilth_write` calls failed. Built-in Edit failed 6 of 1,719 calls.
+  - Each failure made the agent send its payload again in one more API call. The estimated waste was $0.011 per cell, 2.7% of tilth cost. That is more than the whole tilth-over-baseline gap of $0.009 per cell.
+  - The classes were: seen-gate refusal 9, JSON parse error 7, overlap 6, `old` not found 5, ambiguous match 3, batch cap 3, `create_file` on an existing file 1.
+  - The JSON parse errors happen in the host before tilth sees the call. Not-found and ambiguous errors also occur with Edit.
+- **Decision:**
+  1. Nested matches. `lower_text_swaps` drops a `replace_text all` or `rewrite` match that lies wholly inside another op's match. The outer, more specific op wins.
+     - Partial overlaps stay `Overlap` errors. A nested single-match `replace_text` also stays an error.
+     - `count` is checked against the original text. The receipt names each dropped match.
+     - The seen-lines gate judges the same kept matches (`kept_multi_spans`).
+  2. Held-edit confirm. When the seen-lines gate refuses a section, the refusal shows the unseen lines and holds the section in session memory.
+     - This covers multi-match ops and single-anchor line ops. For single-anchor ops it shows up to 400 lines and stops after 8 rounds.
+     - The refusal prints a hold token: `H` and 7 hex digits. The confirm is `{"path":"<p>","tag":"<HOLD>","ops":[]}`.
+     - Holds are keyed by path and hold id. A confirm applies only its own section, once, and only when the live tag equals the tag of the refusal. It then runs the same path as an unchanged resend.
+     - An unchanged resend still works.
+     - Bounds: 64 holds and 4 MiB per session, with the oldest evicted first. An evicted, consumed, or foreign token gets `held edit expired`.
+  3. The batch cap goes from 20 to 50 sections.
+  4. Own-file overwrite. `create_file` records the content digest of each file it creates (at most 1024 per session).
+     - It may overwrite such a file while its content still equals that digest. The digest is checked again just before the replace.
+     - A write through recovery or merge, a move, or a delete ends the tracking.
+     - Files that existed before the session are never overwritten.
+- **Consequences:**
+  - A small race remains between the last digest check and the replace of an own file.
+  - Holds live only in memory, not in the ADR-011 seen store. A confirm sent to a new process gets `held edit expired`.
+  - A hold survives the agent's other tilth writes to the file. The tag check then refuses it. A 16-bit tag collision exposes it the same way it exposes a plain resend.
+  - An empty-ops section with a file tag, the old confirm form, is a no-op success. An insert past EOF gets the plain refusal with no hold.
+- **Verification:**
+  - `tests/mcp_v2/test_write_friction.py`: 12 of its first 19 cases fail on `1c2ede71`.
+  - Unit tests are in `src/session.rs`, `src/edit/apply.rs`, `src/edit/tag.rs`, and `src/mcp/tools/write.rs`.
+  - The Haiku check on the three hard tasks scored 9/9 (main: 8/9).
+  - Paid check (`f14b4638`, sonnet, strict tilth-only arm, 3 reps): five write-heavy goal 6 tasks with write failures (`express_edit_example_start`, `fastapi_edit_security_raise_on_missing`, `gin_edit_render_context`, `rg_edit_flow_migration`, `vuejs__core-11739`).
+    - Spend: $7.11.
+    - The mean per-task cost delta against the goal 6 baseline went from +3.6% (goal 6 tilth cells) to −2.1%. Most of the gain is `vuejs__core-11739`, which went from $0.538 to $0.420 per cell. The other four tasks moved within 3-rep noise.
+    - Failed writes fell from 23 of 132 calls to 13 of 112. The batch-cap, overlap, and create-exists classes did not recur. The rest were `old` not found, ambiguous matches, held seen-gate refusals, and malformed sections.
+    - Correct: 14 of 15. The goal 6 tilth and baseline cells passed 15 of 15. The miss is an `rg_edit_flow_migration` patch that did not compile.[^write-friction]
+
+[^write-friction]: `src/edit/apply.rs` (`nested_in_other_op`, `nested_drops`); `src/edit/recovery.rs` (`unseen_anchor_lines`); `src/mcp/tools/write.rs` (`show_unseen_matches`, `settle_shown`, `confirm_held`, `own_file_unchanged`); `src/session.rs` (`hold_edit`, `take_held_edit`, `note_created`); `src/edit/json.rs` (`lower_edits`). Decision: November 15, 2026, from the goal 6 write-failure analysis.
+
+### ADR-013: Unseen-match refusals print the matches (amends ADR-009) [status: accepted]
 
 - **Context:** ADR-009 names one unblocking read for a refused `rewrite` or `replace_text all|count`. The agent still needs a second call to read, then a third call to retry. The `tools-sonnet-r1` evolve round proposed a patch that prints the matches in the refusal. That patch deadlocked, so it never reached a measurement ([[../benchmark-gepa-v3-evolve]]).
-- **Decision:** PR #444 ships the idea.
+- **Decision:** PR #444 ships the idea. It merged before ADR-012, which extends it with held-edit confirms.
   1. A refusal whose only reason is unseen `rewrite` or `replace_text all|count` matches prints each match as `N:content` lines under `[path#TAG]`.
   2. The printed lines count as displayed. The refusal records them in the snapshot store, and the seen store persists them (ADR-011). The same call, sent again unchanged, then applies. A resumed tilth process also applies it.
   3. Every other refusal stays plain. This includes a drifted section and a tag collision.
-  4. The response has a budget (`WRITE_RESPONSE_BUDGET` in `src/mcp/tools/write.rs`). When the printed lines do not fit what the host shows, the last printed refusal reverts to its plain form and records nothing. A file over the tag cap mints no tag, so it reverts too.
+  4. The response has a limit: `read::HOST_VISIBLE_MAX - HOST_CAP_RESERVE`, measured on the escaped length of the joined sections (`settle_shown` in `src/mcp/tools/write.rs`). While the response is over that limit, the last printed refusal reverts to its plain form and records nothing. A file over the tag cap mints no tag, so it reverts too. `WRITE_RESPONSE_BUDGET` is a different budget; it bounds only the receipt diff.
 - **Why record after the response is built:** A host shows no text past its limit. Lines that the agent never saw must not count as seen. `settle_shown` records the lines only after it knows that the whole response fits.
-- **Gotcha:** The patch from the evolve round took the snapshots mutex twice. Take it once per call. The test harness runs `tool_write` on its own thread with a 30 s wait, so a retaken lock fails the test and does not hang the suite.
+- **Gotcha:** The snapshots mutex (`Session::snapshots`) is not reentrant. The patch from the evolve round took it again while it still held it, and that deadlocked. Do not take the lock again while you hold it. To take it again after you release it is safe: `settle_shown` calls `record_snapshot` once for each refusal. The test harness runs `tool_write` on its own thread with a 30 s wait, so a deadlock fails the test and does not hang the suite.
 - **Verification:** `tests/mcp_v2/test_unseen_match_refusal.py` and the unit tests in `src/mcp/tools/write.rs`.

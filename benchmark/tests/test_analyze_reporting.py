@@ -36,19 +36,19 @@ def _run(*, task, mode, cost, correct, repetition=0, model="claude-haiku-4-5-202
 def test_headline_delta_has_direction_and_deterministic_paired_ci():
     records = [
         _run(task="one", mode="baseline", cost=1.0, correct=True, capability="locate"),
-        _run(task="one", mode="tilth", cost=2.0, correct=True, capability="locate"),
+        _run(task="one", mode="tilth_forced", cost=2.0, correct=True, capability="locate"),
         _run(task="two", mode="baseline", cost=2.0, correct=True, capability="trace"),
-        _run(task="two", mode="tilth", cost=1.0, correct=True, capability="trace"),
+        _run(task="two", mode="tilth_forced", cost=1.0, correct=True, capability="trace"),
     ]
 
-    first = analyze.paired_cpc_delta(records, "tilth")
-    second = analyze.paired_cpc_delta(records, "tilth")
+    first = analyze.paired_cpc_delta(records, "tilth_forced")
+    second = analyze.paired_cpc_delta(records, "tilth_forced")
 
     assert first == second
     assert first[0] == 0.0
     report = analyze.generate_report(records)
     assert report.index("## Headline") < report.index("## Context Efficiency")
-    assert "| tilth-added | $1.5000 | $1.5000 | +0% |" in report
+    assert "| tilth-only | $1.5000 | $1.5000 | +0% |" in report
     assert "95% CI" in report
     assert "## Evidence flags" in report
     assert "## Statistical Analysis" in report
@@ -69,13 +69,13 @@ def test_report_header_keeps_error_count_with_run_metadata():
 def test_headline_reports_baseline_zero_correct_without_dividing():
     records = [
         _run(task="one", mode="baseline", cost=1.0, correct=False),
-        _run(task="one", mode="tilth", cost=1.0, correct=True),
+        _run(task="one", mode="tilth_forced", cost=1.0, correct=True),
     ]
 
     report = analyze.generate_report(records)
 
     assert "n/a (baseline 0-correct)" in report
-    assert analyze.paired_cpc_delta(records, "tilth") == (None, None, None)
+    assert analyze.paired_cpc_delta(records, "tilth_forced") == (None, None, None)
 
 def test_report_renders_flag_counts_by_mode():
     report = analyze.generate_report([
@@ -89,9 +89,9 @@ def test_report_renders_flag_counts_by_mode():
 def test_capability_and_control_sections_use_record_capability():
     records = [
         _run(task="locate-task", mode="baseline", cost=1.0, correct=True, capability="locate"),
-        _run(task="locate-task", mode="tilth", cost=2.0, correct=True, capability="locate"),
+        _run(task="locate-task", mode="tilth_forced", cost=2.0, correct=True, capability="locate"),
         _run(task="control-task", mode="baseline", cost=1.0, correct=True, capability="control"),
-        _run(task="control-task", mode="tilth", cost=1.5, correct=False, capability="control"),
+        _run(task="control-task", mode="tilth_forced", cost=1.5, correct=False, capability="control"),
     ]
 
     report = analyze.generate_report(records)
@@ -100,7 +100,7 @@ def test_capability_and_control_sections_use_record_capability():
     assert "| locate |" in report
     assert "| control |" in report
     assert "## Control-task delta" in report
-    assert "tilth-added" in report
+    assert "tilth-only" in report
     assert "-100pp" in report
 
 
@@ -125,7 +125,7 @@ def test_pairing_uses_task_model_and_repetition_keys():
         ),
         _run(
             task="same",
-            mode="tilth",
+            mode="tilth_forced",
             model="claude-sonnet-4-6",
             cost=2.0,
             correct=False,
@@ -141,7 +141,7 @@ def test_pairing_uses_task_model_and_repetition_keys():
         ),
         _run(
             task="same",
-            mode="tilth",
+            mode="tilth_forced",
             model="claude-sonnet-4-6",
             cost=4.0,
             correct=True,
@@ -166,7 +166,7 @@ def test_paired_cpc_delta_bootstraps_task_deltas_with_fixed_seed(monkeypatch):
         _run(task="one", mode="baseline", model="haiku", cost=1.0, correct=True),
         _run(
             task="one",
-            mode="tilth",
+            mode="tilth_forced",
             model="claude-haiku-4-5-20251001",
             cost=2.0,
             correct=True,
@@ -178,11 +178,11 @@ def test_paired_cpc_delta_bootstraps_task_deltas_with_fixed_seed(monkeypatch):
             cost=2.0,
             correct=True,
         ),
-        _run(task="two", mode="tilth", model="haiku", cost=1.0, correct=True),
+        _run(task="two", mode="tilth_forced", model="haiku", cost=1.0, correct=True),
         _run(task="one", mode="baseline", model="sonnet", cost=3.0, correct=True),
         _run(
             task="one",
-            mode="tilth",
+            mode="tilth_forced",
             model="claude-sonnet-4-6",
             cost=2.0,
             correct=True,
@@ -199,7 +199,7 @@ def test_paired_cpc_delta_bootstraps_task_deltas_with_fixed_seed(monkeypatch):
 
     monkeypatch.setattr(paired.stats, "paired_bootstrap_ci", fake_bootstrap)
 
-    result = paired.paired_cpc_delta(records, "tilth")
+    result = paired.paired_cpc_delta(records, "tilth_forced")
 
     assert observed == {
         "deltas": [0.0, -0.5],
@@ -302,18 +302,18 @@ def test_failure_type_labels_grader_timeout_apart_from_grader_failure():
 def test_failure_taxonomy_reports_types_transitions_and_tool_signal():
     baseline = _run(task="one", mode="baseline", cost=1.0, correct=False)
     baseline["correctness_reason"] = "Missing: exact-symbol"
-    tilth = _run(task="one", mode="tilth", cost=1.0, correct=False)
+    tilth = _run(task="one", mode="tilth_forced", cost=1.0, correct=False)
     tilth["correctness_reason"] = "Missing: exact-symbol"
     tilth["tool_calls"] = {"mcp__tilth__tilth_search": 2}
     passed_baseline = _run(task="two", mode="baseline", cost=1.0, correct=True)
-    passed_tilth = _run(task="two", mode="tilth", cost=1.0, correct=True)
+    passed_tilth = _run(task="two", mode="tilth_forced", cost=1.0, correct=True)
 
     report = analyze.generate_report([baseline, tilth, passed_baseline, passed_tilth])
 
     assert report.index("## Failure taxonomy") < report.index("## Context Efficiency")
     assert "| missing_required_literal | exact-symbol | 1 | 1 | one |" in report
-    assert "| tilth-added vs baseline | 1 | 0 | 0 | 1 |" in report
-    assert "| tilth-added | 1 | 1 | 2 |" in report
+    assert "| tilth-only vs baseline | 1 | 0 | 0 | 1 |" in report
+    assert "| tilth-only | 1 | 1 | 2 |" in report
 
 
 def test_tool_usage_section_reports_per_arm_counts_and_availability():
@@ -323,12 +323,12 @@ def test_tool_usage_section_reports_per_arm_counts_and_availability():
     baseline = _run(task="one", mode="baseline", cost=1.0, correct=True)
     baseline["tool_calls"] = {"Grep": 3, "Read": 2}
     baseline["available_tools"] = ["Bash", "Grep", "Read"]
-    tilth = _run(task="one", mode="tilth", cost=1.0, correct=True)
+    tilth = _run(task="one", mode="tilth_forced", cost=1.0, correct=True)
     # Bare server-side names (e.g. from the mcp-shortening fork) must still
     # count as tilth calls alongside the registered mcp__tilth__ alias.
     tilth["tool_calls"] = {"Read": 1, "mcp__tilth__tilth_search": 4, "tilth_read": 2}
     tilth["available_tools"] = ["Read", "mcp__tilth__tilth_search"]
-    legacy = _run(task="one", mode="tilth", cost=1.0, correct=True, repetition=1)
+    legacy = _run(task="one", mode="tilth_forced", cost=1.0, correct=True, repetition=1)
     legacy["tool_calls"] = {"Grep": 1}
 
     report = analyze.generate_report([baseline, tilth, legacy])
@@ -344,7 +344,7 @@ def test_tool_usage_section_reports_per_arm_counts_and_availability():
     # recorded (the legacy row lacks the field and only shrinks the known
     # denominator); one tilth cell made >=1 tilth call.
     assert "| baseline | 1 | 0/1 | 0 |" in report
-    assert "| tilth-added | 2 | 1/1 | 1 |" in report
+    assert "| tilth-only | 2 | 1/1 | 1 |" in report
     # No row carries batch_sizes -> the batching table degrades explicitly
     # instead of rendering zeros.
     assert "_Batch sizes unrecorded" in report
@@ -358,11 +358,11 @@ def test_batching_table_reports_multi_item_share_per_arm():
     baseline = _run(task="one", mode="baseline", cost=1.0, correct=True)
     baseline["tool_calls"] = {"Read": 2}
     baseline["batch_sizes"] = {}
-    tilth = _run(task="one", mode="tilth", cost=1.0, correct=True)
+    tilth = _run(task="one", mode="tilth_forced", cost=1.0, correct=True)
     tilth["tool_calls"] = {"mcp__tilth__tilth_read": 3}
     tilth["batch_sizes"] = {"mcp__tilth__tilth_read": [1, 4, 1],
                             "mcp__tilth__tilth_search": [1, 1]}
-    legacy = _run(task="one", mode="tilth_forced", cost=1.0, correct=True)
+    legacy = _run(task="one", mode="tilth_legacy", cost=1.0, correct=True)
     legacy["tool_calls"] = {"mcp__tilth__tilth_read": 5}
 
     report = analyze.generate_report([baseline, tilth, legacy])
@@ -379,9 +379,9 @@ def test_op_kinds_table_reports_counts_per_arm():
     batch-size table's semantics."""
     baseline = _run(task="one", mode="baseline", cost=1.0, correct=True)
     baseline["op_kinds"] = {}
-    tilth = _run(task="one", mode="tilth", cost=1.0, correct=True)
+    tilth = _run(task="one", mode="tilth_forced", cost=1.0, correct=True)
     tilth["op_kinds"] = {"replace_text": 5, "replace": 2}
-    legacy = _run(task="one", mode="tilth_forced", cost=1.0, correct=True)
+    legacy = _run(task="one", mode="tilth_legacy", cost=1.0, correct=True)
 
     report = analyze.generate_report([baseline, tilth, legacy])
 
@@ -396,7 +396,7 @@ def test_per_task_tools_used_totals_and_native_cost_reconciliation():
     category breakdown against the runner's native caching-aware total."""
     runs = []
     for repetition, tilth_calls in enumerate([1, 0, 0]):
-        run = _run(task="one", mode="tilth", cost=1.0, correct=True,
+        run = _run(task="one", mode="tilth_forced", cost=1.0, correct=True,
                    repetition=repetition, model="claude-sonnet-5")
         run["tool_calls"] = {"Read": 2}
         if tilth_calls:
@@ -416,8 +416,8 @@ def test_per_task_tools_used_totals_and_native_cost_reconciliation():
     report = analyze.generate_report(runs + [baseline])
 
     assert "**Tools used (total calls across reps):**" in report
-    assert "tilth-added: Read=6, mcp__tilth__tilth_search=1" in report
-    assert "baseline   : Grep=4" in report  # label ljust-padded to "tilth-added"
+    assert "tilth-only: Read=6, mcp__tilth__tilth_search=1" in report
+    assert "baseline  : Grep=4" in report  # label ljust-padded to "tilth-only"
     assert "Tool breakdown (median counts)" not in report
     assert "native=$1.0000" in report
     assert "Δnative=" in report
@@ -428,9 +428,9 @@ def test_paired_loader_counts_contaminated_panel_rows_incorrect(tmp_path: Path) 
 
     rows = [
         {**_run(task="t1", mode="baseline", cost=1.0, correct=True), "panel_name": "p", "contaminated": False},
-        {**_run(task="t1", mode="tilth", cost=1.0, correct=True), "panel_name": "p", "contaminated": True},
+        {**_run(task="t1", mode="tilth_forced", cost=1.0, correct=True), "panel_name": "p", "contaminated": True},
         {**_run(task="t2", mode="baseline", cost=1.0, correct=True), "contaminated": True},
-        {**_run(task="t2", mode="tilth", cost=1.0, correct=True), "panel_name": "p", "contaminated": False},
+        {**_run(task="t2", mode="tilth_forced", cost=1.0, correct=True), "panel_name": "p", "contaminated": False},
     ]
     path = tmp_path / "results.jsonl"
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
@@ -439,16 +439,16 @@ def test_paired_loader_counts_contaminated_panel_rows_incorrect(tmp_path: Path) 
 
     assert [row["correct"] for row in loaded] == [True, False, True, True]
     assert len(loaded) == 4
-    assert paired.paired_accuracy_delta(loaded, "tilth")[0] == pytest.approx(-0.5)
+    assert paired.paired_accuracy_delta(loaded, "tilth_forced")[0] == pytest.approx(-0.5)
     assert analyze.is_contaminated_panel_row is paired.is_contaminated_panel_row
 
 
 def _paired_models(rows: list[dict]) -> set:
-    return {model for _task, model in paired.pair_modes(rows, "tilth", "baseline")}
+    return {model for _task, model in paired.pair_modes(rows, "tilth_forced", "baseline")}
 
 
 def _arms(**fields) -> list[dict]:
-    return [{**_run(task="t1", mode=mode, cost=1.0, correct=True), **fields} for mode in ("baseline", "tilth")]
+    return [{**_run(task="t1", mode=mode, cost=1.0, correct=True), **fields} for mode in ("baseline", "tilth_forced")]
 
 
 def test_alias_row_labels_as_its_resolved_model() -> None:
@@ -479,7 +479,7 @@ def test_failed_alias_cell_pairs_with_its_resolved_arm(tmp_path: Path) -> None:
     path = tmp_path / "results.jsonl"
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
-    pairs = paired.pair_modes(paired.load_runs(path), "tilth", "baseline")
+    pairs = paired.pair_modes(paired.load_runs(path), "tilth_forced", "baseline")
 
     assert list(pairs) == [("t1", "claude-sonnet-5")]
     assert [(base, exp) for _rep, base, exp, _a, _b in pairs[("t1", "claude-sonnet-5")]] == [(True, False)]

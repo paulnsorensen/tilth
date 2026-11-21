@@ -99,11 +99,10 @@ RESULTS_DIR = BENCHMARK_DIR / "results"
 TILTH_MCP_CONFIG = FIXTURES_DIR / "tilth_mcp.json"
 
 # opencode runner: per-mode opencode.json (OPENCODE_CONFIG env) selecting which
-# MCP servers are exposed. opencode has no built-in-tool allowlist, so it covers
-# baseline (no MCP) and tilth (tilth MCP); tilth_forced has no opencode analog.
+# MCP servers are exposed. opencode has no verified way to disable its built-in
+# tools, so it covers baseline only; tilth_forced has no opencode analog.
 OPENCODE_CONFIGS = {
     "baseline": str(FIXTURES_DIR / "opencode_baseline.json"),
-    "tilth": str(FIXTURES_DIR / "opencode_tilth.json"),
 }
 REPOS_DIR = Path("/tmp/tilth_bench/repos")
 
@@ -304,14 +303,6 @@ MODES = {
         mcp_config_path=None,
         opencode_config_path=str(FIXTURES_DIR / "opencode_baseline.json"),
         description="Claude Code built-in tools",
-    ),
-    "tilth": ModeConfig(
-        name="tilth",
-        tools=["Read", "Edit", "Grep", "Glob", "Bash"],
-        mcp_config_path=str(TILTH_MCP_CONFIG),
-        opencode_config_path=str(FIXTURES_DIR / "opencode_tilth.json"),
-        binary_path=TILTH_BIN,
-        description="Built-in tools + tilth MCP (hybrid)",
     ),
     "tilth_forced": ModeConfig(
         name="tilth_forced",

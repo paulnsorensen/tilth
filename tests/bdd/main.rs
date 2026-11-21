@@ -301,15 +301,10 @@ fn search_callees(world: &mut TilthWorld, step: &cucumber::gherkin::Step) {
     assert_eq!(actual, docstring(step), "{world:?}");
 }
 
-/// Follow the search hint of `kind`; return sorted `path:line name` rows.
+/// Follow the first result's target as `kind`; return sorted `path:line name` rows.
 fn follow_items(world: &mut TilthWorld, kind: &str) -> String {
-    let hint = world.search_payload()["hints"]
-        .as_array()
-        .expect("search hints")
-        .iter()
-        .find(|hint| hint["kind"] == kind)
-        .unwrap_or_else(|| panic!("{kind} hint"))
-        .clone();
+    let target = world.search_payload()["results"][0]["target"].clone();
+    let hint = json!({"kind": kind, "target": target});
     world.call("tilth_search", json!({"queries": [{"follow": hint}]}));
     let payload = world.search_payload();
     let mut actual = payload["results"][0]["items"]

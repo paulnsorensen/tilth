@@ -27,10 +27,22 @@ class AC06Enrichment(unittest.TestCase):
         self.assertIsNotNone(response)
         return json.loads(harness.tool_result_text(response))
 
-    def _assert_hint(self, query, kind):
+    def _assert_follows(self, query, kind):
         payload = self._call(query)
-        hints = payload.get("hints", [])
-        self.assertTrue(any(h.get("kind") == kind for h in hints))
+        self.assertNotIn("hints", payload)
+        target = payload["results"][0]["target"]
+        requests = [
+            harness.initialize_request(1),
+            harness.tools_call_request(
+                2,
+                "tilth_search",
+                {"queries": [{"follow": {"kind": kind, "target": target}}], "cwd": CWD},
+            ),
+        ]
+        response = harness.run_mcp([], requests).response_by_id(2)
+        self.assertFalse(harness.tool_is_error(response), response)
+        followed = json.loads(harness.tool_result_text(response))
+        self.assertEqual(followed["results"][0]["resolved_as"], kind)
 
     def test_unique_core(self):
         payload = self._call("detect_file_type")
@@ -38,24 +50,23 @@ class AC06Enrichment(unittest.TestCase):
         self.assertIn("core", result)
 
     def test_callers_continuation(self):
-        self._assert_hint("detect_file_type", "fetch_callers")
+        self._assert_follows("detect_file_type", "fetch_callers")
 
     def test_callees_continuation(self):
-        self._assert_hint("detect_file_type", "fetch_callees")
+        self._assert_follows("detect_file_type", "fetch_callees")
 
     def test_siblings_continuation(self):
-        self._assert_hint("detect_file_type", "fetch_siblings")
+        self._assert_follows("detect_file_type", "fetch_siblings")
 
     def test_tests_continuation(self):
-        self._assert_hint("detect_file_type", "fetch_tests")
+        self._assert_follows("detect_file_type", "fetch_tests")
 
     def test_ambiguous_disambiguation(self):
         payload = self._call("run")
         result = payload["results"][0]
         self.assertIn("candidates", result)
         self.assertGreater(len(result["candidates"]), 1)
-        hints = payload.get("hints", [])
-        self.assertEqual(hints, [])
+        self.assertNotIn("hints", payload)
         self.assertNotIn("core", result)
 
 
