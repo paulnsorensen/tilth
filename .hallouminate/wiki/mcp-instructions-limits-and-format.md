@@ -99,4 +99,20 @@ transcripts (anthropic.com/engineering/writing-tools-for-agents).
   compares served bytes with the files, not frozen bytes, so GEPA candidates can
   evolve them. `tool_descriptions_fit_2kb` caps each at 2,048 bytes.
 
-_Source: child spec `bench-prompt-files`, stack PR #313 (`stack/bench-gepa/0-prompt-files`), verified at the layer 6 head of PR #319 · Updated: 2026-10-13_
+## A description sentence does not change the tilth_write op mix
+
+Goal 6 showed that line-number ops cost more output than `replace_text`:
+about 455 thinking tokens per call against 220, and 1,713 against 1,294
+estimated output tokens per call (sonnet, `tilth_stock`, 24 tasks x 3).
+On 2026-11-21 one sentence led `prompts/tools/write.md`: "Default to
+replace_text {old,new}; use line-number ops only when no short unique old
+text exists." A paid check (sonnet, five write tasks x 3, $7.49) against
+the #457 rows did not move the mix. Line ops rose from 36% to 42% of ops,
+the task-mean cost rose 5.3% (noise at n=15), and accuracy stayed 14/15.
+The sentence was dropped. A probable cause (not tested): agents pick line
+ops from the numbered read output and from the size of the edit, not from
+description text. A future lever on this cost should change what the agent
+sees (read or receipt output), not add prose. Rows:
+`benchmark/results/text-edits.jsonl` against `write-friction.jsonl`.
+
+_Source: child spec `bench-prompt-files`, stack PR #313 (`stack/bench-gepa/0-prompt-files`), verified at the layer 6 head of PR #319; op-mix check on branch `perf/text-match-edits` · Updated: 2026-11-21_

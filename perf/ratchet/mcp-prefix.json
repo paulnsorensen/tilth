@@ -4,7 +4,7 @@
       "command": "python3 scripts/mcp_prefix_bytes.py",
       "direction": "lower",
       "revision": "27623490",
-      "threshold": 10469,
+      "threshold": 10371,
       "tolerance": 0.0,
       "unit": "bytes"
     }
