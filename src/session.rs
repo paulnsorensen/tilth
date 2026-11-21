@@ -383,8 +383,6 @@ impl Session {
         }
     }
 
-    /// `key` was removed or moved away, or holds content that the agent did
-    /// not author.
     /// Track `new_text` as the file's content after a write with no drift, but
     /// only while the file matched what the session tracked before the write.
     /// Otherwise the file holds lines the session never authored, so it stops
@@ -400,6 +398,8 @@ impl Session {
         }
     }
 
+    /// `key` was removed or moved away, or holds content that the agent did
+    /// not author. Drop its held edits and its created state.
     pub fn forget_written(&self, key: &str) {
         let mut memory = self.write_memory();
         memory.held.retain(|(held, _), _| held != key);
