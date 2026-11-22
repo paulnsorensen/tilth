@@ -91,6 +91,23 @@ def test_hook_source_key_feeds_only_the_strict_key(hook_source: dict) -> None:
     assert _key() == plain_before
 
 
+def test_allow_capture_changes_each_hooked_key_and_no_plain_key() -> None:
+    """The flag is in the argv of a hooked cell, so capture cells and strict cells never share a row."""
+    strict_before, plain_before = _key(strict=True), _key()
+    forced_before, codex_before = _key(mode="tilth_forced", strict=True), _key(mode="tilth_forced", model="luna56")
+
+    run.set_hook_capture(True)
+
+    assert _key(strict=True) != strict_before
+    assert _key(mode="tilth_forced", strict=True) != forced_before
+    assert _key(mode="tilth_forced", model="luna56") != codex_before
+    assert _key() == plain_before
+    template = run._command_template(StoreTask(), run.MODES["baseline"], "baseline", "sonnet5", bare=True,
+                                     reasoning_effort=None, max_budget_usd=1.0, strict_file_tools=True)
+    settings = json.loads(template[template.index("--settings") + 1])
+    assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["args"] == ["hook", "--hint", "native", "--allow-capture"]
+
+
 def test_digest_carries_hook_source_key_and_not_the_python_guard() -> None:
     identity = run.cell_identity("wiring_task", "baseline", "sonnet5", 0, bare=True, reasoning_effort=None,
                                  max_budget_usd=1.0, strict_file_tools=True, hook_sha="h")

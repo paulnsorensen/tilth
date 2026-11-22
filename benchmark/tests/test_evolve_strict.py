@@ -30,13 +30,23 @@ WEAK_SEED = mcp(dev_a="0", dev_b="0", cheap_a="1", test_a="0")
 DENY_ROW = next(row for row in CORPUS["must_deny"] if row["command"] not in {run._PROBE_DENY, run._PROBE_ALLOW})
 ALLOW_ROW = next(row for row in CORPUS["must_allow"] if row["command"] not in {run._PROBE_DENY, run._PROBE_ALLOW})
 
+CAPTURE = CORPUS[hookgate.CAPTURE_SECTION]
+# With `--allow-capture`: a row that denies, and a row that the default mode denies and the flag allows.
+CAPTURE_DENY_ROW = CAPTURE["must_deny"][0]
+CAPTURE_ALLOW_ROW = CAPTURE["must_allow"][0]
+
 _FAKE_HOOK = """#!{python}
 import json, sys
 cfg = json.load(open({config!r}))
 hint = sys.argv[sys.argv.index("--hint") + 1]
+capture = "--allow-capture" in sys.argv
+if capture and cfg["rejects_capture"]:
+    sys.stderr.write("error: unexpected argument '--allow-capture' found")
+    sys.exit(2)
 command = json.load(sys.stdin)["tool_input"]["command"]
-deny = command in cfg["deny"]
-if command in cfg["flip"].get(hint, []):
+deny = command in cfg["capture_deny" if capture else "deny"]
+flips = cfg["flip"].get(hint, []) + (cfg["flip"].get(hint + "+capture", []) if capture else [])
+if command in flips:
     deny = not deny
 if deny:
     if not cfg["silent"]:
@@ -46,11 +56,19 @@ sys.exit(0)
 """
 
 
-def fake_hook(tmp: Path, name: str, *, flip: dict[str, list[str]] | None = None, silent: bool = False) -> Path:
-    """A hook that is faithful to the corpus, except it flips the verdict of ``flip[hint]`` commands."""
+def fake_hook(tmp: Path, name: str, *, flip: dict[str, list[str]] | None = None, silent: bool = False,
+              rejects_capture: bool = False) -> Path:
+    """A hook that is faithful to the corpus in both capture modes, except for the ``flip`` commands.
+
+    ``flip[hint]`` flips a verdict in both capture modes; ``flip[hint + "+capture"]`` flips it only with the flag.
+    ``rejects_capture`` models a binary built before the flag existed: it exits 2 on the unknown argument.
+    """
+    deny = [row["command"] for row in CORPUS["must_deny"]]
+    lifted = {row["command"] for row in CAPTURE["must_allow"]}
+    capture_deny = [c for c in deny if c not in lifted] + [row["command"] for row in CAPTURE["must_deny"]]
     config = tmp / f"{name}.json"
-    config.write_text(json.dumps({"deny": [row["command"] for row in CORPUS["must_deny"]], "flip": flip or {},
-                                  "silent": silent}))
+    config.write_text(json.dumps({"deny": deny, "capture_deny": capture_deny, "flip": flip or {},
+                                  "silent": silent, "rejects_capture": rejects_capture}))
     path = tmp / name
     path.write_text(_FAKE_HOOK.format(python=sys.executable, config=str(config)))
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
@@ -806,3 +824,150 @@ def test_hook_gate_failure_clears_the_candidate_build(monkeypatch: pytest.Monkey
 
     assert info["stage"] == "hook gate"
     assert not (run.RESULTS_DIR / "candidates" / result.sha).exists()
+
+
+# --- `--allow-capture`: the evolve default, and the corpus in both capture modes ---
+
+
+def _hook_args() -> list[str]:
+    settings = json.loads(run._strict_bash_settings("/bin/tilth", "native"))
+    return settings["hooks"]["PreToolUse"][0]["hooks"][0]["args"]
+
+
+@pytest.mark.parametrize(("flag", "expected"), [(None, True), ("--no-allow-capture", False)])
+def test_capture_is_the_evolve_default_and_reaches_the_cell_hook(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                                 flag, expected) -> None:
+    world = strict_world(monkeypatch, tmp_path)
+
+    evo = build(world, *([flag] if flag else []), strict=True)
+
+    assert evo.settings.allow_capture is expected
+    assert run.hook_capture() is expected
+    assert (run.HOOK_CAPTURE_FLAG in _hook_args()) is expected
+
+
+def test_a_non_strict_run_leaves_capture_off(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = strict_world(monkeypatch, tmp_path)
+    run.set_hook_capture(True)
+
+    build(world)
+
+    assert run.hook_capture() is False
+
+
+def test_faithful_seed_hook_passes_the_preflight_with_the_capture_flag(monkeypatch: pytest.MonkeyPatch,
+                                                                      tmp_path: Path) -> None:
+    world = strict_world(monkeypatch, tmp_path)
+
+    assert build(world, strict=True).preflight() is None
+
+    assert "in both hint modes with --allow-capture" in log_text(world)
+
+
+def test_the_gate_checks_capture_rows_only_for_a_capture_run(tmp_path: Path) -> None:
+    """A hook that allows an authored write, but only with the flag."""
+    loose = fake_hook(tmp_path, "loose", flip={"tilth+capture": [CAPTURE_DENY_ROW["command"]]})
+    wanted = [f"--hint tilth --allow-capture: must deny ({CAPTURE_DENY_ROW['rule']}) but got allow (exit 0): "
+              f"`{CAPTURE_DENY_ROW['command']}`"]
+
+    assert hookgate.corpus_failures(str(loose)) == []
+    assert hookgate.corpus_failures(str(loose), capture=True) == wanted
+    run.set_hook_capture(True)
+    assert hookgate.corpus_failures(str(loose)) == wanted
+    assert hookgate.corpus_failures(str(loose), capture=False) == []
+
+
+def test_a_hook_that_denies_a_real_capture_fails_the_capture_gate(tmp_path: Path) -> None:
+    strict_only = fake_hook(tmp_path, "strict-only", flip={"native+capture": [CAPTURE_ALLOW_ROW["command"]]})
+
+    failures = hookgate.corpus_failures(str(strict_only), capture=True)
+
+    assert failures == [
+        f"--hint native --allow-capture: must allow but got deny (exit 2): `{CAPTURE_ALLOW_ROW['command']}`"]
+
+
+def test_a_default_deny_row_must_still_deny_with_the_flag(tmp_path: Path) -> None:
+    assert DENY_ROW["command"] not in {row["command"] for row in CAPTURE["must_allow"]}
+    loose = fake_hook(tmp_path, "loose", flip={"native+capture": [DENY_ROW["command"]]})
+
+    failures = hookgate.corpus_failures(str(loose), capture=True)
+
+    assert failures == [f"--hint native --allow-capture: must deny ({DENY_ROW['rule']}) but got allow (exit 0): "
+                        f"`{DENY_ROW['command']}`"]
+
+
+def test_a_default_deny_row_that_the_capture_section_lifts_must_allow_with_the_flag(tmp_path: Path) -> None:
+    lifted = next(row for row in CORPUS["must_deny"]
+                  if row["command"] in {allowed["command"] for allowed in CAPTURE["must_allow"]})
+    strict_only = fake_hook(tmp_path, "strict-only", flip={"tilth+capture": [lifted["command"]]})
+
+    failures = hookgate.corpus_failures(str(strict_only), capture=True)
+
+    assert failures and all(line.startswith("--hint tilth --allow-capture: must allow but got deny")
+                            and lifted["command"] in line for line in failures)
+
+
+def test_a_capture_run_needs_the_capture_section(tmp_path: Path) -> None:
+    hook = fake_hook(tmp_path, "any-hook")
+    corpus = {key: CORPUS[key] for key in hookgate.LISTS}
+
+    assert hookgate.corpus_failures(str(hook), corpus) == []
+    assert hookgate.corpus_failures(str(hook), corpus, capture=True) == [
+        "hook corpus `allow_capture` section is not a JSON object"]
+    assert hookgate.corpus_failures(str(hook), {**corpus, "allow_capture": {"must_deny": [], "must_allow": []}},
+                                    capture=True)
+
+
+def test_seed_preflight_refuses_a_seed_hook_that_fails_a_capture_row(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                                    capsys) -> None:
+    seed_hook = fake_hook(tmp_path, "loose-seed", flip={"tilth+capture": [CAPTURE_DENY_ROW["command"]]})
+    world = strict_world(monkeypatch, tmp_path, seed_hook=seed_hook)
+
+    assert build(world, strict=True).preflight() == 2
+
+    assert f"--allow-capture: must deny ({CAPTURE_DENY_ROW['rule']})" in capsys.readouterr().err
+    assert world.calls == [] and world.spawned == []
+
+
+def test_no_allow_capture_does_not_check_the_capture_rows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    seed_hook = fake_hook(tmp_path, "loose-seed", flip={"tilth+capture": [CAPTURE_DENY_ROW["command"]]})
+    world = strict_world(monkeypatch, tmp_path, seed_hook=seed_hook)
+
+    assert build(world, "--no-allow-capture", strict=True).preflight() is None
+
+    assert "--allow-capture" not in log_text(world)
+
+
+def test_a_seed_hook_built_before_the_flag_refuses_a_capture_run(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                                capsys) -> None:
+    old = fake_hook(tmp_path, "old-seed", rejects_capture=True)
+    world = strict_world(monkeypatch, tmp_path, seed_hook=old)
+
+    assert build(world, strict=True).preflight() == 2
+    assert "--allow-capture: must allow but got deny" in capsys.readouterr().err
+    assert world.calls == [] and world.spawned == []
+
+    assert build(world, "--no-allow-capture", strict=True).preflight() is None
+
+
+def test_the_candidate_hook_gate_fails_a_candidate_that_loosens_capture(monkeypatch: pytest.MonkeyPatch,
+                                                                       tmp_path: Path) -> None:
+    loose = fake_hook(tmp_path, "loose-candidate", flip={"native+capture": [CAPTURE_DENY_ROW["command"]]})
+    world = strict_world(monkeypatch, tmp_path, hooks={"loose": loose})
+    fake, _seen = scripted_engine([winner("loose")])
+    monkeypatch.setattr(engine, "optimize_anything", fake)
+    evo = build(world, strict=True)
+
+    assert evo.run() == 0
+
+    (result,) = [r for r in evo.results.values() if "tag=loose" in r.candidate["prompts/mcp.md"]]
+    assert result.stage == "hook gate"
+    assert "--allow-capture" in result.tail and CAPTURE_DENY_ROW["command"] in result.tail
+
+
+def test_the_built_hook_passes_the_corpus_in_both_capture_modes() -> None:
+    real = _built_tilth()
+    if real is None:
+        pytest.skip("no built tilth in target/")
+
+    assert hookgate.corpus_failures(str(real), capture=True) == []

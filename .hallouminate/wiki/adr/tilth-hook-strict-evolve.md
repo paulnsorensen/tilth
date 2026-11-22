@@ -143,13 +143,26 @@ The user settled three questions:
 - Scope: the flag also lifts `curl -o` and `-O`, `tail -f`, reads of `/proc`, `/sys`, and `/dev/null`, and output to a stream device. The user accepted that `tail -n +1 -f FILE` then prints a whole file.
 - Install: `tilth install <host> --hook` gets no flag. A reinstall keeps an `--allow-capture` that the tilth entry already has (`existing_allow_capture` in `src/install.rs`), as it keeps `--hint`.
 
-F-5 holds, because the default mode does not change:
+F-5 holds for the hook, because its default mode does not change:
 
-- The `must_deny` and `must_allow` rows of `benchmark/hook_corpus.json` are unchanged. The new `allow_capture` section holds the rows for the flag. `benchmark/evolve/hookgate.py` reads only the two default lists, so the seed preflight and the hook gate stay strict. `cargo test` checks the `allow_capture` rows in both hint modes, in `src/hook/tests.rs` and through the binary in `tests/hook_cli.rs`.
+- The `must_deny` and `must_allow` rows of `benchmark/hook_corpus.json` are unchanged. The new `allow_capture` section holds the rows for the flag. `cargo test` checks the `allow_capture` rows in both hint modes, in `src/hook/tests.rs` and through the binary in `tests/hook_cli.rs`.
 - `capture_lifts_only_the_default_denials_that_the_corpus_lists` fails when the flag allows a default `must_deny` row that no `allow_capture.must_allow` row lists. Five default rows flip: `echo hi > /dev/tty`, two `go test` redirects, and two `tee` rows.
 - A differential run of the old binary and the new binary found no verdict change in the default mode. It used 1,515 commands (the corpus, every string in `src/hook/tests.rs`, and the probe lists of this change) in both hint modes.
 - The strict deny text for `output redirect` and `tee` has one more sentence. It names the route for command output that stays open: `<command> 2>&1 | tail -n 40`.
 - The baseline key uses the tree hash of `src/hook`, so this change buys a new strict baseline, as each `src/hook` change does.
+
+### Evolve runs with the flag by default (2026-11-22, user decision)
+
+The user asked for the flag as the default of the evolve benchmarks. A strict cell then behaves like daily work: a command can write its own output to a file.
+
+- `run.set_hook_capture` is one switch for the process. `_hook_options` adds `--allow-capture` to the cell hook (`_strict_bash_settings`), the Codex hook (`_codex_hook_config`), the seed replay, and the probes (`_run_hook`). All of them must agree: a replay with other options than the cell hook reports a false `hook_loosened`.
+- `Evolution.__init__` turns the switch on when the run is strict and `Settings.allow_capture` is true (the default). `--no-allow-capture` turns it off. `run.py` keeps it off unless it gets `--allow-capture`: only the evolve default has user approval.
+- The flag is in the argv of each hooked cell, so the command template and the run key change. No new key field is necessary, and capture cells never share a row with strict cells. A `run.py --panel` row matches an evolve row only with `--allow-capture`.
+- `hookgate.corpus_failures` checks the mode of the cells. With the flag, the `allow_capture` section holds, and each default row holds too, except that a default `must_deny` row that `allow_capture.must_allow` lists must pass. The seed preflight and the candidate hook gate both use it.
+- The gate does not replay the other mode. `just check` runs before the gate and holds each candidate to the corpus in both modes through the Rust tests. A replay of both modes made each gate about 2.4 times slower, because the test fakes are Python scripts.
+- F-5 changes in one point: the floor for a candidate hook in an evolve run is the seed hook with `--allow-capture`, not the seed hook in its default mode. The two F-5 checks stay: the corpus gate and the `hook_loosened` replay.
+- A seed binary without the flag exits 2 on it. The preflight then refuses the run before any paid call.
+- The test fixture `hooks_without_capture` in `benchmark/tests/conftest.py` resets the switch for each test, because an `Evolution` object turns it on.
 
 The rules with the flag:
 

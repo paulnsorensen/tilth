@@ -135,6 +135,12 @@ def hermetic_codex_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture(autouse=True)
+def hooks_without_capture(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start each test with hook calls that do not use ``--allow-capture``; an evolve run turns it on."""
+    monkeypatch.setattr(run, "_hook_capture", False)
+
+
+@pytest.fixture(autouse=True)
 def hermetic_claude_pin(monkeypatch: pytest.MonkeyPatch) -> None:
     """Spawn plain ``claude`` and skip the pin check; tests of the pin restore the real functions."""
     monkeypatch.setattr(run, "resolve_claude_binary", lambda: "claude")

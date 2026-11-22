@@ -145,6 +145,12 @@ Every cell runs with Bash guarded by the tilth hook (`tilth hook`). The tilth ar
 binary's own hook with `--hint tilth`. The baseline runs the seed's hook with `--hint native`.
 Every cell uses `hook_sha` = the seed sha, so baseline run keys depend on the seed hook source.
 
+The strict hooks run with `--allow-capture` by default. A command can then write its own output to a file
+(`go test ./... > out.txt`, `cmd | tee log`), and `echo`, `printf`, `cat`, and here-document writes still deny.
+The cell hook, the seed replay, and the probes all use the flag, so the audit and the cell agree.
+The flag is in the argv of each strict cell, so it is in the run key.
+
+Pass `--no-allow-capture` to run the strict hooks without the flag. The two modes never share a stored cell.
 Pass `--no-strict-file-tools` to run cells without the hook. Stored non-strict baselines are not
 reused by a strict run, and the reverse. The first strict run buys a full strict baseline.
 
@@ -153,8 +159,11 @@ reused by a strict run, and the reverse. The first strict run buys a full strict
 Before any paid call, a strict run builds the seed hook and replays every row of the frozen corpus
 (`benchmark/hook_corpus.json`) through it in both hint modes. A `must_deny` row that the hook allows,
 or a `must_allow` row that it denies, refuses the run (exit 2). The log names the failing rows.
-The `allow_capture` section of the corpus holds the verdicts for `tilth hook --allow-capture`. No benchmark
-cell uses that option, so the preflight and the hook gate do not replay it. `cargo test` checks it.
+
+The replay uses the mode of the cells. With `--allow-capture` (the default), the hook runs with the flag and
+the `allow_capture` section of the corpus holds. Each default row holds too, with one exception: a default
+`must_deny` row that `allow_capture.must_allow` lists must pass. With `--no-allow-capture`, only the two
+default lists hold. A seed binary that does not have the flag exits 2 on it, so a capture run refuses that seed.
 
 ## Hook gate
 
@@ -163,7 +172,8 @@ corpus through the candidate binary in both hint modes. Any wrong verdict fails 
 `hook gate` with score 0 and runs no cells. The failing commands go to reflection in the stage tail.
 A candidate that cannot allow `go test ./...` or deny `cat src/lib.rs` with the right hint text
 also fails at `hook gate`, through the harness probe. The corpus file itself stays outside the
-candidate allowlist (`src/`, `prompts/`).
+candidate allowlist (`src/`, `prompts/`). The gate uses the mode of the cells, as the preflight does.
+`just check` runs before the gate and holds each candidate to the corpus in both capture modes.
 
 ## Proposer repair
 

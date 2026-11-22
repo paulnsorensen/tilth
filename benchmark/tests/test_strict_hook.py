@@ -926,3 +926,39 @@ def test_a_strict_replace_arm_keeps_its_command_and_key_inputs(monkeypatch: pyte
     settings = template[template.index("--settings") + 1]
     assert list(json.loads(settings)) == ["hooks"]
     assert settings == json.dumps(json.loads(settings))
+
+
+# --- `--allow-capture`: one switch for the cell hook, the seed replay, the probe, and the Codex hook ---
+
+
+def test_the_capture_switch_reaches_every_hook_call(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    hook = str(fake_hook(tmp_path))
+    seen: list[list[str]] = []
+    real_run = subprocess.run
+    monkeypatch.setattr(run.subprocess, "run", lambda cmd, **kwargs: seen.append(cmd) or real_run(cmd, **kwargs))
+
+    assert run._hook_replay(hook, "cat src/a.go") is True
+    run.probe_hook(hook, "native")
+    without = len(seen)
+    run.set_hook_capture(True)
+    assert run._hook_replay(hook, "cat src/a.go") is True
+    run.probe_hook(hook, "tilth")
+    run._hook_replay(hook, "go test ./...", hint="tilth", host="codex")
+    run.run_hook(hook, "native", "go test ./...", capture=False)
+
+    assert not any(run.HOOK_CAPTURE_FLAG in cmd for cmd in seen[:without])
+    assert all(cmd[-1] == run.HOOK_CAPTURE_FLAG for cmd in seen[without:-1])
+    assert seen[-2] == [hook, "hook", "--host", "codex", "--hint", "tilth", "--allow-capture"]
+    assert seen[-1] == [hook, "hook", "--hint", "native"]
+    assert "hook --host codex --hint tilth --allow-capture" in run._codex_hook_config("/bin/tilth")
+
+
+def test_the_run_cli_flag_turns_the_capture_switch_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[bool] = []
+    monkeypatch.setattr(run, "set_hook_capture", seen.append)
+
+    for argv in (["--allow-capture", "--reps", "0"], ["--reps", "0"]):
+        with pytest.raises(SystemExit):
+            run.main(argv)
+
+    assert seen == [True, False]

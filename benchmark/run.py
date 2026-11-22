@@ -856,10 +856,35 @@ class HookLoosenedError(RuntimeError):
     """A strict cell ran a Bash call that the hook at ``hook_sha`` denies."""
 
 
+# `tilth hook --allow-capture` lets a command write its own output to a file (`go test ./... > out.txt`).
+# One switch covers the process, because the cell hook, the seed replay, and the probes must agree: a replay
+# with other options than the cell hook reports a false `hook_loosened`. The flag is in the argv of every
+# hooked cell, so it is part of the run key.
+HOOK_CAPTURE_FLAG = "--allow-capture"
+_hook_capture = False
+
+
+def set_hook_capture(allow: bool) -> None:
+    """Run every hook call of this process (cell hook, seed replay, probe) with or without ``--allow-capture``."""
+    global _hook_capture
+    _hook_capture = bool(allow)
+
+
+def hook_capture() -> bool:
+    """Whether the hook calls of this process use ``--allow-capture``."""
+    return _hook_capture
+
+
+def _hook_options(capture: bool | None = None) -> list[str]:
+    """The extra ``tilth hook`` options; ``capture`` overrides the process switch."""
+    return [HOOK_CAPTURE_FLAG] if (_hook_capture if capture is None else capture) else []
+
+
 def _strict_bash_settings(hook_binary: str, hint: str) -> str:
     # Exec form (no shell) and onFailure=block: a missing or crashing hook binary denies the call.
     return json.dumps({"hooks": {"PreToolUse": [{"matcher": "Bash", "hooks": [{
-        "type": "command", "command": hook_binary, "args": ["hook", "--hint", hint], "onFailure": "block",
+        "type": "command", "command": hook_binary, "args": ["hook", "--hint", hint, *_hook_options()],
+        "onFailure": "block",
     }]}]}})
 
 
@@ -903,16 +928,20 @@ def _hook_source_key(hook_sha: str, repo: Path | None = None) -> str:
 
 
 def _run_hook(binary: str, hint: str, command: str, timeout: float = 30,
-              host: str | None = None) -> subprocess.CompletedProcess:
-    """Send one Bash pre-tool event to ``binary hook [--host <host>] --hint <hint>``."""
+              host: str | None = None, capture: bool | None = None) -> subprocess.CompletedProcess:
+    """Send one Bash pre-tool event to ``binary hook [--host <host>] --hint <hint> [--allow-capture]``.
+
+    ``capture`` overrides the process switch (``set_hook_capture``) for this call.
+    """
     event = json.dumps({"tool_name": "Bash", "tool_input": {"command": command}})
     host_args = ["--host", host] if host else []
-    return subprocess.run([binary, "hook", *host_args, "--hint", hint], input=event, capture_output=True,
-                          text=True, timeout=timeout)
+    return subprocess.run([binary, "hook", *host_args, "--hint", hint, *_hook_options(capture)], input=event,
+                          capture_output=True, text=True, timeout=timeout)
 
 
-def run_hook(binary: str, hint: str, command: str, *, timeout: float = 30) -> subprocess.CompletedProcess:
-    return _run_hook(binary, hint, command, timeout)
+def run_hook(binary: str, hint: str, command: str, *, timeout: float = 30,
+             capture: bool | None = None) -> subprocess.CompletedProcess:
+    return _run_hook(binary, hint, command, timeout, capture=capture)
 
 
 def probe_hook(binary: str, hint: str) -> None:
@@ -1614,7 +1643,8 @@ def _codex_catalog_file() -> Path:
 
 def _codex_hook_config(tilth_bin: object) -> str:
     """The inline ``hooks.PreToolUse`` value that runs the tilth shell guard on every Bash call."""
-    command = json.dumps(f"{shlex.quote(str(tilth_bin))} hook --host codex --hint tilth")
+    words = [shlex.quote(str(tilth_bin)), "hook", "--host", "codex", "--hint", "tilth", *_hook_options()]
+    command = json.dumps(" ".join(words))
     return (
         'hooks.PreToolUse=[{matcher = "^Bash$", hooks = [{type = "command", '
         f"command = {command}, timeout = {_CODEX_HOOK_TIMEOUT_S}}}]}}]"
@@ -3292,6 +3322,11 @@ Examples:
     )
     parser.set_defaults(strict_file_tools=None)
     parser.add_argument(
+        "--allow-capture", action="store_true",
+        help="Run every Bash hook with `tilth hook --allow-capture`, so a command can write its own output to a "
+             "file (an evolve run does this by default); every hooked cell key then changes",
+    )
+    parser.add_argument(
         "--reps",
         type=int,
         default=DEFAULT_REPS,
@@ -3411,6 +3446,7 @@ Examples:
     )
 
     args = parser.parse_args(argv)
+    set_hook_capture(args.allow_capture)
     if args.reps < 1:
         parser.error("--reps must be at least 1")
     if args.max_cells is not None and args.max_cells < 1:
