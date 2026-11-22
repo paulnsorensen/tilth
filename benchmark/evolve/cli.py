@@ -2,7 +2,7 @@
 """Evolve tilth: a GEPA search over instruction texts and ``src/**`` patches, scored by cost per correct.
 
     python3 benchmark/evolve/cli.py --panel benchmark/panels/gepa-v1.json --seed-sha SHA \\
-        --max-usd 200 --max-metric-calls 60 [--base-branch main] [--model haiku] [--replay-diagnostic N] \\
+        --max-usd 200 --max-metric-calls 60 [--base-branch main] [--model sonnet] [--replay-diagnostic N] \\
         [--preamble]
 
 Every candidate is a local commit on the seed; the winner, when it is not the
@@ -118,8 +118,9 @@ def _parser() -> argparse.ArgumentParser:
                              "branch when there is no remote-tracking ref (default: main)")
     # Candidates run under the strict Bash hook, which only the claude runner wires in evolve; a Codex
     # tilth-only arm enforces its restriction through the catalog and the pinned hook, not through this path.
-    claude_models = sorted(name for name in run.MODELS if run.RUNNERS[name] == "claude")
-    parser.add_argument("--model", default="haiku", choices=claude_models, help="agent model for every cell")
+    # The benchmark log compares runs, so every evolve run uses a Sonnet model.
+    parser.add_argument("--model", default="sonnet", choices=benchlog.sonnet_models(),
+                        help="Sonnet agent model for every cell (default sonnet)")
     parser.add_argument("--reruns", type=int, default=3, help="re-runs R before a candidate is accepted (default 3)")
     parser.add_argument("--cell-retries", type=int, default=2, metavar="N",
                         help="re-run a cell that did not complete (crash, infra, timeout) up to N more times per "

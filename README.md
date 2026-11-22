@@ -225,7 +225,10 @@ Source: [.hallouminate/wiki/benchmark-gepa-v3-evolve.md](.hallouminate/wiki/benc
 
 The chart shows the evolve runs over time. Each run scores tilth candidates against the built-in-tools baseline.
 A score of 1.0 is cost-per-correct parity with the baseline. A score above 1.0 is cheaper per correct answer.
-Scores from different task panels do not compare, so a divider separates the panels and no line joins them.
+Every evolve run uses a Sonnet agent model. Each band of the chart names its task panel and the resolved model.
+Scores from different panels or models do not compare, so a divider separates the bands and no line joins them.
+A table under the chart gives the real numbers per band: the dev-split pass rate and cost per correct answer of
+the baseline (built-in tools, no tilth), the tilth seed, and the tilth winner.
 Each evolve run adds one entry to [benchmark/log/evolve.jsonl](benchmark/log/evolve.jsonl) and redraws the chart.
 The evolve loop is a GEPA search over tilth commits, which change prompt texts and `src/**`. See [benchmark/evolve/README.md](benchmark/evolve/README.md#benchmark-log).
 

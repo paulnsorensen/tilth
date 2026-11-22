@@ -2,20 +2,24 @@
 
 The top panel shows, per run, the seed and winner dev means on the score scale, where 1.0 is cost-per-correct
 parity with the built-in-tools baseline. A ring marks a run that opened a draft PR. Scores from different task
-panels do not compare, so a divider separates them and no line joins them. The bottom panel shows the paired test
-delta (winner minus seed) with its 95% CI. The same entries give the same bytes.
+panels or agent models do not compare, so a divider separates each band of one panel and one model, and no line
+joins two bands. The middle panel shows the paired test delta (winner minus seed) with its 95% CI. A table under
+them gives, per band, the dev-split pass rate and cost per correct answer of the baseline (no tilth), the tilth
+seed, and the tilth winner. The same entries give the same bytes.
 """
 
 import math
 from datetime import datetime, timezone
 from xml.sax.saxutils import escape, quoteattr
 
-WIDTH, HEIGHT = 800, 440
+WIDTH = 800
 LEFT, RIGHT = 56, 88
 SCORE_TOP, SCORE_BOTTOM = 72, 262
 DELTA_TOP, DELTA_BOTTOM = 306, 380
 TICK_LABEL_Y = 398
-NOTE_Y = 426
+TABLE_TOP = 428
+TABLE_ROW = 32
+TABLE_COLUMNS = (284, 450, 616)
 FONT = "system-ui, -apple-system, 'Segoe UI', sans-serif"
 
 # The reference data-viz palette: categorical slots 1 and 2, the status "good" green, and the chart chrome.
@@ -28,7 +32,12 @@ THEMES = {
 TITLE = "tilth evolve runs: score against the built-in-tools baseline"
 NOTE = "Score = pass rate × baseline cost ÷ candidate cost per task, dev-split mean. Above 1.0 is cheaper per correct."
 PANEL_UNKNOWN = "panel not recorded"
+MODEL_UNKNOWN = "model not recorded"
+ARM_UNKNOWN = "not recorded"
 PANEL_NAME_ROWS = 3
+# The table columns: the arm key in an entry's ``arms.dev``, its heading, and its theme color.
+ARM_COLUMNS = (("baseline", "baseline (no tilth)", "ink"), ("seed", "tilth seed", "seed"),
+               ("best", "tilth winner", "winner"))
 
 
 def _n(value: float) -> str:
@@ -100,22 +109,36 @@ def _scale(low: float, high: float, top: float, bottom: float):
     return to_y
 
 
-def _series(points: list[tuple[float, float | None]], panels: list[str | None], to_y, color: str, surface: str,
-            name: str, run_ids: list[str]) -> list[str]:
-    """A 2px line through consecutive known points of one panel, and one dot per point.
+def band_label(entry: dict) -> str:
+    """The band name of a run: its panel and agent model, the resolved model id when the entry has one."""
+    return f"{entry.get('panel') or PANEL_UNKNOWN} · {entry.get('model_id') or entry.get('model') or MODEL_UNKNOWN}"
 
-    The line breaks at a run without a value and at a panel change.
+
+def arm_text(arm: dict | None) -> str:
+    """An arm's pass rate and cost per correct answer, as the table shows them."""
+    if not arm:
+        return ARM_UNKNOWN
+    cost = arm.get("cost_per_correct_usd")
+    per_correct = f"${cost:.2f}/correct" if cost is not None else "no correct cell"
+    return f"{arm['pass_rate']:.0%} pass · {per_correct}"
+
+
+def _series(points: list[tuple[float, float | None]], bands: list[str], to_y, color: str, surface: str,
+            name: str, run_ids: list[str]) -> list[str]:
+    """A 2px line through consecutive known points of one band, and one dot per point.
+
+    The line breaks at a run without a value and at a band change.
     """
     parts, segment, current = [], [], None
-    for (x, value), panel in zip([*points, (0.0, None)], [*panels, None]):
-        if segment and (value is None or panel != current):
+    for (x, value), band in zip([*points, (0.0, None)], [*bands, None]):
+        if segment and (value is None or band != current):
             if len(segment) > 1:
                 parts.append(f'<polyline fill="none" stroke="{color}" stroke-width="2" stroke-linejoin="round" '
                              f'points="{" ".join(f"{_n(px)},{_n(py)}" for px, py in segment)}"/>')
             segment = []
         if value is not None:
             segment.append((x, to_y(value)))
-            current = panel
+            current = band
     for (x, value), run_id in zip(points, run_ids):
         if value is not None:
             parts.append(f'<circle cx="{_n(x)}" cy="{_n(to_y(value))}" r="4.5" fill="{color}" stroke="{surface}" '
@@ -124,31 +147,62 @@ def _series(points: list[tuple[float, float | None]], panels: list[str | None], 
     return parts
 
 
-def _panel_bands(xs: list[float], panels: list[str | None], theme: dict) -> list[str]:
-    """A dotted divider between runs of different panels, and each panel's name at the head of its band.
+def _band_starts(bands: list[str]) -> list[int]:
+    """The index of the first run of each band; a band is a run of entries with one panel and one model."""
+    return [index for index, band in enumerate(bands) if not index or band != bands[index - 1]]
+
+
+def _panel_bands(xs: list[float], bands: list[str], theme: dict) -> list[str]:
+    """A dotted divider between bands, and each band's panel and model at its head.
 
     A name that would touch the name before it moves down one row.
     """
     parts, edges = [], [-math.inf] * PANEL_NAME_ROWS
-    for start, panel in enumerate(panels):
-        if start and panel == panels[start - 1]:
-            continue
+    for start in _band_starts(bands):
         left = (xs[start - 1] + xs[start]) / 2 if start else float(LEFT)
         if start:
             parts.append(_line(left, SCORE_TOP, left, SCORE_BOTTOM, theme["muted"], dash="2 4"))
-        name = panel or PANEL_UNKNOWN
+        name = bands[start]
         row = next((row for row in range(PANEL_NAME_ROWS) if left + 6 >= edges[row] + 8), PANEL_NAME_ROWS - 1)
         parts.append(_text(left + 6, SCORE_TOP - 6 + 14 * row, name, theme["muted"], size=10))
         edges[row] = left + 6 + 6 * len(name)
     return parts
 
 
-def _frame(theme: dict, body: list[str]) -> str:
-    head = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{HEIGHT}" '
-            f'viewBox="0 0 {WIDTH} {HEIGHT}" role="img" font-family={quoteattr(FONT)}>')
+def _arm_table(entries: list[dict], bands: list[str], theme: dict) -> tuple[list[str], float]:
+    """One table row per band: the dev-split arms of the band's latest run that has a baseline arm.
+
+    Returns the parts and the y below the table.
+    """
+    parts = [_text(16, TABLE_TOP, "Dev split per band: pass rate · cost per correct answer (USD)", theme["secondary"]),
+             _line(16, TABLE_TOP + 8, WIDTH - 16, TABLE_TOP + 8, theme["axis"])]
+    y = TABLE_TOP + 26
+    parts.append(_text(16, y, "panel · agent model", theme["muted"], size=11))
+    for x, (_key, heading, color) in zip(TABLE_COLUMNS, ARM_COLUMNS):
+        parts.append(_text(x, y, heading, theme[color], size=11, weight="600"))
+    y -= TABLE_ROW - 22  # The first band row sits 22px under the headings.
+    starts = _band_starts(bands)
+    for start, end in zip(starts, [*starts[1:], len(bands)]):
+        y += TABLE_ROW
+        source = next((entry for entry in reversed(entries[start:end])
+                       if ((entry.get("arms") or {}).get("dev") or {}).get("baseline")), None)
+        parts.append(_text(16, y, bands[start], theme["ink"], weight="600"))
+        parts.append(_text(16, y + 14, f"run {source['run_id']}" if source else "no run recorded arms",
+                           theme["muted"], size=10))
+        dev = source["arms"]["dev"] if source else {}
+        for x, (key, _heading, _color) in zip(TABLE_COLUMNS, ARM_COLUMNS):
+            arm = dev.get(key)
+            parts.append(_text(x, y, arm_text(arm), theme["ink"] if arm else theme["muted"], size=11))
+    return parts, y + 38
+
+
+def _frame(theme: dict, body: list[str], height: float) -> str:
+    height = round(height)
+    head = (f'<svg xmlns="http://www.w3.org/2000/svg" width="{WIDTH}" height="{height}" '
+            f'viewBox="0 0 {WIDTH} {height}" role="img" font-family={quoteattr(FONT)}>')
     return "\n".join([
         head, f"<title>{escape(TITLE)}</title>",
-        f'<rect width="{WIDTH}" height="{HEIGHT}" rx="8" fill="{theme["surface"]}"/>',
+        f'<rect width="{WIDTH}" height="{height}" rx="8" fill="{theme["surface"]}"/>',
         _text(16, 26, TITLE, theme["ink"], size=15, weight="600"), *body, "</svg>",
     ]) + "\n"
 
@@ -202,19 +256,19 @@ def render(entries: list[dict], theme_name: str) -> str:
             _line(LEFT, SCORE_BOTTOM, WIDTH - RIGHT, SCORE_BOTTOM, theme["axis"]),
             _text(WIDTH / 2, (SCORE_TOP + SCORE_BOTTOM) / 2, "No evolve runs yet", theme["secondary"], size=16,
                   anchor="middle"),
-            _text(16, NOTE_Y, NOTE, theme["muted"], size=11),
-        ])
+            _text(16, TABLE_TOP, NOTE, theme["muted"], size=11),
+        ], TABLE_TOP + 18)
     entries = sorted(entries, key=lambda entry: (entry["recorded_at"], entry["run_id"]))
     times = [_when(entry) for entry in entries]
     xs = _x_positions(times)
     run_ids = [entry["run_id"] for entry in entries]
-    panels = [entry.get("panel") for entry in entries]
+    bands = [band_label(entry) for entry in entries]
     seed = [entry.get("seed_dev_mean") for entry in entries]
     best = [entry.get("best_dev_mean") for entry in entries]
     deltas = [entry.get("paired_test_delta") for entry in entries]
 
     scores = [value for value in (*seed, *best) if value is not None]
-    score_ticks = nice_ticks(min(0.0, *scores), max(1.2, *(value * 1.05 for value in scores)))
+    score_ticks = nice_ticks(min([0.0, *scores]), max([1.2, *(value * 1.05 for value in scores)]))
     to_score = _scale(score_ticks[0], score_ticks[-1], SCORE_TOP, SCORE_BOTTOM)
     spread = [value for delta in deltas if delta for value in (delta["low"], delta["high"], delta["point"])]
     reach = max([0.1, *(abs(value) * 1.1 for value in spread)])
@@ -225,9 +279,9 @@ def render(entries: list[dict], theme_name: str) -> str:
     body += _y_axis(score_ticks, to_score, theme)
     body += [_line(LEFT, to_score(1.0), WIDTH - RIGHT, to_score(1.0), theme["muted"], width=1.5, dash="4 4"),
              _text(LEFT + 6, to_score(1.0) - 6, "parity 1.0", theme["muted"], size=11)]
-    body += _panel_bands(xs, panels, theme)
-    body += _series(list(zip(xs, seed)), panels, to_score, theme["seed"], theme["surface"], "seed", run_ids)
-    body += _series(list(zip(xs, best)), panels, to_score, theme["winner"], theme["surface"], "winner", run_ids)
+    body += _panel_bands(xs, bands, theme)
+    body += _series(list(zip(xs, seed)), bands, to_score, theme["seed"], theme["surface"], "seed", run_ids)
+    body += _series(list(zip(xs, best)), bands, to_score, theme["winner"], theme["surface"], "winner", run_ids)
     for x, entry, seed_value, best_value in zip(xs, entries, seed, best):
         anchor = best_value if best_value is not None else seed_value
         if entry.get("outcome") == "pr_opened" and anchor is not None:
@@ -270,5 +324,7 @@ def render(entries: list[dict], theme_name: str) -> str:
         body.append(f"<g><title>{escape(tip)}</title>{tick}</g>")
     body += [_text(x, TICK_LABEL_Y, label, theme["muted"], size=11, anchor="middle")
              for x, label in _time_ticks(times, xs)]
-    body.append(_text(16, NOTE_Y, NOTE, theme["muted"], size=11))
-    return _frame(theme, body)
+    table, bottom = _arm_table(entries, bands, theme)
+    body += table
+    body.append(_text(16, bottom, NOTE, theme["muted"], size=11))
+    return _frame(theme, body, bottom + 18)

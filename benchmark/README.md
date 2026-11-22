@@ -270,7 +270,8 @@ When that remote-tracking ref does not exist, the run checks the local branch.
 `--cell-budget-usd` sets the Claude `--max-budget-usd` of every cell in the run: seed, candidate, baseline, and finish cells (default: `1.0`, the `run.py` default).
 The value must be a positive finite number; the run refuses any other value before a paid call.
 The per-cell budget is part of each cell's run key, so a run at one budget does not reuse rows bought at another budget, and it buys its baselines again.
-A stronger model, such as `sonnet`, costs more per token, so give it a larger budget than `haiku`: at `$1` many external cells stop with `error_max_budget_usd`.
+Evolve accepts only a Sonnet agent model: `--model` takes the Claude names in `run.MODELS` whose model is a Sonnet, and the default is `sonnet`. Any other model is a usage error (exit 2).
+Sonnet costs more per token than `haiku`, so give it a larger budget: at `$1` many external cells stop with `error_max_budget_usd`.
 `--cell-estimate-usd` defaults to `--cell-budget-usd`, so the finish reserve and a cell with no stored cost are estimated at the full per-cell budget.
 Evolve runs strict by default (`--no-strict-file-tools` opts out); see [evolve/README.md](evolve/README.md) for the seed-hook preflight and the hook gate.
 A panel row from `run.py --panel` has the same key only when that run passed `--bare` and the same `--max-budget-usd`, passed `--strict-file-tools` with its hook commit equal to the evolve `--seed-sha`, and did not pass `--reasoning-effort`.

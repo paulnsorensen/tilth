@@ -6,7 +6,7 @@
 
 ``entry_from_run_dir`` builds an entry from a run directory's ``log.txt`` and ``rows.jsonl``. A live run and
 ``import`` use it alike, so an imported entry equals the live one except ``recorded_at``. The builder reads only
-values the run logged; a value the run did not reach is ``null``.
+values the run logged or stored; a value the run did not reach is ``null``. The log holds Sonnet runs only.
 """
 
 import argparse
@@ -22,7 +22,7 @@ if not __package__:
 
 from evolve import chart  # noqa: E402
 
-SCHEMA = 1
+SCHEMA = 2
 # The committed log; the README embeds the two charts next to it.
 COMMITTED_LOG = Path(__file__).resolve().parent.parent / "log" / "evolve.jsonl"
 # The log a run appends to when --benchmark-log is absent; the test suite points it at a temp path.
@@ -30,6 +30,8 @@ DEFAULT_LOG = COMMITTED_LOG
 
 RUN_PREFIX = "run: "
 FRONTIER_PREFIX = "frontier: "
+ARMS_PREFIX = "arms: "
+ARM_NAMES = ("baseline", "seed", "best")
 _SEED = re.compile(r"^run seed: (\S+)$")
 _STOP = re.compile(r"^stop: (.+)$")
 _SEARCH_END = re.compile(r"^search: ended \((.+)\)$")
@@ -62,6 +64,18 @@ def frontier_line(seed_dev_mean: float | None, best_cid: str | None, best_dev_me
     """The run-log line that records the seed's dev mean and the best accepted non-seed candidate."""
     return FRONTIER_PREFIX + json.dumps({"best_cid": best_cid, "best_dev_mean": best_dev_mean,
                                          "seed_dev_mean": seed_dev_mean}, sort_keys=True)
+
+
+def arms_line(arms: dict) -> str:
+    """The run-log line that records the pass rate and costs of the baseline, seed, and best arms per split."""
+    return ARMS_PREFIX + json.dumps(arms, sort_keys=True)
+
+
+def sonnet_models() -> list[str]:
+    """The Claude-runner names in ``run.MODELS`` whose model is a Sonnet: the only evolve agent models."""
+    import run  # The harness loads only here, so ``redraw`` runs without it.
+
+    return sorted(name for name, model in run.MODELS.items() if run.RUNNERS[name] == "claude" and "sonnet" in model)
 
 
 def chart_paths(log: Path) -> tuple[Path, Path]:
@@ -125,6 +139,27 @@ def _frontier(lines: list[str]) -> dict:
             "seed_dev_mean": float(finalists.group(4))}
 
 
+def _stored_arms(lines: list[str], rows: list[dict]) -> dict:
+    """The arms of a log from before the ``arms:`` line: the baseline arm per split from the stored rows only.
+
+    The rows do not name the candidate of a tilth row, so the seed and best arms are None. A retried or reused cell
+    is in the rows more than once; its last row is the one the run used. The test arms exist only when finish
+    compared the finalists.
+    """
+    from evolve.loop import EvolveError, arm_stats  # The harness loads only here, so ``redraw`` runs without it.
+
+    def baseline(split: str) -> dict | None:
+        cells = {(row.get("task"), row.get("repetition")): row for row in rows
+                 if row.get("mode") == "baseline" and row.get("panel_split") == split}
+        try:
+            return arm_stats(cells.values())
+        except (EvolveError, KeyError, TypeError):
+            return None
+
+    test = dict.fromkeys(ARM_NAMES) | {"baseline": baseline("test")} if _last(lines, _MEANS) else None
+    return {"dev": dict.fromkeys(ARM_NAMES) | {"baseline": baseline("dev")}, "test": test}
+
+
 def entry_from_run_dir(run_dir: Path, *, recorded_at: datetime) -> dict:
     """One log entry from ``run_dir``'s ``log.txt`` and ``rows.jsonl``; ``FileNotFoundError`` without a ``log.txt``.
 
@@ -155,6 +190,7 @@ def entry_from_run_dir(run_dir: Path, *, recorded_at: datetime) -> dict:
         "tilth_version": _unique(rows, "tilth_version", "tilth_forced"),
         "panel": header.get("panel", _unique(rows, "panel_name")),
         "model": header.get("model", _unique(rows, "model_alias")),
+        "model_id": _unique(rows, "resolved_model"),
         "preamble": header.get("preamble"),
         "stop_reason": stop.group(1) if stop else None,
         "outcome": _outcome(lines),
@@ -167,6 +203,8 @@ def entry_from_run_dir(run_dir: Path, *, recorded_at: datetime) -> dict:
                                "high": float(paired.group(3)), "tasks": int(paired.group(4))}
                               if paired else None),
         "pass_rate_delta": float(passed.group(1)) if passed else None,
+        "arms": (_json_after(lines, ARMS_PREFIX) if any(line.startswith(ARMS_PREFIX) for line in lines)
+                 else _stored_arms(lines, rows)),
         "spend": _spend(lines),
         "pr_url": url.group(0) if url else None,
     }
@@ -211,10 +249,11 @@ def redraw(log: Path) -> tuple[Path, Path]:
 def import_runs(run_dirs: list[Path], log: Path) -> list[str]:
     """Append an entry for each run directory, oldest ``log.txt`` first; the imported run ids.
 
-    A directory without a ``log.txt``, one whose log does not parse, or a run id the log holds already is skipped
-    with one line on stderr. ``recorded_at`` is the ``log.txt`` modification time.
+    A directory without a ``log.txt``, one whose log does not parse, a run whose model is not a Sonnet, or a run id
+    the log holds already is skipped with one line on stderr. ``recorded_at`` is the ``log.txt`` modification time.
     """
     known = {entry.get("run_id") for entry in load(log)}
+    sonnet = sonnet_models()
     found = [Path(run_dir) for run_dir in run_dirs if (Path(run_dir) / "log.txt").is_file()]
     for run_dir in run_dirs:
         if Path(run_dir) not in found:
@@ -229,6 +268,10 @@ def import_runs(run_dirs: list[Path], log: Path) -> list[str]:
             entry = entry_from_run_dir(run_dir, recorded_at=modified)
         except (OSError, ValueError) as error:
             print(f"skip {run_dir}: {error}", file=sys.stderr)
+            continue
+        if entry["model"] not in sonnet:
+            print(f"skip {run_dir}: model {entry['model']} is not a Sonnet model ({', '.join(sonnet)})",
+                  file=sys.stderr)
             continue
         append(log, entry)
         known.add(run_dir.name)

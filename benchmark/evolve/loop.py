@@ -262,6 +262,20 @@ def task_stats(rows: Iterable[Mapping], task: str) -> tuple[float, float] | None
     return mean(correct(row) for row in mine), mean(row_cost(row) for row in mine)
 
 
+def arm_stats(rows: Iterable[Mapping]) -> dict | None:
+    """Pass rate, mean cost per cell, and cost per correct answer (USD) over one arm's rows; None without rows.
+
+    Cost per correct is the total cost over the correct count; it is None when no cell is correct.
+    """
+    rows = list(rows)
+    if not rows:
+        return None
+    passed = sum(correct(row) for row in rows)
+    total = sum(row_cost(row) for row in rows)
+    return {"pass_rate": round(passed / len(rows), 6), "mean_cost_usd": round(total / len(rows), 6),
+            "cost_per_correct_usd": round(total / passed, 6) if passed else None, "cells": len(rows)}
+
+
 def task_score(rows: Iterable[Mapping], task: str, base_cost: float) -> float:
     """``p * base / c``: pass rate times the frozen baseline mean cost over the candidate's mean row cost.
 
@@ -414,6 +428,9 @@ class Evolution:
         self.dev_baseline_rows: list[dict] | None = None
         self.base_cost: dict[str, float] = {}
         self.base_rows: dict[str, list[dict]] = {}
+        # The benchmark log's arm numbers: every baseline plan row, and the paired test rows when finish compared them.
+        self.baseline_plan_rows: list[dict] = []
+        self.test_arm_rows: dict[str, list[dict]] | None = None
         self.spend: dict[str, float] = {"cells": 0.0, "judge": 0.0}
         self.best: float | None = None
         self.unimproved = 0
@@ -715,6 +732,7 @@ class Evolution:
         tasks = (*self.panel.cheap, *self.panel.dev, *self.panel.test)
         try:
             rows = self._plan(self._cells(tasks, BASELINE_MODE, self._reps()), None)
+            self.baseline_plan_rows = rows
             self.base_cost = _baseline_costs(rows, tasks)
             self.base_rows = {task: [cost_summary(row) for row in rows
                                      if row["task"] == task and baselines.is_completed(row)] for task in tasks}
@@ -1236,6 +1254,7 @@ class Evolution:
         test_means = {cid: mean(correct(row) for row in rows) for cid, rows in test_rows.items()}
         scores = _means_line(finalists, test_rows)
         self.log(f"finish: test-split means {scores}")
+        self.test_arm_rows = {"baseline": baseline_rows, "seed": test_rows[seed.cid], "best": test_rows[winner.cid]}
         test_base = _baseline_costs(baseline_rows, kept)
         deltas = _paired_score_deltas(test_rows[winner.cid], test_rows[seed.cid], kept, test_base)
         if not deltas:
@@ -1317,8 +1336,20 @@ class Evolution:
             self._record_benchmark()
         return 1 if self.finish_failure else 0
 
+    def _arms(self, seed: Cascade | None, best: Cascade | None) -> dict:
+        """The benchmark log's arm numbers per split: the baseline, the seed, and the best accepted candidate.
+
+        The dev arms use the rows each scored; the test arms exist only when finish compared the finalists.
+        """
+        dev = {"baseline": arm_stats(row for row in self.baseline_plan_rows if row["task"] in self.panel.dev),
+               "seed": arm_stats(seed.rows) if seed is not None else None,
+               "best": arm_stats(best.rows) if best is not None else None}
+        test = ({name: arm_stats(rows) for name, rows in self.test_arm_rows.items()}
+                if self.test_arm_rows is not None else None)
+        return {"dev": dev, "test": test}
+
     def _record_benchmark(self) -> None:
-        """Log the frontier, then append this run's entry to the benchmark log and redraw its charts.
+        """Log the frontier and the arms, then append this run's entry to the benchmark log and redraw its charts.
 
         A failure writes one log line and changes nothing else: the exit code and the finish result stay.
         """
@@ -1331,6 +1362,8 @@ class Evolution:
             best = nonseed[0] if nonseed else None
             self.log(benchlog.frontier_line(seed_mean, best.cid[:12] if best else None,
                                             best.dev_mean if best else None))
+            step = "arms"
+            self.log(benchlog.arms_line(self._arms(seed, best)))
             path = self.settings.benchmark_log
             if path is None:
                 return

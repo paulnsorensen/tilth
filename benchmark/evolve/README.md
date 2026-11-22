@@ -328,19 +328,25 @@ A log or chart fault writes one `benchmark log: <step> failed (...)` line to `lo
 exit code or the finish result. `--benchmark-log PATH` writes to another log; the charts go next to it. The
 test suite points the default log at a temp path, so no test writes `benchmark/log/`.
 
+The log holds Sonnet runs only, so its runs compare. `cli.py --model` accepts only the Claude names in
+`run.MODELS` whose model is a Sonnet (`benchlog.sonnet_models`), and the default is `sonnet`. Any other model is a
+usage error (exit 2) that names the Sonnet choices. The helper model of reflection and the proposer does not
+change.
+
 `benchlog.entry_from_run_dir` builds the entry from the run's `log.txt` and `rows.jsonl`. A live run and an
-import use the same builder. The run logs two lines for it: `run: {...}` (panel, model, preamble) at the start
-of each session, and `frontier: {...}` (seed and best dev means) before the entry. An entry records only
-values the run logged or stored; a value the run did not reach is `null`.
+import use the same builder. The run logs three lines for it: `run: {...}` (panel, model, preamble) at the start
+of each session, and `frontier: {...}` (seed and best dev means) and `arms: {...}` (the arm numbers) before the
+entry. An entry records only values the run logged or stored; a value the run did not reach is `null`.
 
 | Field | Value |
 |---|---|
-| `schema` | `1` |
+| `schema` | `2` |
 | `run_id` | The run directory name (`--run-id`). |
 | `recorded_at` | UTC time of the append (`YYYY-MM-DDTHH:MM:SSZ`). An import uses the `log.txt` modification time. |
 | `seed_sha` | The `run seed:` line (`--seed-sha`). |
 | `tilth_version` | The one `tilth_version` of the run's `tilth_forced` rows; `null` when the rows hold none or several. |
 | `panel`, `model`, `preamble` | The `run:` line. Without it, `panel` is the one `panel_name` of the rows and `model` is their one `model_alias`. |
+| `model_id` | The one `resolved_model` of the rows, the model id that the alias resolved to; `null` when the rows hold none or several. |
 | `stop_reason` | The last `stop:` line, else the `search: ended (...)` reason. |
 | `outcome` | The last finish result: `pr_opened`, `no_improvement`, `incomplete`, `refused`, `failed`, or `pr_failed`. |
 | `seed_dev_mean` | The seed's dev-split mean score. |
@@ -348,15 +354,27 @@ values the run logged or stored; a value the run did not reach is `null`.
 | `test_means` | Test-split pass rate per finalist content id, when finish compared them. |
 | `paired_test_delta` | `{point, low, high, tasks}`: winner minus seed per-task score, with its 95% CI. |
 | `pass_rate_delta` | Winner minus seed test pass rate. |
+| `arms` | `{dev, test}`. Each split is `{baseline, seed, best}`, and each arm is `{pass_rate, mean_cost_usd, cost_per_correct_usd, cells}` or `null`. `test` is `null` unless finish compared the finalists. |
 | `spend` | `{cells, judge, reflection, proposer, total, max_usd}` in USD, from the `spend:` line. |
 | `pr_url` | The draft PR URL when finish opened one. |
 
+An arm is the baseline (built-in tools, no tilth), the seed, or `best`: the accepted non-seed candidate with the
+best dev mean, which is also the finish winner. `pass_rate` is the correct cells over all cells. `mean_cost_usd`
+is the mean row cost per cell. `cost_per_correct_usd` is the total cost over the correct count, and it is `null`
+when no cell is correct. Correctness and cost come from `loop.correct` and `loop.row_cost`, the helpers that the
+score uses. The dev arms use the rows that each arm scored: the baseline plan rows of the dev tasks, and the seed
+and best rows with their re-runs. The test arms use the paired rows that finish compared, after it drops an
+incomplete task.
+
 A score of 1.0 is cost-per-correct parity with the baseline (see [Score and finish rule](#score-and-finish-rule)).
 The chart shows the seed and winner dev means per run against a dashed parity line at 1.0. A green ring marks a
-run that opened a draft PR. Scores from different panels do not compare. A dotted divider separates the runs of
-each panel, each panel has its name above its runs, and no line joins runs of different panels. A lower panel
-shows the paired test delta with its 95% CI. The chart uses only the standard library, and the same log gives the
-same bytes.
+run that opened a draft PR. A band is a sequence of runs with one panel and one model (`model_id`, else
+`model`). Scores from different bands do not compare, and `sonnet` can resolve to a new model over time. A dotted
+divider separates the bands, each band has its panel and model above its runs, and no line joins two bands. A
+middle panel shows the paired test delta with its 95% CI. A table under the chart has one row per band. It shows
+the dev-split pass rate and cost per correct answer of `baseline (no tilth)`, `tilth seed`, and `tilth winner`.
+The numbers come from the latest run of the band with a baseline arm, and the row names that run. An arm without
+numbers shows `not recorded`. The chart uses only the standard library, and the same log gives the same bytes.
 
 A resumed run appends to the same `log.txt`; the builder reads only the last session, which starts at the last
 `run seed:` line. A `log.txt` without a `spend:` line gives no entry: that run was refused at preflight or did
@@ -367,6 +385,12 @@ python3 benchmark/evolve/benchlog.py redraw                       # redraw both 
 python3 benchmark/evolve/benchlog.py import RUN_DIR [RUN_DIR ...]  # append entries for past run directories
 ```
 
-An import goes oldest `log.txt` first and skips a run id that the log holds already. A log from before the `run:`
-and `frontier:` lines records `null` for preamble, and takes its panel from the rows. It takes its dev means from
-a `finish: finalists` line, else records `null`.
+An import goes oldest `log.txt` first. It skips a run id that the log holds already, and a run whose model is not
+a Sonnet. A log from before the `run:` and `frontier:` lines records `null` for preamble, and takes its panel
+from the rows. It takes its dev means from a `finish: finalists` line, else records `null`.
+
+A log from before the `arms:` line takes its baseline arms from the stored rows. For each split it uses the
+baseline rows with that `panel_split`, and the last row of each cell, because a retry or a store-only plan writes
+a cell again. It records the test arms only when the log has a `finish: test-split means` line. Its seed and
+best arms are `null`: a stored row does not name its candidate. The test baseline of such a run also includes a
+task that finish dropped.
