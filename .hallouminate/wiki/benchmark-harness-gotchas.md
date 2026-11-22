@@ -171,10 +171,13 @@ Claude Code then waits for the backgrounded task, and kills it only 10 minutes l
 A paid re-run of the six goal 7 `bat-2650` cells (PR #467) then passed 3/3 in both arms, in 20–31 s per cell.
 The grade keeps its own env and runs only the held-out tests, which pass with debug assertions on.
 The setting joins `harness_digest` only when it is not empty (`agent_env`), so only bat cells get new run keys.
+That includes every `sharkdp/bat` task, not only bat-2650 (gepa-v2 has six). A stored baseline row for a bat task now raises `BaselineDrift`, so a run that plans bat baseline cells needs `--refreeze-baselines`. The dry run does not show this.
+A chain task has no `upstream_repo`, so a chain key leaves the setting out while its turns get it. No chain has a bat turn today.
 
 Claude Code starts each Bash command in a new session, so `proc.kill()` on the runner does not stop what a tool call leaves behind.
 Four orphaned `bat` processes from goal 6 were still running 13 days later.
-`run._reap_workspace_processes` kills each process whose cwd or executable is under the cell workspace, after the runner exits and on timeout. It reads `/proc` and never sweeps a root outside the temp dir.
+The runner env carries `TILTH_BENCH_CELL=<random>` per cell. After the runner exits and on timeout, `run._reap_cell_processes` kills each process whose env holds that value, or whose executable is under the cell workspace (a built binary run with a cleared env).
+It does not match by cwd, so a developer shell that is `cd`'d into a live workspace survives. It reads `/proc` and kills through a pidfd, so a reused PID is never hit. The executable rule needs a workspace strictly under the temp dir.
 
 ## Related GEPA gotchas
 

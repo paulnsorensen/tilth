@@ -366,38 +366,60 @@ def _agent_env(task: object) -> dict[str, str]:
     return dict(_AGENT_ENV_BY_REPO.get(getattr(task, "upstream_repo", ""), {}))
 
 
-def _reap_workspace_processes(root: Path) -> int:
-    """Kill each process whose working directory or executable is under ``root``, and return the count.
+# The runner env carries this variable with a random value per cell; each child process inherits it.
+_CELL_MARKER = "TILTH_BENCH_CELL"
 
+
+def _reap_cell_processes(root: Path, marker: str) -> int:
+    """Kill each leftover process of one cell, and return the count.
+
+    A process belongs to the cell when its environment holds ``TILTH_BENCH_CELL=<marker>``, or when its
+    executable is under the cell workspace ``root`` (a binary the cell built, run with a cleared env).
     Claude Code starts each Bash command in a new session, so ``proc.kill()`` does not stop a process
     that a tool call leaves behind. Such a process can hold a pipe open and take CPU from later cells.
-    The sweep reads ``/proc``. It does nothing when ``/proc`` is absent or ``root`` is not strictly
-    under the temp dir.
+    The sweep reads ``/proc`` and kills through a pidfd, so a reused PID is never hit. It does nothing
+    without ``/proc``, and it ignores ``root`` unless ``root`` is strictly under the temp dir.
     """
     procfs = Path("/proc")
-    root, temp = root.resolve(), Path(tempfile.gettempdir()).resolve()
-    if not procfs.is_dir() or root == temp or not root.is_relative_to(temp):
+    if not procfs.is_dir() or not hasattr(os, "pidfd_open"):
         return 0
+    root, temp = root.resolve(), Path(tempfile.gettempdir()).resolve()
+    workspace = root if root != temp and root.is_relative_to(temp) else None
+    tag = f"{_CELL_MARKER}={marker}".encode()
     killed = 0
     for entry in procfs.iterdir():
         if not entry.name.isdigit() or int(entry.name) == os.getpid():
             continue
-        paths = []
-        for link in ("cwd", "exe"):
-            try:
-                paths.append(Path(os.readlink(entry / link)))
-            except OSError:
-                continue
-        if not any(path.is_relative_to(root) for path in paths):
-            continue
         try:
-            os.kill(int(entry.name), signal.SIGKILL)
+            pidfd = os.pidfd_open(int(entry.name))
         except OSError:
             continue
-        killed += 1
+        try:
+            if _in_cell(entry, workspace, tag):
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                killed += 1
+        except OSError:
+            pass
+        finally:
+            os.close(pidfd)
     if killed:
-        print(f"    killed {killed} leftover process(es) under {root}", file=sys.stderr)
+        print(f"    killed {killed} leftover process(es) of the cell in {root}", file=sys.stderr)
     return killed
+
+
+def _in_cell(entry: Path, workspace: Path | None, tag: bytes) -> bool:
+    """Whether ``/proc/<pid>`` holds the cell marker in its env, or runs an executable from ``workspace``."""
+    try:
+        if tag in (entry / "environ").read_bytes().split(b"\0"):
+            return True
+    except OSError:
+        pass
+    if workspace is None:
+        return False
+    try:
+        return Path(os.readlink(entry / "exe")).is_relative_to(workspace)
+    except OSError:
+        return False
 
 
 def _host_runner_argv(cmd: list[str], env: Mapping[str, str], agent_venv: Path | None) -> list[str]:
@@ -2021,6 +2043,8 @@ def _run_single_cell(
         agent_venv=agent_venv,
     )
     env.update(_agent_env(task))
+    cell_marker = os.urandom(16).hex()
+    env[_CELL_MARKER] = cell_marker
     if runner == "codex":
         home_stack.enter_context(isolated_codex_home(env, "tilth-bench-codex-"))
     if runner == "claude":
@@ -2060,7 +2084,7 @@ def _run_single_cell(
             nonlocal timed_out
             timed_out = True
             proc.kill()
-            _reap_workspace_processes(repo_path)
+            _reap_cell_processes(repo_path, cell_marker)
 
         stderr_thread = threading.Thread(target=_drain_stderr)
         stderr_thread.start()
@@ -2089,7 +2113,7 @@ def _run_single_cell(
             timer.cancel()
             proc.stdout.close()
             stderr_pipe.close()
-            _reap_workspace_processes(repo_path)
+            _reap_cell_processes(repo_path, cell_marker)
 
         stderr_text = "".join(stderr_chunks)
         if auth_error is not None:
@@ -2125,7 +2149,7 @@ def _run_single_cell(
                     seen.decode(errors="replace") if isinstance(seen, bytes) else seen or "", hook_binary, partial=True)
             raise
         finally:
-            _reap_workspace_processes(repo_path)
+            _reap_cell_processes(repo_path, cell_marker)
         if runner == "claude":
             auth.check_captured(result.stdout)
     elapsed_ms = int((time.time() - start_time) * 1000)
