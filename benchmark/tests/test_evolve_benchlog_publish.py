@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import run
 from evolve import benchlog, chart, engine, logpr
+from evolve.loop import Evolution, arm_stats
 from evolve_support import child, git, log_text, main, make_world, mcp, scripted_engine, seed_candidate, seed_files
 
 # The real client, taken at import: the autouse conftest fixture replaces the module name with an offline one.
@@ -211,3 +212,57 @@ def test_the_chart_draws_the_last_entry_of_a_run_id(tmp_path: Path) -> None:
     assert len(benchlog.load(log)) == 2
     assert light.read_text() == chart.render([second], "light")
     assert light.read_text().count("resumed: seed dev mean") == 1
+
+
+def test_an_interrupted_run_keeps_its_entry_and_opens_no_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """An interrupt ends the run with no finish result; such an entry must not reach the public log."""
+    world = winning_world(monkeypatch, tmp_path)
+    origin, _base = with_origin(world)
+    gh = GhRecorder()
+
+    def interrupted(self):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(Evolution, "search", interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        main(world, log_client=client_for(world, gh))
+
+    entry = json.loads((run.RESULTS_DIR / "evolve" / "run1" / benchlog.ENTRY_FILE).read_text())
+    assert entry["outcome"] is None
+    assert gh.calls == []
+    assert git("ls-remote", "--heads", str(origin), "benchmark-log/*", cwd=world.repo) == ""
+    assert temp_worktrees(world) == []
+    [line] = [line for line in log_text(world).splitlines() if line.startswith("benchmark log: ")]
+    assert line.startswith("benchmark log: not published (") and "benchlog.py publish" in line
+
+
+def test_an_interrupted_run_appends_nothing_to_a_local_log(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    world = winning_world(monkeypatch, tmp_path)
+    log = tmp_path / "local" / "evolve.jsonl"
+
+    def interrupted(self):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(Evolution, "search", interrupted)
+
+    with pytest.raises(KeyboardInterrupt):
+        main(world, "--benchmark-log", str(log))
+
+    assert not log.exists()
+
+
+def test_publish_names_a_run_directory_without_an_entry(tmp_path: Path,
+                                                        capsys: pytest.CaptureFixture[str]) -> None:
+    assert benchlog.main(["publish", str(tmp_path)], client=object(), repo=tmp_path) == 1
+    assert f"has no readable {benchlog.ENTRY_FILE}" in capsys.readouterr().err
+
+
+def test_arm_numbers_count_completed_cells_only() -> None:
+    passed = {"task": "a", "correct": True, "contaminated": False, "total_cost_usd": 1.0}
+    failed = {"task": "a", "correct": False, "contaminated": False, "total_cost_usd": 3.0}
+    timed_out = {"task": "a", "correct": False, "contaminated": False, "total_cost_usd": 5.0, "timed_out": True}
+
+    assert arm_stats([passed, failed, timed_out]) == {"pass_rate": 0.5, "mean_cost_usd": 2.0,
+                                                     "cost_per_correct_usd": 4.0, "cells": 2}
+    assert arm_stats([timed_out]) is None

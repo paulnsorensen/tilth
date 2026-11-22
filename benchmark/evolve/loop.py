@@ -263,11 +263,13 @@ def task_stats(rows: Iterable[Mapping], task: str) -> tuple[float, float] | None
 
 
 def arm_stats(rows: Iterable[Mapping]) -> dict | None:
-    """Pass rate, mean cost per cell, and cost per correct answer (USD) over one arm's rows; None without rows.
+    """Pass rate, mean cost per cell, and cost per correct answer (USD) over one arm's completed rows.
 
-    Cost per correct is the total cost over the correct count; it is None when no cell is correct.
+    A row that did not complete (infra failure, timeout, or an error that is not a budget cap) is no verdict on
+    the arm, so it does not count; None when no row completed. Cost per correct is the total cost over the correct
+    count; it is None when no cell is correct.
     """
-    rows = list(rows)
+    rows = [row for row in rows if baselines.is_completed(row)]
     if not rows:
         return None
     passed = sum(correct(row) for row in rows)
@@ -1418,11 +1420,18 @@ class Evolution:
         With ``--benchmark-log PATH`` the entry goes to PATH and the charts next to it. Without it, the run opens its
         own PR that adds the entry to the committed log of the base branch (``logpr.publish``). A failure writes one
         log line and changes nothing else: the exit code, the finish result, and the entry file stay.
+
+        A run that an interrupt or an uncaught error ended has no finish result. Its entry goes to the run directory
+        only: the run appends nothing and opens no PR.
         """
         step = "entry"
         try:
             entry = self.benchmark_entry(datetime.now(timezone.utc))
             benchlog.write_entry(self.run_dir, entry)
+            if entry["outcome"] is None:
+                self.log("benchmark log: not published (the run has no finish result); to publish it, run "
+                         f"python3 benchmark/evolve/benchlog.py publish {self.run_dir}")
+                return
             path = self.settings.benchmark_log
             if path is not None:
                 step = "append"

@@ -124,7 +124,12 @@ def main(argv: list[str] | None = None, *, client=None, repo: Path | None = None
 def _publish(args: argparse.Namespace, client, repo: Path) -> int:
     from evolve import logpr  # git and gh load only here, so ``redraw`` stays a standard-library script.
 
-    entry = json.loads((args.run_dir / ENTRY_FILE).read_text())
+    try:
+        entry = json.loads((args.run_dir / ENTRY_FILE).read_text())
+    except (OSError, ValueError) as error:
+        print(f"error: benchmark log: {args.run_dir} has no readable {ENTRY_FILE} ({type(error).__name__}: {error})",
+              file=sys.stderr)
+        return 1
     try:
         url = logpr.publish(args.run_dir, entry, repo=repo, base=args.base_branch,
                             client=client or logpr.GitHubLogClient(repo), replace=args.replace)

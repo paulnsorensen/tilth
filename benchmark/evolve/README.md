@@ -323,6 +323,9 @@ no improvement, ends incomplete, or fails in finish. `Evolution.benchmark_entry`
 own state: its settings, panel, seed and frontier cascades, spend totals, arms, and the result record that finish
 fills. The run writes the entry to `<run_dir>/benchmark-entry.json`. A value the run did not reach is `null`.
 
+An interrupt or an uncaught error ends a run with no finish result (`outcome` is `null`). That run writes its
+entry file, appends nothing, and opens no PR. Its log line names the `publish` command for a manual publish.
+
 By default, the run then opens its own PR for the log:
 
 1. It fetches `origin/<base-branch>` and adds a temporary detached worktree at that commit, outside the repository.
@@ -386,12 +389,13 @@ change.
 The test means, the paired delta, and the pass-rate delta keep three decimals, as the `finish:` lines show them.
 
 An arm is the baseline (built-in tools, no tilth), the seed, or `best`: the accepted non-seed candidate with the
-best dev mean, which is also the finish winner. `pass_rate` is the correct cells over all cells. `mean_cost_usd`
-is the mean row cost per cell. `cost_per_correct_usd` is the total cost over the correct count, and it is `null`
-when no cell is correct. Correctness and cost come from `loop.correct` and `loop.row_cost`, the helpers that the
-score uses. The dev arms use the rows that each arm scored: the baseline plan rows of the dev tasks, and the seed
-and best rows with their re-runs. The test arms use the paired rows that finish compared, after it drops an
-incomplete task.
+best dev mean, which is also the finish winner. An arm counts only completed cells: a cell with an infra failure,
+a timeout, or an error that is not a budget cap is no verdict on the arm. `cells` is that count, and `pass_rate`
+is the correct cells over it. `mean_cost_usd` is the mean row cost per cell. `cost_per_correct_usd` is the total
+cost over the correct count, and it is `null` when no cell is correct. Correctness and cost come from
+`loop.correct` and `loop.row_cost`, the helpers that the score uses. The dev arms use the rows that each arm
+scored: the baseline plan rows of the dev tasks, and the seed and best rows with their re-runs. The test arms use
+the paired rows that finish compared, after it drops an incomplete task.
 
 A score of 1.0 is cost-per-correct parity with the baseline (see [Score and finish rule](#score-and-finish-rule)).
 The chart shows the seed and winner dev means per run against a dashed parity line at 1.0. A green ring marks a
