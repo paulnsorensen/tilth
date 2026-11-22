@@ -167,7 +167,8 @@ The `bat` process that the test started stays alive and holds the pty master and
 So `cargo test 2>&1 | tail` (or `| grep`) never sees end of file and never ends. A backgrounded run that writes to a file ends, because no reader waits on a pipe.
 Claude Code then waits for the backgrounded task, and kills it only 10 minutes later, so the cell passes the 1800 s limit.
 
-`run._AGENT_ENV_BY_REPO` sets `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` in the agent shell for `sharkdp/bat` only, which skips the check: the full piped suite then passes.
+`run._AGENT_ENV_BY_REPO` sets `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` in the agent shell for `sharkdp/bat` only, which skips the check: the full piped suite then passes in 15 s.
+A paid re-run of the six goal 7 `bat-2650` cells (PR #467) then passed 3/3 in both arms, in 20–31 s per cell.
 The grade keeps its own env and runs only the held-out tests, which pass with debug assertions on.
 The setting joins `harness_digest` only when it is not empty (`agent_env`), so only bat cells get new run keys.
 
