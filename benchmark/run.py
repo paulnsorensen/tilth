@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import sysconfig
@@ -348,6 +349,55 @@ def _agent_venv(task: object, workdir: Path) -> Path | None:
     """The workdir's venv when the task prepared one; never the separate grading venv."""
     venv = workdir / ".venv"
     return venv if (venv / "bin").is_dir() else None
+
+
+# Extra agent-shell settings for one upstream repo. build_runner_env sets only per-language settings.
+# sharkdp/bat: the pty test `no_args_doesnt_break` closes one file descriptor two times. From Rust 1.80,
+# a debug build aborts there, and the `bat` process that the test started stays alive. That process
+# holds the output pipe of a piped `cargo test` open, so the command never ends. With debug assertions
+# off, the check does not run. The grade keeps its own env and runs only the held-out tests.
+_AGENT_ENV_BY_REPO: dict[str, dict[str, str]] = {
+    "sharkdp/bat": {"CARGO_PROFILE_DEV_DEBUG_ASSERTIONS": "false"},
+}
+
+
+def _agent_env(task: object) -> dict[str, str]:
+    """The extra agent-shell settings for the task's upstream repo, or an empty dict."""
+    return dict(_AGENT_ENV_BY_REPO.get(getattr(task, "upstream_repo", ""), {}))
+
+
+def _reap_workspace_processes(root: Path) -> int:
+    """Kill each process whose working directory or executable is under ``root``, and return the count.
+
+    Claude Code starts each Bash command in a new session, so ``proc.kill()`` does not stop a process
+    that a tool call leaves behind. Such a process can hold a pipe open and take CPU from later cells.
+    The sweep reads ``/proc``. It does nothing when ``/proc`` is absent or ``root`` is not strictly
+    under the temp dir.
+    """
+    procfs = Path("/proc")
+    root, temp = root.resolve(), Path(tempfile.gettempdir()).resolve()
+    if not procfs.is_dir() or root == temp or not root.is_relative_to(temp):
+        return 0
+    killed = 0
+    for entry in procfs.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        paths = []
+        for link in ("cwd", "exe"):
+            try:
+                paths.append(Path(os.readlink(entry / link)))
+            except OSError:
+                continue
+        if not any(path.is_relative_to(root) for path in paths):
+            continue
+        try:
+            os.kill(int(entry.name), signal.SIGKILL)
+        except OSError:
+            continue
+        killed += 1
+    if killed:
+        print(f"    killed {killed} leftover process(es) under {root}", file=sys.stderr)
+    return killed
 
 
 def _host_runner_argv(cmd: list[str], env: Mapping[str, str], agent_venv: Path | None) -> list[str]:
@@ -1285,6 +1335,7 @@ def cell_identity(
             ),
             hook_source_key=hook_source_key,
             home_isolation=_CODEX_HOME_ISOLATION if runner == "codex" else None,
+            agent_env=_agent_env(task),
         ),
         "task_digest": _cell_task_digest(task),
         "env_fingerprint": env_fingerprint(task),
@@ -1969,6 +2020,7 @@ def _run_single_cell(
         language=task.language,
         agent_venv=agent_venv,
     )
+    env.update(_agent_env(task))
     if runner == "codex":
         home_stack.enter_context(isolated_codex_home(env, "tilth-bench-codex-"))
     if runner == "claude":
@@ -2008,6 +2060,7 @@ def _run_single_cell(
             nonlocal timed_out
             timed_out = True
             proc.kill()
+            _reap_workspace_processes(repo_path)
 
         stderr_thread = threading.Thread(target=_drain_stderr)
         stderr_thread.start()
@@ -2036,6 +2089,7 @@ def _run_single_cell(
             timer.cancel()
             proc.stdout.close()
             stderr_pipe.close()
+            _reap_workspace_processes(repo_path)
 
         stderr_text = "".join(stderr_chunks)
         if auth_error is not None:
@@ -2070,6 +2124,8 @@ def _run_single_cell(
                 _audit_codex_commands(
                     seen.decode(errors="replace") if isinstance(seen, bytes) else seen or "", hook_binary, partial=True)
             raise
+        finally:
+            _reap_workspace_processes(repo_path)
         if runner == "claude":
             auth.check_captured(result.stdout)
     elapsed_ms = int((time.time() - start_time) * 1000)

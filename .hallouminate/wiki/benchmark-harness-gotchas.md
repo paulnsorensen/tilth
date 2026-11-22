@@ -157,6 +157,24 @@ A shell variable does not reach grading, because `toolchain_env` keeps only `_KE
 So `toolchain_env` sets the variable itself, and `build_runner_env` (`benchmark/run.py`) sets it for rust tasks.
 The agent's `cargo test` then sees the same layout as the grade.
 Editing `proc.py` changes `package_digest`, so every external instance is admitted again on the next run.
+
+## Rust 1.80+ IO-safety abort hangs bat's piped `cargo test`
+
+`sharkdp__bat-2650` timed out in 7 of 12 goal 6 and goal 7 cells (both arms), although every agent made the correct one-line fix in its first minute.
+bat's pty test `no_args_doesnt_break` closes one file descriptor two times.
+From Rust 1.80, a debug build aborts there (`fatal runtime error: IO Safety violation: owned file descriptor already closed`).
+The `bat` process that the test started stays alive and holds the pty master and the test's stderr pipe.
+So `cargo test 2>&1 | tail` (or `| grep`) never sees end of file and never ends. A backgrounded run that writes to a file ends, because no reader waits on a pipe.
+Claude Code then waits for the backgrounded task, and kills it only 10 minutes later, so the cell passes the 1800 s limit.
+
+`run._AGENT_ENV_BY_REPO` sets `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` in the agent shell for `sharkdp/bat` only, which skips the check: the full piped suite then passes.
+The grade keeps its own env and runs only the held-out tests, which pass with debug assertions on.
+The setting joins `harness_digest` only when it is not empty (`agent_env`), so only bat cells get new run keys.
+
+Claude Code starts each Bash command in a new session, so `proc.kill()` on the runner does not stop what a tool call leaves behind.
+Four orphaned `bat` processes from goal 6 were still running 13 days later.
+`run._reap_workspace_processes` kills each process whose cwd or executable is under the cell workspace, after the runner exits and on timeout. It reads `/proc` and never sweeps a root outside the temp dir.
+
 ## Related GEPA gotchas
 
 The October 2026 GEPA overhaul gotchas moved to [Benchmark GEPA overhaul gotchas](benchmark-gepa-gotchas.md). That page covers the bare flag, quota events, gepa 0.1.4, and external-task data.
