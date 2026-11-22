@@ -35,6 +35,7 @@ These differences are permanent. A sync from upstream keeps the fork side.
 | Server mode | The MCP server always registers `tilth_write`. It has no read-only mode. `--edit` is accepted and ignored. | Read-only and edit modes. |
 | Removed commands | No `tilth diff`, `tilth overview`, or `tilth --map`. Use `git diff`, `git log`, `ls`, and `find`. | Present. |
 | Removed tools | No `tilth_grok` MCP tool and no `tilth grok` command. | Present. |
+| Version | The version is always `0.0.0-experimental`. `tilth --version` prints `tilth 0.0.0-experimental+<commit>`, so the commit identifies the build. The fork has no tagged releases. | Semantic versions with tagged releases. |
 
 ## Install
 
