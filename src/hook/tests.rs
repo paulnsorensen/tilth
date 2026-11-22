@@ -1361,3 +1361,220 @@ fn hint_rewording_leaves_every_corpus_decision_and_rule_unchanged() {
         assert!(!denies(&command), "denied but must allow: {command:?}");
     }
 }
+
+// Tool runners, debuggers, and programs that read commands from stdin.
+
+#[test]
+fn runners_unwrap_to_the_command_they_run() {
+    assert_rules(&[
+        ("mise exec -- cat src/lib.rs", "cat"),
+        ("mise x -- cat f", "cat"),
+        ("mise exec node@20 -- cat f", "cat"),
+        ("mise -C /tmp exec -- cat f", "cat"),
+        ("mise exec -c 'cat f'", "cat"),
+        ("mise exec --command='cat f'", "cat"),
+        ("mise exec -- sh", "shell stdin"),
+        ("uv run cat f", "cat"),
+        ("uv run --python 3.12 cat f", "cat"),
+        ("uv run --with=x -- head f", "head"),
+        ("uv --directory d run grep x f", "grep"),
+        ("uv run python", "python"),
+        ("uv run -m json.tool f", "python -m json.tool"),
+        ("uv run --module=base64 f", "python -m"),
+        ("uv run -", "python"),
+        ("uvx --from x cat f", "cat"),
+        ("npx cat f", "cat"),
+        ("npx -p x cat f", "cat"),
+        ("npx -c 'cat f'", "cat"),
+        ("npm exec -- cat f", "cat"),
+        ("poetry run cat f", "cat"),
+        ("poetry -C d run python -c 1", "python"),
+        ("bundle exec cat f", "cat"),
+        ("pnpm exec cat f", "cat"),
+        ("pnpm dlx -c 'cat f'", "cat"),
+        ("pnpm --filter x exec head f", "head"),
+        ("yarn exec cat f", "cat"),
+        ("yarn dlx -p x cat f", "cat"),
+        ("bunx cat f", "cat"),
+        ("bun x cat f", "cat"),
+        ("direnv exec . cat f", "cat"),
+        ("nix develop -c cat f", "cat"),
+        ("nix develop .#x --command bash -c 'cat f'", "cat"),
+        ("nix develop", "shell stdin"),
+        ("nix shell nixpkgs#jq", "shell stdin"),
+        ("nix-shell --run 'cat f'", "cat"),
+        ("nix-shell -p jq --command 'cat f'", "cat"),
+        ("nix-shell", "shell stdin"),
+        ("asdf exec cat f", "cat"),
+        ("pixi run -e dev cat f", "cat"),
+        ("conda run -n env cat f", "cat"),
+        ("micromamba run -n env cat f", "cat"),
+        ("timeout 5 mise exec -- env cat f", "cat"),
+        ("mise exec -- uv run cat f", "cat"),
+        ("echo f | xargs uv run cat", "cat"),
+    ]);
+    assert_all_allow(&[
+        "mise exec -- cargo test",
+        "mise exec go@1.24.7 -- python3 script.py",
+        "mise install",
+        "uv run pytest -q",
+        "uv run --frozen pytest",
+        "uv run pytest -q -p no:cacheprovider tests",
+        "uv run --with pytest-xdist pytest -n 4",
+        "uv run -m pytest",
+        "uv run script.py",
+        "uv sync",
+        "npx jest",
+        "npx jest --ci",
+        "npm test",
+        "npm exec -- tsc",
+        "bundle exec rspec",
+        "bundle install",
+        "poetry run pytest",
+        "pnpm exec vitest run",
+        "pnpm test",
+        "yarn test",
+        "yarn exec jest",
+        "bunx tsc",
+        "bun run build",
+        "bun test",
+        "direnv exec . go test ./...",
+        "nix develop -c cargo test",
+        "nix build",
+        "nix-shell --run 'cargo test'",
+        "asdf exec go test ./...",
+        "pixi run pytest",
+        "conda run -n env pytest",
+    ]);
+}
+
+#[test]
+fn debuggers_need_batch_and_plain_commands() {
+    assert_rules(&[
+        ("gdb -batch -ex \"shell cat src/main.rs\"", "cat"),
+        ("gdb -batch -ex '!cat f'", "cat"),
+        ("gdb --batch --ex='shell head f'", "head"),
+        ("gdb -batch -ex 'shell true' -ex 'shell cat f'", "cat"),
+        ("gdb -batch -eval-command 'she grep x f'", "grep"),
+        ("gdb -batch -ex shell", "shell stdin"),
+        (
+            "gdb -batch -ex 'python print(open(\"f\").read())'",
+            "debugger script",
+        ),
+        ("gdb -batch -ex 'py print(1)'", "debugger script"),
+        ("gdb -batch -ex pi", "debugger script"),
+        ("gdb -batch -ex 'pipe info frame | cat'", "debugger script"),
+        ("gdb -batch -ex '| bt | cat'", "debugger script"),
+        ("gdb -batch -iex 'guile (display 1)'", "debugger script"),
+        ("gdb -batch -x -", "stdin repl"),
+        ("gdb ./a.out", "stdin repl"),
+        ("gdb -p 1234", "stdin repl"),
+        ("gdb", "stdin repl"),
+        ("rust-gdb ./a.out", "stdin repl"),
+        ("lldb ./a.out", "stdin repl"),
+        ("lldb-18 ./a.out", "stdin repl"),
+        ("lldb -b -o 'platform shell cat f'", "cat"),
+        (
+            "lldb --batch --one-line='script print(1)'",
+            "debugger script",
+        ),
+        ("lldb -b -o script", "debugger script"),
+    ]);
+    assert_all_allow(&[
+        "gdb -batch -ex run --args ./a.out",
+        "gdb -batch -ex bt -ex 'info registers' ./a.out core",
+        "gdb -batch -ex 'shell make test'",
+        "gdb -batch -x cmds.gdb ./a.out",
+        "gdb --version",
+        "lldb -b -o run -- ./a.out",
+        "lldb --batch -o 'bt all' -p 1234",
+        "rust-gdb -batch -ex bt ./a.out",
+    ]);
+}
+
+#[test]
+fn stdin_repls_need_a_program() {
+    assert_rules(&[
+        ("irb", "stdin repl"),
+        ("irb -r json", "stdin repl"),
+        ("pry", "stdin repl"),
+        ("pry -e 'x = 1'", "stdin repl"),
+        ("lua", "stdin repl"),
+        ("lua -", "stdin repl"),
+        ("lua -i script.lua", "stdin repl"),
+        ("lua5.4 -l socket", "stdin repl"),
+        ("luajit", "stdin repl"),
+        ("sqlite3", "stdin repl"),
+        ("sqlite3 db.sqlite", "stdin repl"),
+        ("sqlite3 -cmd .tables db.sqlite", "stdin repl"),
+        ("sqlite3 -interactive db.sqlite 'select 1'", "stdin repl"),
+        ("echo 'select 1' | sqlite3 db.sqlite", "stdin repl"),
+        ("make -f -", "stdin repl"),
+        ("make -f-", "stdin repl"),
+        ("make --file=- all", "stdin repl"),
+        ("gmake --makefile - all", "stdin repl"),
+        ("R", "stdin repl"),
+        ("R --vanilla", "stdin repl"),
+        ("R -f -", "stdin repl"),
+        ("R script.R", "stdin repl"),
+        ("tclsh", "stdin repl"),
+        ("tclsh8.6 -encoding utf-8", "stdin repl"),
+        ("guile", "stdin repl"),
+        ("guile -l init.scm", "stdin repl"),
+        ("ghci", "stdin repl"),
+        ("ghci Main.hs", "stdin repl"),
+        ("jshell", "stdin repl"),
+        ("jshell script.jsh", "stdin repl"),
+        ("mise exec -- irb", "stdin repl"),
+    ]);
+    assert_all_allow(&[
+        "irb script.rb",
+        "irb --version",
+        "pry script.rb",
+        "lua script.lua",
+        "lua -- script.lua",
+        "lua script.lua -i",
+        "lua -e 'print(1)'",
+        "lua -v",
+        "luajit -b in.lua out.o",
+        "sqlite3 db.sqlite \"select 1\"",
+        "sqlite3 -line db.sqlite .tables",
+        "sqlite3 -version",
+        "make",
+        "make test",
+        "make -j4 build",
+        "make -f Makefile test",
+        "make --file=build.mk all",
+        "gmake -C dir test",
+        "R -f script.R",
+        "R --file=script.R",
+        "R -e 'testthat::test_dir(\"tests\")'",
+        "R CMD check pkg",
+        "R --version",
+        "tclsh script.tcl",
+        "guile script.scm",
+        "guile -s script.scm",
+        "guile -c '(display 1)'",
+        "ghci -e main Main.hs",
+        "jshell --version",
+    ]);
+}
+
+#[test]
+fn hint_stdin_repl_and_debugger_script_name_the_fix() {
+    for command in ["irb", "gdb -batch -ex 'python print(1)'"] {
+        let reason = tilth_reason_for(command);
+        assert!(names_tilth_tool(&reason), "{command:?}: {reason}");
+        assert!(reason.contains("-batch"), "{reason}");
+        match verdict(command, Hint::Native) {
+            Verdict::Deny { reason, .. } => {
+                assert!(!reason.to_lowercase().contains("tilth"), "{reason}");
+                assert!(reason.contains("-batch"), "{reason}");
+            }
+            Verdict::Allow => panic!("allowed: {command:?}"),
+        }
+    }
+    let repl = tilth_reason_for("irb");
+    assert!(repl.contains("reads its commands from stdin"), "{repl}");
+    assert!(repl.contains("run that file with Bash"), "{repl}");
+}

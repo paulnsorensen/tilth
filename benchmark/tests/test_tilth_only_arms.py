@@ -861,16 +861,21 @@ def test_run_plan_turns_a_probe_crash_into_an_invalid_cell_before_any_cell(
     assert events == []
 
 
-# --- the hook denies a bare shell, so write_stdin cannot start an unguarded one ---
+# --- the hook denies a bare shell or stdin REPL, so write_stdin cannot start an unguarded one ---
 
 
 @pytest.mark.skipif(not (config.REPO_ROOT / "target" / "debug" / "tilth").is_file(), reason="needs a debug tilth build")
-@pytest.mark.parametrize("command", ["bash", "sh", "python3", "/usr/bin/zsh -lc bash", "cat src/main.rs"])
+@pytest.mark.parametrize("command", [
+    "bash", "sh", "python3", "/usr/bin/zsh -lc bash", "cat src/main.rs",
+    "mise exec -- cat src/lib.rs", "mise exec -- sh", "irb", "make -f -",
+    'gdb -batch -ex "shell cat src/main.rs"',
+])
 def test_the_codex_hook_denies_bare_shells_and_file_reads(command: str) -> None:
     binary = str(config.REPO_ROOT / "target" / "debug" / "tilth")
 
     assert run._hook_replay(binary, command, hint="tilth", host="codex") is True
     assert run._hook_replay(binary, "/usr/bin/zsh -lc ls", hint="tilth", host="codex") is False
+    assert run._hook_replay(binary, "mise exec -- cargo test", hint="tilth", host="codex") is False
 
 
 # --- reporting: a missing experiment mode and an unknown legacy mode stay visible ---

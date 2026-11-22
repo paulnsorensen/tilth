@@ -50,10 +50,27 @@ The old strict guard, `benchmark/claude_bash_guard.py`, was a Go-only allowlist,
 - Install tests must run with a sandbox HOME. A test that unset HOME made `tilth install` fall back to the passwd home and write the real `~/.claude.json` and `~/.claude/settings.json`.
 - Wrapper commands (`env`, `sudo`, `timeout`, `xargs`, ...) leak through ordering variants (`--`, `VAR=value`, positionals) unless one loop consumes all of them; reviews found them one at a time.
 
+## Decision: tool runners and stdin REPLs (2026-11-22, user-approved guard change)
+
+A review of PR #459 found two gaps. `mise exec -- cat f` and `gdb -batch -ex "shell cat f"` passed. Codex `write_stdin` can type into a running process, so a program that reads its commands from stdin is an unguarded shell.
+
+- Tool runners unwrap to the command they run, and the normal rules check that command. `RUNNERS` in `src/hook/rules.rs` lists them: `mise exec|x`, `uv run`, `uvx`, `npx`, `npm exec|x`, `poetry run`, `bundle exec`, `pnpm exec|dlx`, `pnpx`, `yarn exec|dlx`, `bunx`, `bun x`, `direnv exec DIR`, `nix develop|shell -c`, `nix-shell --run|--command`, `asdf exec`, `pixi run`, `conda|mamba|micromamba run`.
+  - The command is the words after `--`, or the first operand after the subcommand. `mise exec` takes tool specs before `--`, so only the words after `--` are its command.
+  - A shell-string option (`mise exec -c`, `npx -c`, `nix-shell --run`) and pnpm shell mode reparse their text, like `bash -c`.
+  - `uv run -m MODULE` uses the `python -m` module rules, and `uv run -` denies as a stdin script.
+  - `nix develop`, `nix shell`, and `nix-shell` without a command start an interactive shell and deny as `shell stdin`.
+  - Unknown runner options count as flags. A false deny costs benchmark accuracy. The cost of this choice: the value of an unlisted valued option reads as the command.
+- gdb and lldb deny without `-batch` (rule `stdin repl`). An `-ex`/`-o` value that starts with `shell`, `!`, or `platform shell` reparses the shell part. A value that starts with `pipe`, `|`, `python`/`py`/`pi`, `guile`, or `script` denies (rule `debugger script`).
+- `REPLS` is one table of programs that read commands from stdin when no operand or option names a program: `irb`, `pry`, `lua`, `luajit`, `sqlite3` (needs DB and SQL), `make`/`gmake` with `-f -`, `R` without `-f`/`-e`/`CMD`, `tclsh`, `guile`, `ghci` without `-e`, `jshell`. They deny as `stdin repl`.
+- The rules only close the stdin vector. Inline code that does not read stdin (`lua -e`, `R -e`, `ghci -e`, `guile -c`) stays allowed, like `Rscript -e`.
+- Each new rule has a `must_deny` row in `benchmark/hook_corpus.json`, because `ac1_every_rule_entry_has_a_must_deny_row` requires one.
+
+Open gaps after this change: `python -i`, `node -i`, `perl -d`, `php -a`; `sqlite3` dot-commands (`.shell`, `.read`) and `readfile()`; `make --eval`; `docker run`; `cabal repl`, `stack ghci`, `ghc --interactive`; gdb `compile`/`call system()` in a live inferior.
+
 ## Deferred
 
 - vscode, copilot-cli, antigravity, gemini, qwen-code, and kiro install support waits until each host's docs and event shape are verified.
 - opencode, pi, and amp need plugin shims.
 - Retiring `scripts/tilth-bash-guard`.
 - The wozcode strict arm gets native-tool deny hints it cannot use.
-- Policy gaps outside the named rules: top-level `$c f`, `uv run`/`poetry run`/`npx`/`docker run` wrappers, `git blame`, `busybox`, `find -fprint`, `parallel` and other shell-string runners, `awk` programs that build file names or commands at run time, `sed` scripts read with `-f`.
+- Policy gaps outside the named rules: top-level `$c f`, `docker run` (tool runners closed 2026-11-22, see above), `git blame`, `busybox`, `find -fprint`, `parallel` and other shell-string runners, `awk` programs that build file names or commands at run time, `sed` scripts read with `-f`.

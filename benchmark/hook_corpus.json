@@ -164,7 +164,14 @@
     {"command": "git diff --no-index a b", "rule": "diff"},
     {"command": "jq --rawfile x f .", "rule": "jq"},
     {"command": "sed 'r f' g", "rule": "sed"},
-    {"command": "awk '{ print > \"out\" }' g", "rule": "awk"}
+    {"command": "awk '{ print > \"out\" }' g", "rule": "awk"},
+    {"command": "mise exec -- cat src/lib.rs", "rule": "cat"},
+    {"command": "uv run grep -n foo src/lib.rs", "rule": "grep"},
+    {"command": "mise exec -- sh", "rule": "shell stdin"},
+    {"command": "irb", "rule": "stdin repl"},
+    {"command": "make -f -", "rule": "stdin repl"},
+    {"command": "gdb -batch -ex \"shell cat src/main.rs\"", "rule": "cat"},
+    {"command": "gdb -batch -ex 'python print(open(\"src/lib.rs\").read())'", "rule": "debugger script"}
   ],
   "must_allow": [
     {"command": "go test ./..."},
@@ -236,6 +243,13 @@
     {"command": "cd src && go test ./..."},
     {"command": "FOO=1 cargo test"},
     {"command": "timeout 60 go test ./..."},
-    {"command": "env FOO=1 go test ./..."}
+    {"command": "env FOO=1 go test ./..."},
+    {"command": "mise exec -- cargo test"},
+    {"command": "uv run --frozen pytest -q"},
+    {"command": "bundle exec rspec"},
+    {"command": "gdb -batch -ex run --args ./a.out"},
+    {"command": "make -f Makefile test"},
+    {"command": "sqlite3 db.sqlite \"select 1\""},
+    {"command": "lua script.lua"}
   ]
 }

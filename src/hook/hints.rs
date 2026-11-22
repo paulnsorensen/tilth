@@ -29,6 +29,10 @@ pub(super) const PERL_I: Rule = "perl -i";
 pub(super) const AWK_INPLACE: Rule = "awk -i inplace";
 pub(super) const PYTHON_M: Rule = "python -m";
 pub(super) const GIT_CONFIG: Rule = "git -c";
+/// A REPL or debugger that reads its commands from stdin (`irb`, `make -f -`, `gdb`).
+pub(super) const STDIN_REPL: Rule = "stdin repl";
+/// A gdb or lldb command option that runs a pipe or a script interpreter.
+pub(super) const DEBUGGER_SCRIPT: Rule = "debugger script";
 
 /// Host-event rules. They never come from a command string, so the corpus does not cover them.
 pub(super) const MALFORMED_EVENT: Rule = "malformed event";
@@ -116,7 +120,14 @@ const WRITE_RULES: &[Rule] = &[
 const INTERPRETER_RULES: &[Rule] = &["python", "perl", "ruby", "node", "deno", "bun", "php"];
 
 #[cfg(test)]
-const OTHER_RULES: &[Rule] = &[PARSE_ERROR, UNRESOLVED, SHELL_STDIN, GIT_CONFIG];
+const OTHER_RULES: &[Rule] = &[
+    PARSE_ERROR,
+    UNRESOLVED,
+    SHELL_STDIN,
+    GIT_CONFIG,
+    STDIN_REPL,
+    DEBUGGER_SCRIPT,
+];
 
 /// Every rule name the command rules can cite.
 #[cfg(test)]
@@ -182,6 +193,19 @@ fn tilth_reason(rule: &str, kind: Kind) -> String {
              {SHELL_MAP}"
         ),
         Kind::Write => write_reason(rule, write),
+        Kind::Generic if rule == STDIN_REPL => format!(
+            "Blocked: this command starts a REPL or debugger that reads its commands from stdin, \
+             so the hook cannot see what it runs. Give it a program instead. \
+             Create a script with tilth_write in a unique scratch dir (`mktemp -d`), \
+             then run that file with Bash (`lua <file>`, `irb <file>`, `make -f <file>`). \
+             Pass SQL as an argument (`sqlite3 <db> \"<sql>\"`), and run gdb or lldb with -batch.\n\n\
+             {SHELL_MAP}"
+        ),
+        Kind::Generic if rule == DEBUGGER_SCRIPT => "Blocked: a gdb or lldb command option \
+             (`-ex`, `-o`) runs a pipe or a script interpreter, so the hook cannot see what it \
+             reads. Use plain debugger commands with -batch. Read files with tilth_read, search \
+             with tilth_search, and write with tilth_write."
+            .to_string(),
         Kind::Generic => format!(
             "Blocked: the hook cannot allow this command (`{rule}`). \
              Read files with tilth_read, search with tilth_search, and write with tilth_write."
@@ -235,6 +259,16 @@ fn native_reason(rule: &str, kind: Kind) -> String {
             "Blocked: shell `{rule}` writes files or runs inline code. \
              Use the Edit tool to change an existing file and the Write tool to create a new one."
         ),
+        Kind::Generic if rule == STDIN_REPL => "Blocked: this command starts a REPL or debugger \
+             that reads its commands from stdin, so the hook cannot see what it runs. Give it a \
+             script file or the program as an argument, and run gdb or lldb with -batch. \
+             Use the Read, Grep, Glob, Edit, and Write tools for file work."
+            .to_string(),
+        Kind::Generic if rule == DEBUGGER_SCRIPT => "Blocked: a gdb or lldb command option \
+             (`-ex`, `-o`) runs a pipe or a script interpreter, so the hook cannot see what it \
+             reads. Use plain debugger commands with -batch. \
+             Use the Read, Grep, Glob, Edit, and Write tools for file work."
+            .to_string(),
         Kind::Generic => format!(
             "Blocked: the hook cannot allow this command (`{rule}`). \
              Use the Read, Grep, Glob, Edit, and Write tools for file work."
