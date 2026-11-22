@@ -56,7 +56,10 @@ src/
   budget.rs            Token budget enforcement.
   types.rs             Shared types (QueryType, Lang, OutlineEntry, etc.).
   error.rs             Error types with exit codes.
-npm/                   npm wrapper — postinstall downloads binary, run.js proxies to it.
+build.rs               Sets TILTH_VERSION: the package version plus the short git commit, so `tilth --version` names the build.
+docs/                  User docs: cli.md (CLI flags), hosts.md (`tilth install` hosts and hooks), mcp.md (edit model and structural search).
+npm/                   Upstream's npm wrapper. The fork does not publish it; it stays for upstream syncs.
+npm-nightly/           The fork's published npm wrapper (@paulnsorensen/tilth-nightly): postinstall downloads the binary, run.js proxies to it.
 benchmark/             Evaluation harness (see Benchmarks section below).
 benchmark/log/         Committed append-only evolve run log (evolve.jsonl) and its light/dark SVG charts.
 prompts/               MCP server instruction source (mcp.md), tool descriptions (tools/*.md), and the launcher preamble (preamble.md). Embedded into the binary at compile time; mcp.md is regenerated into AGENTS.md.
@@ -90,7 +93,7 @@ CI runs `fmt --check`, `clippy -D warnings`, `cargo test`, the `tests/mcp_v2` an
 
 This is a **fork**. Some divergence from upstream is permanent and intentional; do not "fix" it toward upstream on a sync.
 
-**Fork version is `0.0.0-experimental`.** The fork has its own version identity. It never tracks upstream's number. `version` in `Cargo.toml` and `npm/package.json` is `0.0.0-experimental`. `build.rs` adds the short git commit, so `tilth --version` prints `tilth 0.0.0-experimental+<sha>`. Do not tag releases. `tests/mcp_v2/test_version_identity.py` fails when a sync brings back upstream's number.
+**Fork version is `0.0.0-experimental`.** The fork has its own version identity. It never tracks upstream's number. `version` in `Cargo.toml` and `npm/package.json` is `0.0.0-experimental`. `build.rs` adds the short git commit, so `tilth --version` prints `tilth 0.0.0-experimental+<sha>`. Do not tag releases. `tests/mcp_v2/test_version_identity.py` reads `Cargo.toml` and `npm/package.json` and fails when a sync brings back upstream's number in either file. It does not read the lockfiles.
 
 **Keep-ours fork features** (take the fork side on any sync conflict):
 

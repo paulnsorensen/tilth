@@ -51,8 +51,8 @@ visible instead of silent.
 instruction-cap shortening) — it served an 8,688-char instructions blob for
 weeks after #151 landed. It was mistaken for current HEAD behavior during an
 early measurement pass (the "24,917-char fork surface" reading). Root cause:
-version is pinned at `0.8.4` across the whole fork (see CLAUDE.md fork law),
-so `tilth --version` cannot distinguish a stale binary from current HEAD.
+the version was pinned at `0.8.4` across the whole fork, so
+`tilth --version` could not distinguish a stale binary from current HEAD.
 
 **Check byte sizes (or rebuild from source), not `--version`, when a fork
 binary's prompt surface is in question.** This applies to builds before

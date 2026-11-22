@@ -31,8 +31,8 @@ These differences are permanent. A sync from upstream keeps the fork side.
 | Area | This fork | Upstream |
 |---|---|---|
 | Edits | `tilth_write` takes a JSON `edits` array of `{path, tag, ops}` sections. A whole-file tag binds each edit to the content you saw. A changed file gets a 3-way merge, and the section fails only on a conflict. | A different `tilth_write` edit surface. |
-| Paths | Every path-taking MCP tool requires `cwd`. A relative path anchors under `cwd`, and `..` is refused. An absolute path is used as given. The server does not use the MCP roots handshake. | An optional `root` argument. |
-| Server mode | The MCP server always registers `tilth_write`. It has no read-only mode. `--edit` is accepted and ignored. | Read-only and edit modes. |
+| Paths | Every path-taking MCP tool requires `cwd`. A relative path anchors under `cwd`, and the server refuses `..`. The server uses an absolute path as given. The server does not use the MCP roots handshake. | An optional `root` argument. |
+| Server mode | The MCP server always registers `tilth_write`. It has no read-only mode. The server accepts `--edit` and ignores it. | Read-only and edit modes. |
 | Removed commands | No `tilth diff`, `tilth overview`, or `tilth --map`. Use `git diff`, `git log`, `ls`, and `find`. | Present. |
 | Removed tools | No `tilth_grok` MCP tool and no `tilth grok` command. | Present. |
 | Version | The version is always `0.0.0-experimental`. `tilth --version` prints `tilth 0.0.0-experimental+<commit>`, so the commit identifies the build. The fork has no tagged releases. | Semantic versions with tagged releases. |
@@ -66,11 +66,9 @@ The nightly workflow publishes `@paulnsorensen/tilth-nightly` from `main`. Its `
 npx --yes @paulnsorensen/tilth-nightly@latest --version
 ```
 
-> [!CAUTION]
-> When you run `tilth install <host>` from an npm install, the config entry it writes is `npx tilth --mcp`.
-> That command runs **upstream** tilth.
-> For MCP use, install from source.
-> Alternatively, change the entry to run `npx --yes @paulnsorensen/tilth-nightly@latest --mcp`.
+When you run `tilth install <host>` from this package, the config entry is `npx @paulnsorensen/tilth-nightly --mcp`. The `--hook` entry uses the same `npx` form.
+This entry has no version pin, so it can run a new nightly each time the host starts.
+For a fixed binary, build from source.
 
 ## MCP server
 
@@ -82,7 +80,7 @@ tilth install codex           # writes ~/.codex/config.toml
 ```
 
 `tilth install` supports 22 hosts. [docs/hosts.md](docs/hosts.md) lists each host and its config file.
-The entry runs `<path-to-tilth> --mcp`, a JSON-RPC server on stdio.
+The entry runs `<path-to-tilth> --mcp`, a JSON-RPC server on stdio. From an npm install, the entry runs `npx <package> --mcp`, where `<package>` is the npm package that holds the binary.
 
 The server has three tools. Each tool requires `cwd`, the absolute path of your checkout.
 
@@ -121,6 +119,8 @@ tilth codex exec "summarize src/auth.ts"             # runs: codex -c model_inst
 - The launcher does not register the MCP server. Run `tilth install claude-code` or `tilth install codex` first.
 - `claude` or `codex` must be the first argument. `tilth --json claude` is a usage error (exit 2).
 - All later arguments pass to the harness unchanged.
+- The launcher adds the preamble to every call, management subcommands such as `claude mcp` and `codex login` included.
+- On Windows, the launcher starts only a native `claude.exe` or `codex.exe`. It does not start an npm `.cmd` shim.
 - If you give `--system-prompt` or `--system-prompt-file` (claude), or a `model_instructions_file` override (codex), the launcher adds nothing. Arguments after `--` do not count.
 - On Unix, the launcher refuses a cache directory that is not a real directory, that another user owns, or that all users can write.
 - `tilth codex` exits 1 when the cache path is not valid UTF-8.
@@ -150,11 +150,17 @@ Seven hosts support `--hook`: `claude-code`, `codex`, `droid`, `crush`, `augment
 
 > [!IMPORTANT]
 > For `claude-code`, the entry sets `onFailure: "block"`.
-> If the binary moves or disappears, every Bash call is blocked until you reinstall or remove the entry.
+> If the binary moves or disappears, the hook blocks every Bash call until you reinstall or remove the entry.
 
 ### Bash guard hook
 
 [scripts/tilth-bash-guard](scripts/tilth-bash-guard) is an older Python guard for Claude Code. It sends `grep`, `rg`, and `cat` reads of project files to the tilth tools.
+The guard does not catch these forms:
+
+- A command inside a wrapper such as `bash -c '...'`.
+- A pipe filter such as `cargo test | grep foo`.
+- A path outside the project.
+
 Read the script before you install it. Run its self-test first:
 
 ```bash

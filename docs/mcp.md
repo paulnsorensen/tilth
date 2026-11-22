@@ -3,7 +3,7 @@
 This page describes the edit model and structural search of the fork's MCP server.
 The exact text that the server sends is in [prompts/](../prompts/). That text wins over this page.
 
-Every tool requires `cwd`, the absolute path of your checkout. A relative path anchors under `cwd`, and `..` is refused. An absolute path is used as given.
+Every tool requires `cwd`, the absolute path of your checkout. A relative path anchors under `cwd`, and the server refuses `..`. The server uses an absolute path as given.
 
 ## Edit model
 
@@ -82,14 +82,19 @@ Result from this repository:
 - Each match is `[start_line, end_line, start_byte, end_byte]`. A fifth element maps each capture name to its ranges.
 - Results hold ranges, not source text. Read the ranges before you use a `rewrite` op.
 - An invalid pattern or an unknown language fails. It does not fall back to a text search.
-- The scan keeps at most 1,000 matches. `total_matches` counts all matches.
+- The scan keeps at most 1,000 matches. `total_matches` counts all matches. When the scan stops at the limit, the result sets `match_limited: true`.
+- Line numbers are 1-based. A one-line match has the same start and end line.
+- Byte offsets are zero-based and half-open: the end byte is the byte after the match.
+- A lowercase `$name`, such as `$this` in PHP or `$home` in Bash, stays literal. An uppercase `$HOME` is a metavariable.
+- A bare C call parses as a declaration, so the pattern needs a `;`: `wrap($A);`.
+- The scan skips a file larger than 500,000 bytes. The result counts it in `skipped_files` and sets `completeness: "partial"`.
 
 ### When the result is larger than the budget
 
 The result takes the first view that fits, sets `completeness: "partial"` and `budget_limited: true`, and adds a `note`.
 
 1. One matched file: the first matches of that file that fit. `shown` gives their count.
-2. `view: "files"`: `[path, count]` pairs. This view is used only for 100 or fewer files.
+2. `view: "files"`: `[path, count]` pairs. The result uses this view only for 100 or fewer files.
 3. `view: "directories"`: per-directory counts, plus `top_files` with up to 10 files.
 4. `view: "none"`: totals only.
 

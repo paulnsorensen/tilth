@@ -37,9 +37,9 @@ The command keeps your other config entries. It adds or replaces one `tilth` ser
 | `pi` | `~/.pi/agent/mcp.json` |
 
 The entry runs the absolute path of the `tilth` binary that ran the install, with `--mcp`.
-When that binary is inside `node_modules`, the entry is `npx tilth --mcp` instead. That command runs upstream tilth. See [Install](../README.md#install).
+When that binary is inside `node_modules`, the entry is `npx <package> --mcp` instead, where `<package>` is the npm package that holds the binary. From the nightly package, the entry is `npx @paulnsorensen/tilth-nightly --mcp`. The `--hook` entry uses the same `npx` form. See [Install](../README.md#install).
 
-`--edit` is accepted for compatibility and does nothing. The server always serves `tilth_write`.
+The installer accepts `--edit` for compatibility and ignores it. The server always serves `tilth_write`.
 
 ## Shell guard hook
 
