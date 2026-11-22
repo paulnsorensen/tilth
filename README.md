@@ -253,16 +253,22 @@ tilth codex exec "summarize src/auth.ts"             # runs: codex -c model_inst
 
 ### Use the tilth preamble in another harness
 
-`tilth preamble` prints the tilth preamble. `tilth preamble --path` writes it to the cache file and prints the path of that file.
+`tilth preamble` prints the tilth preamble. `tilth preamble --path` writes it to the cache file and prints the path of that file. `--append <FILE>` adds your own text after the preamble, for a harness that takes one prompt file.
 
 ```bash
 tilth preamble >> AGENTS.md                               # add it to project instructions
 claude --append-system-prompt "$(tilth preamble)"         # add it after the built-in Claude Code prompt
 <harness> --system-prompt-file "$(tilth preamble --path)" # give the file to a harness that takes one
+<harness> --system-prompt-file "$(tilth preamble --path --append my-rules.md)" # one file: the preamble, then your text
 ```
 
 - The text is the same text that `tilth claude` and `tilth codex` use.
 - `--path` uses the same cache file and the same directory checks as the launcher.
+- `--append <FILE>` gives the preamble, one empty line, and the bytes of `<FILE>` unchanged. Line 1 is always `# tilth agent preamble`, so a caller can test the result.
+- With `--path`, the joined text has its own cache file, `preamble-<hash>.md`. The hash is of the joined text, so a changed `<FILE>` gives a new file name, and a running session keeps its file.
+- tilth uses a cache file again when its content is equal. A call that writes a new file removes `preamble-*.md` files that no call used for 30 days.
+- tilth reads `<FILE>` on each call and keeps no record of it. `tilth claude` and `tilth codex` do not use it. The option does not repeat.
+- Exit codes: 0 on success. 1 when tilth cannot read `<FILE>` or cannot write the cache file: stderr has a message, and stdout is empty. 2 on a usage error, which includes a tilth build without `--append`.
 - The preamble tells the agent to use the tilth tools, so register the tilth MCP server in that harness too (see [MCP server](#mcp-server)).
 
 ### Smaller models

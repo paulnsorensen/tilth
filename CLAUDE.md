@@ -165,7 +165,7 @@ Keep a registry-absence test (`tests/mcp_v2/test_retired_tools.py`) so a removed
 
 ## Launcher preamble
 
-`tilth claude` and `tilth codex` hand the harness a bundled system prompt. `tilth preamble` prints the same text, and `tilth preamble --path` prints its cache file, so other harnesses can use it. It lives in `prompts/preamble.md` and `src/launch.rs` embeds it with `include_str!`. `tests/launch_preamble.rs` guards its headings and bans personal-policy terms. `scripts/regen-agents-md.sh` does not read it, so `AGENTS.md` does not carry it.
+`tilth claude` and `tilth codex` hand the harness a bundled system prompt. `tilth preamble` prints the same text, and `tilth preamble --path` prints its cache file, so other harnesses can use it. `tilth preamble --append <FILE>` adds one empty line and the caller's file after the bundled text; `src/launch.rs` owns that join and its cache rules. The text lives in `prompts/preamble.md` and `src/launch.rs` embeds it with `include_str!`. `tests/launch_preamble.rs` guards its headings, bans personal-policy terms, and pins line 1 (`# tilth agent preamble`) and the single final newline, because callers and the join depend on them. `scripts/regen-agents-md.sh` does not read it, so `AGENTS.md` does not carry it.
 
 ## MCP instructions
 
