@@ -226,7 +226,32 @@ A host that fails open when the guard cannot run gets its documented fail-closed
 
 Codex does not run a new hook until you trust it: after the install, run `/hooks` in Codex and approve the tilth entry.
 
-To remove the guard, delete the tilth entry (the handler whose command ends in `hook --host <family>`) from the host's hook file listed above, then restart the host. `tilth install` has no uninstall step. With `claude-code`, `onFailure: "block"` means a moved or missing binary (after `cargo clean`, or an npx cache miss) blocks every Bash call until you reinstall or remove the entry.
+To remove the guard, delete the tilth entry (the handler whose command contains `hook --host <family>`) from the host's hook file listed above, then restart the host. `tilth install` has no uninstall step. With `claude-code`, `onFailure: "block"` means a moved or missing binary (after `cargo clean`, or an npx cache miss) blocks every Bash call until you reinstall or remove the entry.
+##### Output capture (`--allow-capture`)
+
+By default, the guard denies every shell command that writes a file, so `just check > check.log 2>&1` denies. Add `--allow-capture` to the `tilth hook` command to let a command capture its own output. Without the option, no verdict changes.
+
+| Command, with `--allow-capture` | Verdict |
+|---|---|
+| `cmd > log`, `cmd 2> err`, `cmd &> log`, `cmd >> log`, `cmd \| tee log` | allow |
+| `curl -o FILE URL`, `curl -O URL` | allow |
+| `tail -f FILE` | allow |
+| `cat /proc/cpuinfo`, `grep x /sys/...`, `cat /dev/null` | allow |
+| `cmd > /dev/stderr`, `echo x > /dev/stdout` | allow |
+| `echo x > f`, `printf x > f`, `cat <<EOF > f`, `printf x \| tee f`, `tee f <<EOF` | deny |
+| `echo x \| sort > f`, `sort <<EOF > f`, `echo x \| grep x \| tee f` | deny |
+| `> f`, `exec > f`, `$cmd > f` | deny |
+| `cat /proc/self/cwd/src/lib.rs`, `curl -o f file:///etc/passwd` | deny |
+
+- A redirect or `tee` passes only when a real command writes the content. `echo`, `printf`, and `cat` write the text of the caller, so they still deny. A filter (`sort`, `sed`, `grep`, `tr`, and the other readers) passes only with real input: a pipe from a real command, or a file that the guard allows.
+- The guard must know the name of the program. A redirect with no command, with `exec` alone, or with a name from a variable denies.
+- `/proc/<pid>/cwd`, `root`, `fd`, `exe`, and `map_files` link out of `/proc`, so a path through one of them denies. A path with `..` or a glob character denies too.
+- All other rules stay: `cat src/lib.rs`, `sed -i`, `python -c`, and `curl -D FILE` deny with or without the option.
+- The option is a routing rule, not a sandbox. A program that prints its arguments (`yes`, `seq`, a shell function) can write a file through a redirect, and `tail -n +1 -f FILE` prints a whole file.
+
+`tilth install <host> --hook` has no flag for the option. Add `--allow-capture` to the tilth entry by hand: to `args` for `claude-code`, or to the end of the `command` string for the other hosts. A later `tilth install <host> --hook` keeps it, as it keeps `--hint`.
+
+A `tilth` binary that does not have the option exits 2 on the unknown flag, so the guard then blocks every shell command. Run `tilth hook --help` to check for `--allow-capture` before you add it.
 
 Or call it from bash — see [AGENTS.md](./AGENTS.md) for the MCP agent prompt, or [skills/SKILL.md](./skills/SKILL.md) for a Claude Code skill prompt.
 

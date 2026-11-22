@@ -361,15 +361,40 @@ fn hook_invocation(target: &HookTarget, hint: Option<&str>) -> Result<HookInvoca
         &args,
     )?;
     if let Some(hint) = hint {
-        if let Some(args) = invocation.args.as_mut() {
-            args.extend(["--hint".to_string(), hint.to_string()]);
-        } else {
-            invocation.command.push_str(" --hint ");
-            invocation.command.push_str(hint);
-        }
+        push_words(&mut invocation, &["--hint", hint]);
     }
     Ok(invocation)
 }
+
+/// Append option words to a hook invocation in its own form: `args`, or the shell string.
+/// The words must need no shell quoting.
+fn push_words(invocation: &mut HookInvocation, words: &[&str]) {
+    for word in words {
+        if let Some(args) = invocation.args.as_mut() {
+            args.push((*word).to_string());
+        } else {
+            invocation.command.push(' ');
+            invocation.command.push_str(word);
+        }
+    }
+}
+
+/// Whether an existing tilth hook command anywhere in `config` has `--allow-capture`, so a
+/// reinstall keeps a user's choice.
+fn existing_allow_capture(config: &Value, own_prefix: &str) -> bool {
+    let own = handler_line(config).filter(|c| is_tilth_hook_command(c, own_prefix));
+    if own.is_some_and(|line| line.split_whitespace().any(|w| w == ALLOW_CAPTURE)) {
+        return true;
+    }
+    match config {
+        Value::Object(map) => map.values().any(|v| existing_allow_capture(v, own_prefix)),
+        Value::Array(items) => items.iter().any(|v| existing_allow_capture(v, own_prefix)),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
+    }
+}
+
+/// The `tilth hook` option that lets a command capture its own output.
+const ALLOW_CAPTURE: &str = "--allow-capture";
 
 /// The `--hint` value of an existing tilth hook command anywhere in `config`, so a
 /// reinstall keeps a user's choice. Only a value `tilth hook` accepts is carried over.
@@ -577,11 +602,11 @@ fn prepare_hook(host: &str, home: &Path) -> Result<(HookTarget, Value), String> 
     };
     let own_prefix = hook_invocation(&target, None)?.own_prefix;
     let hint = existing_hint(&config, &own_prefix);
-    upsert_hook(
-        &mut config,
-        &target,
-        &hook_invocation(&target, hint.as_deref())?,
-    )?;
+    let mut invocation = hook_invocation(&target, hint.as_deref())?;
+    if existing_allow_capture(&config, &own_prefix) {
+        push_words(&mut invocation, &[ALLOW_CAPTURE]);
+    }
+    upsert_hook(&mut config, &target, &invocation)?;
     Ok((target, config))
 }
 
@@ -2682,6 +2707,63 @@ mod tests {
         assert!(!lines[0].contains("/old/tilth"), "{lines:?}");
         assert!(lines[0].starts_with(&own), "{lines:?}");
         assert!(lines[0].ends_with("claude --hint native"), "{lines:?}");
+    }
+
+    #[test]
+    fn reinstall_keeps_allow_capture_in_both_command_forms() {
+        // Shell form in, exec form out: claude-code rewrites the entry with `args`.
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(
+            home.path(),
+            ".claude/settings.json",
+            &json!({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+                {"type":"command","command":"/old/tilth hook --host claude --allow-capture --hint native"}]}]}})
+            .to_string(),
+        );
+        for _ in 0..2 {
+            install_hook("claude-code", home.path()).unwrap();
+            let lines = all_commands(&read_json(&path));
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(
+                lines[0].ends_with("claude --hint native --allow-capture"),
+                "{lines:?}"
+            );
+        }
+
+        // Shell form stays shell form: codex.
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(
+            home.path(),
+            ".codex/hooks.json",
+            &json!({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+                {"type":"command","command":"/old/tilth hook --host claude --allow-capture"}]}]}})
+            .to_string(),
+        );
+        install_hook("codex", home.path()).unwrap();
+        let lines = all_commands(&read_json(&path));
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(lines[0].ends_with("claude --allow-capture"), "{lines:?}");
+    }
+
+    #[test]
+    fn install_adds_allow_capture_only_when_the_tilth_entry_has_it() {
+        // A fresh install is strict, and the option on another hook is not a choice for tilth.
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(
+            home.path(),
+            ".claude/settings.json",
+            &json!({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+                {"type":"command","command":"/opt/other-guard --allow-capture"}]}]}})
+            .to_string(),
+        );
+        install_hook("claude-code", home.path()).unwrap();
+        let lines = all_commands(&read_json(&path));
+        let tilth: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains(" hook --host "))
+            .collect();
+        assert_eq!(tilth.len(), 1, "{lines:?}");
+        assert!(!tilth[0].contains("--allow-capture"), "{lines:?}");
     }
 
     #[test]

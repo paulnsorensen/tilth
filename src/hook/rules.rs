@@ -5,6 +5,8 @@ use super::hints::{
     GIT_SHOW, INPUT_REDIRECT, JSON_TOOL, MAKE_EVAL, OUTPUT_REDIRECT, PERL_I, PYTHON_M, SED_I,
     SHELL_STDIN, SQLITE_IO, STDIN_REPL, UNRESOLVED,
 };
+use super::Capture;
+use std::cell::Cell;
 
 /// One word of a simple command, with quotes removed.
 #[derive(Clone)]
@@ -25,7 +27,53 @@ pub(super) struct Cmd<'a> {
     pub piped: bool,
     /// A heredoc or here-string feeds the command.
     pub here: bool,
+    /// Whether a command can write its own output to a file (`--allow-capture`).
+    pub capture: Capture,
+    /// Where the stdin of the command comes from.
+    pub feed: Feed,
+    /// The rules set this when the command writes authored content to stdout: the program is a
+    /// content generator, a filter with no real input, or a program the rules cannot name. It
+    /// is a cell because every reading of a wrapper or a tool runner reports through the same
+    /// command.
+    pub authored: &'a Cell<bool>,
 }
+
+impl Cmd<'_> {
+    /// `--allow-capture` is on.
+    fn captures(&self) -> bool {
+        match self.capture {
+            Capture::Allow => true,
+            Capture::Deny => false,
+        }
+    }
+
+    /// A real command writes the stdin of this command, and no heredoc replaces it.
+    fn real_stdin(&self) -> bool {
+        match self.feed {
+            Feed::Real => !self.here,
+            Feed::Unknown | Feed::Authored => false,
+        }
+    }
+}
+
+/// The source of the stdin of a command, for the capture rules.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Feed {
+    /// No pipeline stage feeds the command, or the rules cannot tell.
+    #[default]
+    Unknown,
+    /// The output of a real command.
+    Real,
+    /// Authored content: a content generator, or a heredoc on the pipeline.
+    Authored,
+}
+
+/// Commands that write text the caller supplies, not output of their own. With
+/// `--allow-capture`, a redirect or a `tee` after one of them still denies.
+const GENERATORS: &[&str] = &["echo", "printf", "cat"];
+
+/// Path segments under `/proc` that link to files outside it (`/proc/self/cwd/src/lib.rs`).
+const PROC_LINKS: &[&str] = &["cwd", "root", "fd", "exe", "map_files"];
 
 pub(super) enum Outcome {
     Allow,
@@ -58,17 +106,59 @@ fn normalize_path(text: &str) -> String {
     format!("/{}", parts.join("/"))
 }
 
+/// A stream device path after normalization: a standard stream, the terminal, or an open
+/// descriptor.
+fn is_stream(text: &str) -> bool {
+    let s = normalize_path(text);
+    matches!(
+        s.as_str(),
+        "/dev/stdin" | "/dev/stdout" | "/dev/stderr" | "/dev/tty"
+    ) || s.starts_with("/dev/fd/")
+        || s.starts_with("/proc/self/fd/")
+}
+
 /// Detects blocked device paths, including normalized paths and assignment values.
 pub(super) fn is_device(text: &str) -> bool {
-    let is = |s: &str| {
-        let s = normalize_path(s);
-        matches!(
-            s.as_str(),
-            "/dev/stdin" | "/dev/stdout" | "/dev/stderr" | "/dev/tty"
-        ) || s.starts_with("/dev/fd/")
-            || s.starts_with("/proc/self/fd/")
+    is_stream(text) || text.split_once('=').is_some_and(|(_, v)| is_stream(v))
+}
+
+/// The shell resolves `..` after it follows a link, so the text of such a path does not name
+/// the file. The capture rules trust only a path without `..`.
+fn has_parent_segment(text: &str) -> bool {
+    for segment in text.split('/') {
+        if segment == ".." {
+            return true;
+        }
+    }
+    false
+}
+
+/// A redirect target that is a stream device, not a file. With `--allow-capture`, output to it
+/// passes.
+pub(super) fn is_stream_target(text: &str, literal: bool) -> bool {
+    literal && !has_parent_segment(text) && is_stream(text)
+}
+
+/// A path with no file content that a file tool serves: `/dev/null`, or a literal path under
+/// `/proc` or `/sys`. With `--allow-capture`, a shell reader can read it. A glob can hide a
+/// link name, so a path with a glob character does not count.
+pub(super) fn is_pseudo_file(text: &str, literal: bool) -> bool {
+    if !literal || has_parent_segment(text) || text.contains(['*', '?', '[', ']', '{', '}']) {
+        return false;
+    }
+    let path = normalize_path(text);
+    if path == "/dev/null" || path.starts_with("/sys/") {
+        return true;
+    }
+    let Some(rest) = path.strip_prefix("/proc/") else {
+        return false;
     };
-    is(text) || text.split_once('=').is_some_and(|(_, v)| is(v))
+    for segment in rest.split('/') {
+        if PROC_LINKS.contains(&segment) {
+            return false;
+        }
+    }
+    !rest.is_empty()
 }
 
 /// Applies device, wrapper, and command rules to one simple command.
@@ -101,19 +191,21 @@ fn check_from(cmd: &Cmd, words: &[Arg], xargs: bool) -> Outcome {
     };
     let name = base(&first.text);
     let args = &words[1..];
+    if !first.literal || GENERATORS.contains(&name) {
+        cmd.authored.set(true);
+    }
     if name == "eval" {
         return reparse(args);
     }
     if let Some(spec) = READERS.iter().find(|r| r.name == name) {
-        return read(spec, args, xargs);
+        return read(spec, args, xargs, cmd);
     }
     if let Some(spec) = searcher(name) {
         return search(name, spec, args, cmd, xargs);
     }
     match name {
-        "tr" => tr(args, xargs),
-        "tee" => writer(args, xargs, "tee"),
-        "sponge" => writer(args, xargs, "sponge"),
+        "tr" | "sponge" => copier(cmd, name, args, xargs),
+        "tee" => tee(cmd, args, xargs),
         "patch" | "dd" | "truncate" | "ed" | "ex" => Outcome::Deny(static_name(name)),
         "vi" | "vim" | "nvim" | "view" | "vimdiff" => vim(args),
         "find" => find(args),
@@ -133,7 +225,7 @@ fn check_from(cmd: &Cmd, words: &[Arg], xargs: bool) -> Outcome {
         }
         "trap" => trap(args),
         "script" => script(args),
-        "curl" => curl(args),
+        "curl" => curl(args, cmd.capture),
         "tar" => tar(args),
         "source" | "." => source(args),
         _ => match interpreter_family(name) {
@@ -441,6 +533,9 @@ fn option_file_rule(name: &str, given: &[Arg], opts: &WrapOpts) -> Option<Rule> 
 /// feeds it operands. `Err` holds the final outcome: a runner runs shell source or Python
 /// itself, a runner has two readings and the rules checked both, or `nix run` runs a program
 /// that the rules checked.
+///
+/// A bare `exec` redirects the shell itself, so every later command writes the file. `xargs`
+/// with no command runs `echo`. Both mark the output of the command as authored.
 fn unwrap<'w>(
     cmd: &Cmd,
     mut words: &'w [Arg],
@@ -479,6 +574,9 @@ fn unwrap<'w>(
             },
         };
         words = rest.get(i..).unwrap_or(&[]);
+        if matches!(name, "exec" | "xargs") && words.is_empty() {
+            cmd.authored.set(true);
+        }
     }
     Ok((words, xargs))
 }
@@ -1391,6 +1489,9 @@ fn nix_program_run(
         assigns: cmd.assigns,
         piped: cmd.piped,
         here: cmd.here,
+        capture: cmd.capture,
+        feed: cmd.feed,
+        authored: cmd.authored,
     })
 }
 
@@ -1643,8 +1744,13 @@ const READERS: &[Reader] = &[
     },
 ];
 
-/// Denies file operands, `xargs` operands, and supported in-place reader modes.
-fn read(spec: &Reader, args: &[Arg], xargs: bool) -> Outcome {
+/// Denies file operands, `xargs` operands, and supported in-place reader modes. With
+/// `--allow-capture`, pseudo-file operands pass, and so does `tail -f`: it follows a live
+/// stream, which a file tool cannot do.
+///
+/// A reader is a filter. With no file operand and no real stdin, it writes only the text of
+/// the caller, so its output is authored.
+fn read(spec: &Reader, args: &[Arg], xargs: bool, cmd: &Cmd) -> Outcome {
     let name = spec.name;
     let p = split(args, spec.valued_short, spec.valued_long);
     if matches!(name, "sed" | "gsed") && p.has_any(&["-i", "--in-place"]) {
@@ -1690,17 +1796,28 @@ fn read(spec: &Reader, args: &[Arg], xargs: bool) -> Outcome {
     if io {
         return Outcome::Deny(spec.name);
     }
-    let files = operands.filter(|a| {
-        let t = a.text.as_str();
+    let mut inputs = 0;
+    let mut reads_file = false;
+    for operand in operands {
+        let t = operand.text.as_str();
         let skip_plus = matches!(name, "tail" | "less" | "more") && t.starts_with('+');
         let awk_var = name.ends_with("awk") && is_assignment(t);
-        t != "-" && !skip_plus && !awk_var
-    });
-    if files.count() > 0 || xargs {
-        Outcome::Deny(spec.name)
-    } else {
-        Outcome::Allow
+        if t == "-" || skip_plus || awk_var {
+            continue;
+        }
+        inputs += 1;
+        if !(cmd.captures() && is_pseudo_file(t, operand.literal)) {
+            reads_file = true;
+        }
     }
+    let follows = cmd.captures() && name == "tail" && p.has_any(&["-f", "-F", "--follow"]);
+    if xargs || (reads_file && !follows) {
+        return Outcome::Deny(spec.name);
+    }
+    if inputs == 0 && !cmd.real_stdin() {
+        cmd.authored.set(true);
+    }
+    Outcome::Allow
 }
 
 /// Values of the options in `want_short` and `want_long` (long names may be abbreviated to
@@ -2102,8 +2219,15 @@ fn search(name: &str, spec: &Searcher, args: &[Arg], cmd: &Cmd, xargs: bool) -> 
     }
     let pattern_given = p.has_any(&["-e", "-f", "--regexp", "--file"]);
     let skip = usize::from(!pattern_given);
-    if p.operands.iter().skip(skip).any(|a| a.text != "-") {
-        return Outcome::Deny(rule);
+    let mut reads_file = false;
+    for operand in p.operands.iter().skip(skip) {
+        if operand.text == "-" {
+            continue;
+        }
+        if !(cmd.captures() && is_pseudo_file(&operand.text, operand.literal)) {
+            return Outcome::Deny(rule);
+        }
+        reads_file = true;
     }
     let recursive_flag = spec
         .recursive
@@ -2111,6 +2235,9 @@ fn search(name: &str, spec: &Searcher, args: &[Arg], cmd: &Cmd, xargs: bool) -> 
     let stdin_fed = cmd.piped || cmd.here;
     if recursive_flag || xargs || (spec.recursive.is_none() && !stdin_fed) {
         return Outcome::Deny(rule);
+    }
+    if !reads_file && !cmd.real_stdin() {
+        cmd.authored.set(true);
     }
     Outcome::Allow
 }
@@ -2130,6 +2257,32 @@ fn writer(args: &[Arg], xargs: bool, rule: Rule) -> Outcome {
         Outcome::Deny(rule)
     } else {
         Outcome::Allow
+    }
+}
+
+/// `tee FILE` copies stdin to a file. With `--allow-capture`, it passes when a real command
+/// feeds it through a pipe. Any other `tee` copies authored content.
+fn tee(cmd: &Cmd, args: &[Arg], xargs: bool) -> Outcome {
+    let real_feed = cmd.real_stdin() && !xargs;
+    if !real_feed {
+        cmd.authored.set(true);
+    }
+    if cmd.captures() && real_feed {
+        Outcome::Allow
+    } else {
+        writer(args, xargs, "tee")
+    }
+}
+
+/// `tr` and `sponge` copy stdin. Without real input, they write only the text of the caller.
+fn copier(cmd: &Cmd, name: &str, args: &[Arg], xargs: bool) -> Outcome {
+    if !cmd.real_stdin() {
+        cmd.authored.set(true);
+    }
+    if name == "tr" {
+        tr(args, xargs)
+    } else {
+        writer(args, xargs, "sponge")
     }
 }
 
@@ -2186,8 +2339,13 @@ fn script(args: &[Arg]) -> Outcome {
     }
 }
 
-/// `curl` reads `file://` URLs and `@file` data, and writes with `-o`, `-O`, and similar.
-fn curl(args: &[Arg]) -> Outcome {
+/// `curl` reads `file://` URLs and `@file` data, and writes with `-o`, `-O`, and similar. With
+/// `--allow-capture`, the download options `-o` and `-O` pass.
+fn curl(args: &[Arg], capture: Capture) -> Outcome {
+    let capture = match capture {
+        Capture::Allow => true,
+        Capture::Deny => false,
+    };
     let harmless = |v: Option<&str>| v.is_some_and(|v| matches!(v, "/dev/null" | "-"));
     for (i, a) in args.iter().enumerate() {
         let t = a.text.as_str();
@@ -2203,6 +2361,7 @@ fn curl(args: &[Arg]) -> Outcome {
                 .map_or((long, None), |(k, v)| (k, Some(v)));
             let value = inline.or(next);
             match key {
+                "output" | "remote-name" | "remote-name-all" if capture => {}
                 "output" | "dump-header" | "cookie-jar" | "trace" | "trace-ascii" | "stderr"
                     if !harmless(value) =>
                 {
@@ -2222,6 +2381,8 @@ fn curl(args: &[Arg]) -> Outcome {
                     return Outcome::Deny(INPUT_REDIRECT);
                 }
                 match ch {
+                    'O' if capture => {}
+                    'o' if capture => break,
                     'O' => return Outcome::Deny(OUTPUT_REDIRECT),
                     'o' | 'D' | 'c' if !harmless(value) => return Outcome::Deny(OUTPUT_REDIRECT),
                     'T' | 'K' if !harmless(value) => return Outcome::Deny(INPUT_REDIRECT),
@@ -3080,6 +3241,9 @@ fn debugger(spec: &Debugger, args: &[Arg]) -> Outcome {
         assigns: &[],
         piped: false,
         here: false,
+        capture: Capture::Deny,
+        feed: Feed::Unknown,
+        authored: &Cell::new(false),
     };
     either(check(&run), scripts)
 }

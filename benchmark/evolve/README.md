@@ -153,6 +153,8 @@ reused by a strict run, and the reverse. The first strict run buys a full strict
 Before any paid call, a strict run builds the seed hook and replays every row of the frozen corpus
 (`benchmark/hook_corpus.json`) through it in both hint modes. A `must_deny` row that the hook allows,
 or a `must_allow` row that it denies, refuses the run (exit 2). The log names the failing rows.
+The `allow_capture` section of the corpus holds the verdicts for `tilth hook --allow-capture`. No benchmark
+cell uses that option, so the preflight and the hook gate do not replay it. `cargo test` checks it.
 
 ## Hook gate
 

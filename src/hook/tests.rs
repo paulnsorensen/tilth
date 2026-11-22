@@ -1,4 +1,4 @@
-use super::{hints, run_cli, run_io, verdict, Hint, Host, Verdict};
+use super::{hints, run_cli, run_io, verdict, Capture, Hint, Host, Verdict};
 use serde_json::{json, Value};
 
 const CORPUS: &str = include_str!("../../benchmark/hook_corpus.json");
@@ -42,10 +42,9 @@ fn corpus() -> Value {
     serde_json::from_str(CORPUS).expect("corpus parses")
 }
 
-/// Extracts commands and optional rule names from a named corpus list.
-fn rows(list: &str) -> Vec<(String, Option<String>)> {
-    corpus()[list]
-        .as_array()
+/// Extracts commands and optional rule names from one corpus list.
+fn rows_of(list: &Value) -> Vec<(String, Option<String>)> {
+    list.as_array()
         .expect("list is an array")
         .iter()
         .map(|row| {
@@ -55,6 +54,17 @@ fn rows(list: &str) -> Vec<(String, Option<String>)> {
             )
         })
         .collect()
+}
+
+/// Extracts commands and optional rule names from a named corpus list.
+fn rows(list: &str) -> Vec<(String, Option<String>)> {
+    rows_of(&corpus()[list])
+}
+
+/// Extracts the rows of a list in the `allow_capture` section: the verdicts with
+/// `--allow-capture`.
+fn capture_rows(list: &str) -> Vec<(String, Option<String>)> {
+    rows_of(&corpus()["allow_capture"][list])
 }
 
 /// Combines the AC-1 commands with the must-deny corpus rows.
@@ -91,7 +101,7 @@ fn event(host: Host, command: &str) -> String {
 /// Evaluates an event and returns its exit code and captured stderr as UTF-8.
 fn run(host: Host, hint: Hint, input: &str) -> (i32, String) {
     let mut err = Vec::new();
-    let code = run_io(host, hint, input, &mut err);
+    let code = run_io(host, hint, Capture::Deny, input, &mut err);
     (code, String::from_utf8(err).expect("utf8 stderr"))
 }
 
@@ -121,7 +131,7 @@ fn ac1_listed_and_corpus_commands_deny_with_tilth_hint() {
 fn ac1_deny_rule_matches_corpus_row() {
     for (command, rule) in rows("must_deny") {
         let rule = rule.expect("must_deny row names a rule");
-        match verdict(&command, Hint::Tilth) {
+        match verdict(&command, Hint::Tilth, Capture::Deny) {
             Verdict::Deny { rule: got, .. } => assert_eq!(got, rule, "command {command:?}"),
             Verdict::Allow => panic!("allowed: {command:?}"),
         }
@@ -177,8 +187,8 @@ fn ac3_malformed_json_denies() {
 
 #[test]
 fn ac3_unknown_host_or_hint_denies() {
-    assert_eq!(run_cli("bogus", "tilth"), 2);
-    assert_eq!(run_cli("claude", "bogus"), 2);
+    assert_eq!(run_cli("bogus", "tilth", Capture::Deny), 2);
+    assert_eq!(run_cli("claude", "bogus", Capture::Allow), 2);
     assert!("bogus".parse::<Host>().is_err());
     assert!("bogus".parse::<Hint>().is_err());
 }
@@ -209,11 +219,11 @@ fn ac3_error_node_denies() {
     let (code, _) = run(Host::Claude, Hint::Tilth, &claude_event("echo \"$("));
     assert_eq!(code, 2);
     assert!(matches!(
-        verdict("echo \"$(", Hint::Tilth),
+        verdict("echo \"$(", Hint::Tilth, Capture::Deny),
         Verdict::Deny { .. }
     ));
     assert!(matches!(
-        verdict("if then fi ((", Hint::Native),
+        verdict("if then fi ((", Hint::Native, Capture::Allow),
         Verdict::Deny { .. }
     ));
 }
@@ -308,7 +318,10 @@ fn host_and_hint_parse_names() {
 
 /// Reports whether a shell command is denied with tilth hints.
 fn denies(command: &str) -> bool {
-    matches!(verdict(command, Hint::Tilth), Verdict::Deny { .. })
+    matches!(
+        verdict(command, Hint::Tilth, Capture::Deny),
+        Verdict::Deny { .. }
+    )
 }
 
 /// Asserts that every command is denied, reporting any commands that were allowed.
@@ -872,7 +885,7 @@ fn cure1_unknown_wrapper_option_fails_closed() {
 /// Asserts that each command is denied by its expected rule.
 fn assert_rules(rows: &[(&str, &str)]) {
     for (command, rule) in rows {
-        match verdict(command, Hint::Tilth) {
+        match verdict(command, Hint::Tilth, Capture::Deny) {
             Verdict::Deny { rule: got, .. } => {
                 assert_eq!(got, *rule, "wrong rule for {command:?}");
             }
@@ -1236,7 +1249,7 @@ fn benchmark_probe_contract() {
 
 /// Returns the tilth-mode denial text for a command.
 fn tilth_reason_for(command: &str) -> String {
-    match verdict(command, Hint::Tilth) {
+    match verdict(command, Hint::Tilth, Capture::Deny) {
         Verdict::Deny { reason, .. } => reason,
         Verdict::Allow => panic!("allowed: {command:?}"),
     }
@@ -1351,7 +1364,7 @@ fn hint_rewording_leaves_every_corpus_decision_and_rule_unchanged() {
     for (command, rule) in rows("must_deny") {
         let rule = rule.expect("must_deny row names a rule");
         for hint in [Hint::Tilth, Hint::Native] {
-            match verdict(&command, hint) {
+            match verdict(&command, hint, Capture::Deny) {
                 Verdict::Deny { rule: got, .. } => assert_eq!(got, rule, "{command:?}"),
                 Verdict::Allow => panic!("allowed: {command:?}"),
             }
@@ -1566,7 +1579,7 @@ fn hint_stdin_repl_and_debugger_script_name_the_fix() {
         let reason = tilth_reason_for(command);
         assert!(names_tilth_tool(&reason), "{command:?}: {reason}");
         assert!(reason.contains("-batch"), "{reason}");
-        match verdict(command, Hint::Native) {
+        match verdict(command, Hint::Native, Capture::Deny) {
             Verdict::Deny { reason, .. } => {
                 assert!(!reason.to_lowercase().contains("tilth"), "{reason}");
                 assert!(reason.contains("-batch"), "{reason}");
@@ -1813,7 +1826,7 @@ fn review_hints_name_the_fix_for_each_new_rule() {
     ] {
         let reason = tilth_reason_for(command);
         assert!(names_tilth_tool(&reason), "{command:?}: {reason}");
-        match verdict(command, Hint::Native) {
+        match verdict(command, Hint::Native, Capture::Deny) {
             Verdict::Deny { reason, .. } => {
                 assert!(!reason.to_lowercase().contains("tilth"), "{reason}");
             }
@@ -2287,4 +2300,136 @@ fn round3_nix_run_checks_the_program_of_the_installable() {
         "nix build",
         "nix flake check",
     ]);
+}
+
+// `--allow-capture` (issue #470).
+
+/// The rule that denies a command with `--allow-capture`, or `None` when the command is allowed.
+fn capture_rule(command: &str, hint: Hint) -> Option<&'static str> {
+    match verdict(command, hint, Capture::Allow) {
+        Verdict::Deny { rule, .. } => Some(rule),
+        Verdict::Allow => None,
+    }
+}
+
+#[test]
+fn capture_corpus_rows_hold_in_both_hint_modes() {
+    let allow = capture_rows("must_allow");
+    let deny = capture_rows("must_deny");
+    assert!(!allow.is_empty() && !deny.is_empty());
+    for hint in [Hint::Tilth, Hint::Native] {
+        for (command, _) in &allow {
+            assert_eq!(capture_rule(command, hint), None, "{hint:?} {command:?}");
+        }
+        for (command, rule) in &deny {
+            let rule = rule.as_deref().expect("must_deny row names a rule");
+            assert_eq!(
+                capture_rule(command, hint),
+                Some(rule),
+                "{hint:?} {command:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn capture_rows_all_deny_without_the_option() {
+    // An allow row that passes in the default mode proves nothing about the option, and a
+    // deny row that passes in the default mode means the option tightens a rule.
+    for list in ["must_allow", "must_deny"] {
+        for (command, _) in capture_rows(list) {
+            assert!(
+                denies(&command),
+                "default mode allows {list} row {command:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn capture_lifts_only_the_default_denials_that_the_corpus_lists() {
+    let listed: Vec<String> = capture_rows("must_allow")
+        .into_iter()
+        .map(|(command, _)| command)
+        .collect();
+    for (command, rule) in rows("must_deny") {
+        match capture_rule(&command, Hint::Tilth) {
+            Some(got) => assert_eq!(Some(got), rule.as_deref(), "rule changed: {command:?}"),
+            None => assert!(
+                listed.contains(&command),
+                "`--allow-capture` allows {command:?}, and no allow_capture.must_allow row lists it"
+            ),
+        }
+    }
+    for command in all_allow_commands() {
+        assert_eq!(capture_rule(&command, Hint::Tilth), None, "{command:?}");
+    }
+}
+
+#[test]
+fn capture_reasons_name_the_route_for_command_output() {
+    let reason = |command: &str, hint, capture| match verdict(command, hint, capture) {
+        Verdict::Deny { reason, .. } => reason,
+        Verdict::Allow => panic!("allowed: {command:?}"),
+    };
+    // Without the option, a blocked capture names the route that stays open: a filter.
+    for command in ["just check > check.log 2>&1", "just check 2>&1 | tee log"] {
+        let tilth = reason(command, Hint::Tilth, Capture::Deny);
+        assert!(tilth.contains("| tail -n 40"), "{tilth}");
+        assert!(tilth.contains("tilth_write"), "{tilth}");
+        let native = reason(command, Hint::Native, Capture::Deny);
+        assert!(native.contains("| tail -n 40"), "{native}");
+        assert!(!native.to_lowercase().contains("tilth"), "{native}");
+    }
+    // With the option, a blocked write names the capture forms that pass.
+    for command in ["echo x > f", "printf a | tee f"] {
+        let tilth = reason(command, Hint::Tilth, Capture::Allow);
+        assert!(tilth.contains("capture its own output"), "{tilth}");
+        assert!(tilth.contains("create_file"), "{tilth}");
+        assert!(!tilth.contains("tail -n 40"), "{tilth}");
+        let native = reason(command, Hint::Native, Capture::Allow);
+        assert!(native.contains("capture its own output"), "{native}");
+        assert!(native.contains("Write tool"), "{native}");
+        assert!(!native.to_lowercase().contains("tilth"), "{native}");
+    }
+    // The option changes no other reason.
+    for command in ["cat f", "grep -rn foo .", "sed -i s/a/b/ f", "irb"] {
+        for hint in [Hint::Tilth, Hint::Native] {
+            assert_eq!(
+                reason(command, hint, Capture::Allow),
+                reason(command, hint, Capture::Deny),
+                "{hint:?} {command:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn capture_every_host_shape_gives_the_claude_verdict() {
+    let commands = capture_rows("must_allow")
+        .into_iter()
+        .chain(capture_rows("must_deny"));
+    for (command, _) in commands {
+        let run = |host| {
+            let mut err = Vec::new();
+            run_io(
+                host,
+                Hint::Tilth,
+                Capture::Allow,
+                &event(host, &command),
+                &mut err,
+            )
+        };
+        let want = run(Host::Claude);
+        for host in HOSTS {
+            assert_eq!(run(host), want, "{host:?} differs for {command:?}");
+        }
+    }
+}
+
+#[test]
+fn capture_flag_maps_to_the_policy() {
+    assert_eq!(Capture::default(), Capture::Deny);
+    assert_eq!(Capture::from(false), Capture::Deny);
+    assert_eq!(Capture::from(true), Capture::Allow);
 }

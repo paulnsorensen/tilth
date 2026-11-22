@@ -1,149 +1,231 @@
 //! Parse a command with `tree-sitter-bash` and check every simple command in it.
 
 use super::hints::{Rule, DEVICE_PATH, INPUT_REDIRECT, OUTPUT_REDIRECT, PARSE_ERROR, UNRESOLVED};
-use super::rules::{self, Arg, Cmd, Outcome};
+use super::rules::{self, Arg, Cmd, Feed, Outcome};
+use super::Capture;
+use std::cell::Cell;
 use tree_sitter::{Node, Parser};
 
 /// Nesting limit for `bash -c` and `eval` strings.
 const MAX_DEPTH: usize = 8;
 
 /// The first rule that denies `source`, or `None` when the whole command is allowed.
-pub(super) fn check(source: &str) -> Option<Rule> {
-    Walker { depth: 0 }.source(source)
+pub(super) fn check(source: &str, capture: Capture) -> Option<Rule> {
+    Walker { depth: 0, capture }.source(source).err()
 }
 
 #[derive(Clone, Copy, Default)]
 struct Ctx {
     piped: bool,
     here: bool,
+    /// Where the stdin of the node comes from.
+    feed: Feed,
 }
+
+/// Whether authored content reaches the stdout of a walked node. Authored content is text from
+/// a content generator (`echo`, `printf`, `cat`), from a filter with no real input, or from a
+/// command that the rules cannot name. `--allow-capture` lets a file redirect pass only when
+/// its content is not authored.
+#[derive(Clone, Copy, Default)]
+struct Authored {
+    /// Some command in the node writes authored content to the stdout of the node.
+    any: bool,
+    /// The command that owns a redirect after the node writes authored content. The grammar
+    /// puts the redirect of `a && b > f` on the whole list, but the shell gives it to `b`.
+    last: bool,
+}
+
+impl Authored {
+    /// A redirect with no command, where only the shell writes the file.
+    const NO_COMMAND: Self = Self {
+        any: true,
+        last: true,
+    };
+
+    /// The feed that the node gives to the next pipeline stage.
+    fn feed(self) -> Feed {
+        if self.any {
+            Feed::Authored
+        } else {
+            Feed::Real
+        }
+    }
+
+    /// What writes through a redirect after the node.
+    fn writer(self) -> Feed {
+        if self.last {
+            Feed::Authored
+        } else {
+            Feed::Real
+        }
+    }
+}
+
+/// The authored state of a node, or the rule that denies it.
+type Walk = Result<Authored, Rule>;
 
 struct Walker {
     depth: usize,
+    capture: Capture,
 }
 
 impl Walker {
     /// Parses shell source and returns the first denial, including parse and depth failures.
-    fn source(&mut self, src: &str) -> Option<Rule> {
+    fn source(&mut self, src: &str) -> Walk {
         if self.depth > MAX_DEPTH {
-            return Some(UNRESOLVED);
+            return Err(UNRESOLVED);
         }
         let mut parser = Parser::new();
         if parser
             .set_language(&tree_sitter_bash::LANGUAGE.into())
             .is_err()
         {
-            return Some(PARSE_ERROR);
+            return Err(PARSE_ERROR);
         }
         let Some(tree) = parser.parse(src, None) else {
-            return Some(PARSE_ERROR);
+            return Err(PARSE_ERROR);
         };
         let root = tree.root_node();
         if root.has_error() {
-            return Some(PARSE_ERROR);
+            return Err(PARSE_ERROR);
         }
         self.visit(root, src.as_bytes(), Ctx::default())
     }
 
-    /// Checks a syntax node while carrying pipeline and heredoc context.
-    fn visit(&mut self, node: Node, src: &[u8], ctx: Ctx) -> Option<Rule> {
+    /// Checks a syntax node while carrying pipeline and heredoc context. The output of a
+    /// substitution goes to a word, so it never counts as output of the statement.
+    fn visit(&mut self, node: Node, src: &[u8], ctx: Ctx) -> Walk {
         match node.kind() {
-            "pipeline" => {
+            "pipeline" => self.pipeline(node, src, ctx),
+            "list" | "negated_command" => {
+                let mut out = Authored::default();
                 let mut cursor = node.walk();
-                for (i, child) in node.named_children(&mut cursor).enumerate() {
-                    if let Some(rule) = self.visit(
-                        child,
-                        src,
-                        Ctx {
-                            piped: i > 0,
-                            here: false,
-                        },
-                    ) {
-                        return Some(rule);
-                    }
-                }
-                None
-            }
-            "redirected_statement" => {
-                let mut cursor = node.walk();
-                let here = ctx.here || node.named_children(&mut cursor).any(|c| is_here(c.kind()));
-                let body = node.child_by_field_name("body");
-                let extra: Vec<Arg> = node
-                    .named_children(&mut cursor)
-                    .flat_map(|c| redirect_words(c, src))
-                    .collect();
-                if let Some(b) = body {
-                    if b.kind() == "command" {
-                        if let Some(rule) = self.command(
-                            b,
-                            src,
-                            Ctx {
-                                piped: ctx.piped,
-                                here,
-                            },
-                            extra,
-                        ) {
-                            return Some(rule);
-                        }
-                        return self.redirects(node, src);
-                    }
-                }
-                if !extra.is_empty() {
-                    return Some(UNRESOLVED);
-                }
                 for child in node.named_children(&mut cursor) {
-                    let inner = if Some(child.id()) == body.map(|b| b.id()) {
-                        Ctx {
-                            piped: ctx.piped,
-                            here,
-                        }
-                    } else {
-                        Ctx::default()
+                    let Authored { any, last } = self.visit(child, src, Ctx::default())?;
+                    out = Authored {
+                        any: out.any || any,
+                        last,
                     };
-                    if let Some(rule) = self.visit(child, src, inner) {
-                        return Some(rule);
-                    }
                 }
-                None
+                Ok(out)
             }
+            "redirected_statement" => self.redirected(node, src, ctx),
             "command" => self.command(node, src, ctx, Vec::new()),
-            "file_redirect" => {
-                if let Some(rule) = redirect(node, src) {
-                    return Some(rule);
-                }
-                self.children(node, src)
+            "file_redirect" | "heredoc_redirect" => {
+                self.redirect_node(node, src, Feed::Unknown)?;
+                Ok(Authored::default())
+            }
+            "command_substitution" | "process_substitution" => {
+                self.children(node, src)?;
+                Ok(Authored::default())
             }
             _ => self.children(node, src),
         }
     }
 
-    /// Checks named children with fresh context and returns the first denial.
-    fn children(&mut self, node: Node, src: &[u8]) -> Option<Rule> {
+    /// Checks the stages of a pipeline. The first stage reads what feeds the pipeline, and each
+    /// later stage reads the stage before it. The grammar puts a heredoc on the whole pipeline,
+    /// but the shell gives it to the last stage.
+    fn pipeline(&mut self, node: Node, src: &[u8], ctx: Ctx) -> Walk {
+        let mut out = Authored::default();
+        let last = node.named_child_count().saturating_sub(1);
         let mut cursor = node.walk();
-        for child in node.named_children(&mut cursor) {
-            if let Some(rule) = self.visit(child, src, Ctx::default()) {
-                return Some(rule);
-            }
+        for (i, child) in node.named_children(&mut cursor).enumerate() {
+            let feed = if i == last && ctx.here {
+                Feed::Authored
+            } else if i == 0 {
+                ctx.feed
+            } else {
+                out.feed()
+            };
+            let stage = Ctx {
+                piped: i > 0,
+                here: false,
+                feed,
+            };
+            out = self.visit(child, src, stage)?;
         }
-        None
+        Ok(out)
     }
 
-    /// Walk the redirects of a redirected statement whose body command is already checked.
-    fn redirects(&mut self, node: Node, src: &[u8]) -> Option<Rule> {
+    /// Checks named children with fresh context and returns the first denial.
+    fn children(&mut self, node: Node, src: &[u8]) -> Walk {
+        let mut any = false;
         let mut cursor = node.walk();
-        let body = node.child_by_field_name("body").map(|b| b.id());
         for child in node.named_children(&mut cursor) {
-            if Some(child.id()) != body {
-                if let Some(rule) = self.visit(child, src, Ctx::default()) {
-                    return Some(rule);
+            any |= self.visit(child, src, Ctx::default())?.any;
+        }
+        Ok(Authored { any, last: any })
+    }
+
+    /// Checks a statement with redirects: the body first, then each redirect.
+    fn redirected(&mut self, node: Node, src: &[u8], ctx: Ctx) -> Walk {
+        let mut cursor = node.walk();
+        let here = ctx.here || node.named_children(&mut cursor).any(|c| is_here(c.kind()));
+        let body = node.child_by_field_name("body");
+        let extra: Vec<Arg> = node
+            .named_children(&mut cursor)
+            .flat_map(|c| redirect_words(c, src))
+            .collect();
+        let inner = Ctx { here, ..ctx };
+        let out = match body {
+            Some(b) if b.kind() == "command" => self.command(b, src, inner, extra)?,
+            _ if !extra.is_empty() => return Err(UNRESOLVED),
+            Some(b) => self.visit(b, src, inner)?,
+            None => Authored::NO_COMMAND,
+        };
+        for child in node.named_children(&mut cursor) {
+            if Some(child.id()) != body.map(|b| b.id()) {
+                self.redirect_node(child, src, out.writer())?;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Checks one redirect of a statement. `writer` is what writes through the redirect: with
+    /// `--allow-capture`, an output redirect to a file passes when a real command writes.
+    ///
+    /// The grammar puts two things under the heredoc of `a <<EOF > f | b`: the file redirects
+    /// of `a`, and the rest of the pipeline, which reads the output of `a`.
+    fn redirect_node(&mut self, node: Node, src: &[u8], writer: Feed) -> Result<(), Rule> {
+        match node.kind() {
+            "file_redirect" => {
+                let captured = self.capture == Capture::Allow && writer == Feed::Real;
+                match redirect(node, src, self.capture) {
+                    Some(OUTPUT_REDIRECT) if captured => {}
+                    Some(rule) => return Err(rule),
+                    None => {}
+                }
+                self.children(node, src)?;
+            }
+            "heredoc_redirect" => {
+                let mut cursor = node.walk();
+                for child in node.named_children(&mut cursor) {
+                    match child.kind() {
+                        "file_redirect" => self.redirect_node(child, src, writer)?,
+                        "pipeline" => {
+                            let fed = Ctx {
+                                feed: writer,
+                                ..Ctx::default()
+                            };
+                            self.visit(child, src, fed)?;
+                        }
+                        _ => {
+                            self.visit(child, src, Ctx::default())?;
+                        }
+                    }
                 }
             }
+            _ => {
+                self.visit(node, src, Ctx::default())?;
+            }
         }
-        None
+        Ok(())
     }
 
-    /// Checks a simple command and reparses any shell source it runs.
-    fn command(&mut self, node: Node, src: &[u8], ctx: Ctx, extra: Vec<Arg>) -> Option<Rule> {
+    /// Checks a simple command and reparses any shell source it runs. A command with no words
+    /// holds only redirects and assignments, so no program writes its output.
+    fn command(&mut self, node: Node, src: &[u8], ctx: Ctx, extra: Vec<Arg>) -> Walk {
         let mut cursor = node.walk();
         let mut words: Vec<Arg> = Vec::new();
         let mut here = ctx.here;
@@ -163,27 +245,46 @@ impl Walker {
         }
         words.extend(extra);
         if self.depth > 0 && words.first().is_some_and(|w| !w.literal) {
-            return Some(UNRESOLVED);
+            return Err(UNRESOLVED);
         }
+        let authored = Cell::new(words.is_empty());
         let cmd = Cmd {
             words: &words,
             assigns: &assigns,
             piped: ctx.piped,
             here,
+            capture: self.capture,
+            feed: ctx.feed,
+            authored: &authored,
         };
         match rules::check(&cmd) {
             Outcome::Allow => {}
-            Outcome::Deny(rule) => return Some(rule),
+            Outcome::Deny(rule) => return Err(rule),
             Outcome::Reparse(text) => {
                 self.depth += 1;
                 let found = self.source(&text);
                 self.depth -= 1;
-                if found.is_some() {
-                    return found;
+                if found?.any {
+                    authored.set(true);
                 }
             }
         }
-        self.children(node, src)
+        let authored = authored.get();
+        let out = Authored {
+            any: authored,
+            last: authored,
+        };
+        for child in node.named_children(&mut cursor) {
+            match child.kind() {
+                "file_redirect" | "heredoc_redirect" => {
+                    self.redirect_node(child, src, out.writer())?;
+                }
+                _ => {
+                    self.visit(child, src, Ctx::default())?;
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -246,8 +347,10 @@ fn is_here(kind: &str) -> bool {
     matches!(kind, "heredoc_redirect" | "herestring_redirect")
 }
 
-/// Deny a redirect that reads a path or writes a file.
-fn redirect(node: Node, src: &[u8]) -> Option<Rule> {
+/// Deny a redirect that reads a path or writes a file. With `--allow-capture`, output to a
+/// stream device and input from a pseudo-file pass. The caller decides whether an
+/// `OUTPUT_REDIRECT` result is a capture that passes.
+fn redirect(node: Node, src: &[u8], capture: Capture) -> Option<Rule> {
     let mut cursor = node.walk();
     let op = node
         .children(&mut cursor)
@@ -259,13 +362,23 @@ fn redirect(node: Node, src: &[u8]) -> Option<Rule> {
         return None;
     }
     let (text, literal) = literal(dest, src);
+    let input = matches!(op, "<" | "<&");
+    let lifted = match capture {
+        Capture::Deny => false,
+        Capture::Allow if input => rules::is_pseudo_file(&text, literal),
+        Capture::Allow => rules::is_stream_target(&text, literal),
+    };
+    if lifted {
+        return None;
+    }
     if rules::is_device(&text) {
         return Some(DEVICE_PATH);
     }
     let fd_dup = literal && (text == "-" || text.chars().all(|c| c.is_ascii_digit()));
-    let rule = match op {
-        "<" | "<&" => INPUT_REDIRECT,
-        _ => OUTPUT_REDIRECT,
+    let rule = if input {
+        INPUT_REDIRECT
+    } else {
+        OUTPUT_REDIRECT
     };
     let null = literal && text == "/dev/null";
     if null || (fd_dup && op.ends_with('&')) {
