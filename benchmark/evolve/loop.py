@@ -16,6 +16,7 @@ import tempfile
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from statistics import mean
 
@@ -31,7 +32,7 @@ from judge import store as judge_store
 from spend import SpendLedger
 
 from . import attribution as cost_attribution
-from . import deepdiag, diagnosis, directives, engine, hookgate, replay, rust
+from . import benchlog, deepdiag, diagnosis, directives, engine, hookgate, replay, rust
 from .calls import PaidCalls, StopState
 from .directives import Directive
 from .candidate import SRC_PATCH, content_id
@@ -115,6 +116,8 @@ class Settings:
     avoid_failures_from: tuple[Path, ...] = ()
     # Extra attempts for a cell that did not complete (crash, infra, timeout) in one plan; each one is charged.
     cell_retries: int = 2
+    # The append-only benchmark log that gets one entry per run past preflight; None writes no entry.
+    benchmark_log: Path | None = None
 
 
 def forbidden_terms(panel_path: Path) -> list[str]:
@@ -359,6 +362,7 @@ class Evolution:
         self.log_path = self.run_dir / "log.txt"
         # A later run's --avoid-failures-from reads this line: its gate verdicts hold only on this seed.
         self.log(seed_line(settings.seed_sha))
+        self.log(benchlog.run_line(panel.name, settings.model, settings.preamble))
         # Gate failures from prior runs and from this run's own log (a resume) are known before the first proposal.
         self.failed = FailedPatches()
         for prior in (*settings.avoid_failures_from, self.run_dir):
@@ -1310,4 +1314,33 @@ class Evolution:
                       "proposer": self.paid.total("proposer")}
             self.log("spend: " + " ".join(f"{kind}=${value:.4f}" for kind, value in totals.items())
                      + f" total=${self.ledger.spent:.4f} of ${self.settings.max_usd:.2f}")
+            self._record_benchmark()
         return 1 if self.finish_failure else 0
+
+    def _record_benchmark(self) -> None:
+        """Log the frontier, then append this run's entry to the benchmark log and redraw its charts.
+
+        A failure writes one log line and changes nothing else: the exit code and the finish result stay.
+        """
+        step = "frontier"
+        try:
+            seed = self.results.get(self.seed_id)
+            seed_mean = seed.dev_mean if seed is not None and (seed.means or seed.scores) else None
+            nonseed = sorted((member for member in self.frontier if member.cid != self.seed_id),
+                             key=lambda member: (-member.dev_mean, member.seq))
+            best = nonseed[0] if nonseed else None
+            self.log(benchlog.frontier_line(seed_mean, best.cid[:12] if best else None,
+                                            best.dev_mean if best else None))
+            path = self.settings.benchmark_log
+            if path is None:
+                return
+            step = "entry"
+            entry = benchlog.entry_from_run_dir(self.run_dir, recorded_at=datetime.now(timezone.utc))
+            step = "append"
+            benchlog.append(path, entry)
+            step = "redraw"
+            benchlog.redraw(path)
+        except Exception as error:  # noqa: BLE001 - no log or chart fault may change the run's result
+            self.log(f"benchmark log: {step} failed ({type(error).__name__}: {error})")
+            return
+        self.log(f"benchmark log: appended {self.settings.run_id} to {path}")

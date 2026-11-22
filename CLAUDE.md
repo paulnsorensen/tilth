@@ -58,6 +58,7 @@ src/
   error.rs             Error types with exit codes.
 npm/                   npm wrapper — postinstall downloads binary, run.js proxies to it.
 benchmark/             Evaluation harness (see Benchmarks section below).
+benchmark/log/         Committed append-only evolve run log (evolve.jsonl) and its light/dark SVG charts.
 prompts/               MCP server instruction source (mcp.md), tool descriptions (tools/*.md), and the launcher preamble (preamble.md). Embedded into the binary at compile time; mcp.md is regenerated into AGENTS.md.
 AGENTS.md              User-facing copy of the MCP instructions. Generated from prompts/mcp.md via scripts/regen-agents-md.sh — do not edit directly.
 ```

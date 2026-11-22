@@ -160,6 +160,14 @@ def hermetic_claude_auth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
 
 
 @pytest.fixture(autouse=True)
+def hermetic_benchmark_log(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Point an evolve run's default benchmark log at a temp path, so no test writes the committed benchmark/log/."""
+    from evolve import benchlog
+
+    monkeypatch.setattr(benchlog, "DEFAULT_LOG", tmp_path / "benchmark-log" / "evolve.jsonl")
+
+
+@pytest.fixture(autouse=True)
 def hermetic_tmpfiles(monkeypatch: pytest.MonkeyPatch) -> None:
     """Model a host without systemd-tmpfiles, so the guard skips on every host; guard tests replace it."""
     monkeypatch.setattr(tmp_aging, "_cat_config", lambda: None)

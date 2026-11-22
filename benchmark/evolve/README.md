@@ -315,3 +315,56 @@ deletes the seed's directory (the seed binary is the hook binary for every cell)
 
 Every strict cell replays each Bash call through the seed hook. A cell that ran a call the seed hook
 denies raises `HookLoosenedError`. A candidate therefore cannot loosen the hook to win cells.
+
+## Benchmark log
+
+Every run that passes preflight appends one line to `benchmark/log/evolve.jsonl` at its end. This includes a
+run that finds no improvement, ends incomplete, or fails in finish. The log is append-only: a run never
+rewrites an earlier line. After the append, the run redraws `benchmark/log/evolve.svg` (light) and
+`benchmark/log/evolve-dark.svg` (dark) from the whole log. The top README embeds both charts. Commit
+`benchmark/log/` after each run, so the graph on GitHub shows the new run.
+
+A log or chart fault writes one `benchmark log: <step> failed (...)` line to `log.txt`. It does not change the
+exit code or the finish result. `--benchmark-log PATH` writes to another log; the charts go next to it. The
+test suite points the default log at a temp path, so no test writes `benchmark/log/`.
+
+`benchlog.entry_from_run_dir` builds the entry from the run's `log.txt` and `rows.jsonl`. A live run and an
+import use the same builder. The run logs two lines for it: `run: {...}` (panel, model, preamble) at the start
+of each session, and `frontier: {...}` (seed and best dev means) before the entry. An entry records only
+values the run logged or stored; a value the run did not reach is `null`.
+
+| Field | Value |
+|---|---|
+| `schema` | `1` |
+| `run_id` | The run directory name (`--run-id`). |
+| `recorded_at` | UTC time of the append (`YYYY-MM-DDTHH:MM:SSZ`). An import uses the `log.txt` modification time. |
+| `seed_sha` | The `run seed:` line (`--seed-sha`). |
+| `tilth_version` | The one `tilth_version` of the run's `tilth_forced` rows; `null` when the rows hold none or several. |
+| `panel`, `model`, `preamble` | The `run:` line. Without it, `model` is the one `model_alias` of the rows. |
+| `stop_reason` | The last `stop:` line, else the `search: ended (...)` reason. |
+| `outcome` | The last finish result: `pr_opened`, `no_improvement`, `incomplete`, `refused`, `failed`, or `pr_failed`. |
+| `seed_dev_mean` | The seed's dev-split mean score. |
+| `best_cid`, `best_dev_mean` | The accepted non-seed candidate with the best dev mean (12-character content id). |
+| `test_means` | Test-split pass rate per finalist content id, when finish compared them. |
+| `paired_test_delta` | `{point, low, high, tasks}`: winner minus seed per-task score, with its 95% CI. |
+| `pass_rate_delta` | Winner minus seed test pass rate. |
+| `spend` | `{cells, judge, reflection, proposer, total, max_usd}` in USD, from the `spend:` line. |
+| `pr_url` | The draft PR URL when finish opened one. |
+
+A score of 1.0 is cost-per-correct parity with the baseline (see [Score and finish rule](#score-and-finish-rule)).
+The chart shows the seed and winner dev means per run against a dashed parity line at 1.0. A green ring marks a
+run that opened a draft PR. A lower panel shows the paired test delta with its 95% CI. The chart uses only the
+standard library, and the same log gives the same bytes.
+
+A resumed run appends to the same `log.txt`; the builder reads only the last session, which starts at the last
+`run seed:` line. A `log.txt` without a `spend:` line gives no entry: that run was refused at preflight or did
+not reach its end.
+
+```bash
+python3 benchmark/evolve/benchlog.py redraw                       # redraw both charts from the log
+python3 benchmark/evolve/benchlog.py import RUN_DIR [RUN_DIR ...]  # append entries for past run directories
+```
+
+An import goes oldest `log.txt` first and skips a run id that the log holds already. A log from before the `run:`
+and `frontier:` lines records `null` for panel and preamble. It takes its dev means from a
+`finish: finalists` line, else records `null`.
