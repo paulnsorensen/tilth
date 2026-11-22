@@ -229,7 +229,7 @@ Every evolve run uses a Sonnet agent model. Each band of the chart names its tas
 Scores from different panels or models do not compare, so a divider separates the bands and no line joins them.
 A table under the chart gives the real numbers per band: the dev-split pass rate and cost per correct answer of
 the baseline (built-in tools, no tilth), the tilth seed, and the tilth winner.
-Each evolve run adds one entry to [benchmark/log/evolve.jsonl](benchmark/log/evolve.jsonl) and redraws the chart.
+Each evolve run opens its own ready PR that adds one entry to [benchmark/log/evolve.jsonl](benchmark/log/evolve.jsonl) and redraws the chart. The run builds the entry from its own state and keeps a copy in its run directory. `--benchmark-log PATH` writes to a local log and opens no PR. `benchmark/evolve/benchlog.py publish RUN_DIR --replace` rebuilds a log PR that conflicts after another one lands. The chart shows the last entry of each run id.
 The evolve loop is a GEPA search over tilth commits, which change prompt texts and `src/**`. See [benchmark/evolve/README.md](benchmark/evolve/README.md#benchmark-log).
 
 ## Relationship to upstream
