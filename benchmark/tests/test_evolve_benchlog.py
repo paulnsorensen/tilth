@@ -218,6 +218,20 @@ def test_an_old_log_uses_its_finalists_line_and_old_spend_form(tmp_path: Path) -
     assert entry["stop_reason"] == "metric-call budget"
 
 
+def test_an_old_log_takes_its_panel_from_the_stored_rows(tmp_path: Path) -> None:
+    run_dir = tmp_path / "old-run"
+    run_dir.mkdir()
+    (run_dir / "log.txt").write_text(OLD_LOG)
+    rows = [{"mode": "tilth_forced", "panel_name": "gepa-v1"}, {"mode": "baseline", "panel_name": "gepa-v1"}]
+    (run_dir / "rows.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    log = tmp_path / "evolve.jsonl"
+
+    assert benchlog.main(["import", str(run_dir), "--log", str(log)]) == 0
+
+    [entry] = entries(log)
+    assert entry["panel"] == "gepa-v1"
+
+
 def sample_entry(run_id: str, recorded_at: str, **fields) -> dict:
     entry = dict.fromkeys(ENTRY_KEYS)
     return {**entry, "schema": 1, "run_id": run_id, "recorded_at": recorded_at, **fields}
@@ -246,6 +260,23 @@ def test_the_chart_is_deterministic_and_valid(theme: str) -> None:
 def test_the_themes_use_their_own_surface() -> None:
     assert chart.THEMES["light"]["surface"] in chart.render(SAMPLES, "light")
     assert chart.THEMES["dark"]["surface"] in chart.render(SAMPLES, "dark")
+
+
+def polylines(svg: str) -> int:
+    return len(ElementTree.fromstring(svg).findall(".//{http://www.w3.org/2000/svg}polyline"))
+
+
+def test_no_line_joins_runs_of_different_panels() -> None:
+    """Scores from different panels do not compare: a panel change breaks both series, and each panel is named."""
+    runs = [sample_entry("a", "2026-11-01T10:00:00Z", seed_dev_mean=0.3, best_dev_mean=0.4),
+            sample_entry("b", "2026-11-02T10:00:00Z", seed_dev_mean=0.8, best_dev_mean=0.9)]
+    one_panel = chart.render([{**entry, "panel": "gepa-v1"} for entry in runs], "light")
+    two_panels = chart.render([{**runs[0], "panel": "gepa-v1"}, {**runs[1], "panel": "gepa-v3"}], "light")
+
+    assert polylines(one_panel) == 2
+    assert polylines(two_panels) == 0
+    assert ">gepa-v1<" in two_panels and ">gepa-v3<" in two_panels
+    assert f">{chart.PANEL_UNKNOWN}<" in chart.render(runs, "light")
 
 
 @pytest.mark.parametrize("theme", ["light", "dark"])

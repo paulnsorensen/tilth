@@ -340,7 +340,7 @@ values the run logged or stored; a value the run did not reach is `null`.
 | `recorded_at` | UTC time of the append (`YYYY-MM-DDTHH:MM:SSZ`). An import uses the `log.txt` modification time. |
 | `seed_sha` | The `run seed:` line (`--seed-sha`). |
 | `tilth_version` | The one `tilth_version` of the run's `tilth_forced` rows; `null` when the rows hold none or several. |
-| `panel`, `model`, `preamble` | The `run:` line. Without it, `model` is the one `model_alias` of the rows. |
+| `panel`, `model`, `preamble` | The `run:` line. Without it, `panel` is the one `panel_name` of the rows and `model` is their one `model_alias`. |
 | `stop_reason` | The last `stop:` line, else the `search: ended (...)` reason. |
 | `outcome` | The last finish result: `pr_opened`, `no_improvement`, `incomplete`, `refused`, `failed`, or `pr_failed`. |
 | `seed_dev_mean` | The seed's dev-split mean score. |
@@ -353,8 +353,10 @@ values the run logged or stored; a value the run did not reach is `null`.
 
 A score of 1.0 is cost-per-correct parity with the baseline (see [Score and finish rule](#score-and-finish-rule)).
 The chart shows the seed and winner dev means per run against a dashed parity line at 1.0. A green ring marks a
-run that opened a draft PR. A lower panel shows the paired test delta with its 95% CI. The chart uses only the
-standard library, and the same log gives the same bytes.
+run that opened a draft PR. Scores from different panels do not compare. A dotted divider separates the runs of
+each panel, each panel has its name above its runs, and no line joins runs of different panels. A lower panel
+shows the paired test delta with its 95% CI. The chart uses only the standard library, and the same log gives the
+same bytes.
 
 A resumed run appends to the same `log.txt`; the builder reads only the last session, which starts at the last
 `run seed:` line. A `log.txt` without a `spend:` line gives no entry: that run was refused at preflight or did
@@ -366,5 +368,5 @@ python3 benchmark/evolve/benchlog.py import RUN_DIR [RUN_DIR ...]  # append entr
 ```
 
 An import goes oldest `log.txt` first and skips a run id that the log holds already. A log from before the `run:`
-and `frontier:` lines records `null` for panel and preamble. It takes its dev means from a
-`finish: finalists` line, else records `null`.
+and `frontier:` lines records `null` for preamble, and takes its panel from the rows. It takes its dev means from
+a `finish: finalists` line, else records `null`.

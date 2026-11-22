@@ -1,8 +1,9 @@
 """An SVG chart of the evolve benchmark log, drawn with the standard library only.
 
 The top panel shows, per run, the seed and winner dev means on the score scale, where 1.0 is cost-per-correct
-parity with the built-in-tools baseline. A ring marks a run that opened a draft PR. The bottom panel shows the
-paired test delta (winner minus seed) with its 95% CI. The same entries give the same bytes.
+parity with the built-in-tools baseline. A ring marks a run that opened a draft PR. Scores from different task
+panels do not compare, so a divider separates them and no line joins them. The bottom panel shows the paired test
+delta (winner minus seed) with its 95% CI. The same entries give the same bytes.
 """
 
 import math
@@ -26,6 +27,8 @@ THEMES = {
 }
 TITLE = "tilth evolve runs: score against the built-in-tools baseline"
 NOTE = "Score = pass rate × baseline cost ÷ candidate cost per task, dev-split mean. Above 1.0 is cheaper per correct."
+PANEL_UNKNOWN = "panel not recorded"
+PANEL_NAME_ROWS = 3
 
 
 def _n(value: float) -> str:
@@ -97,23 +100,46 @@ def _scale(low: float, high: float, top: float, bottom: float):
     return to_y
 
 
-def _series(points: list[tuple[float, float | None]], to_y, color: str, surface: str, name: str,
-            run_ids: list[str]) -> list[str]:
-    """A 2px line through consecutive known points, broken at a run without a value, and one dot per point."""
-    parts, segment = [], []
-    for x, value in [*points, (0.0, None)]:
-        if value is None:
+def _series(points: list[tuple[float, float | None]], panels: list[str | None], to_y, color: str, surface: str,
+            name: str, run_ids: list[str]) -> list[str]:
+    """A 2px line through consecutive known points of one panel, and one dot per point.
+
+    The line breaks at a run without a value and at a panel change.
+    """
+    parts, segment, current = [], [], None
+    for (x, value), panel in zip([*points, (0.0, None)], [*panels, None]):
+        if segment and (value is None or panel != current):
             if len(segment) > 1:
                 parts.append(f'<polyline fill="none" stroke="{color}" stroke-width="2" stroke-linejoin="round" '
                              f'points="{" ".join(f"{_n(px)},{_n(py)}" for px, py in segment)}"/>')
             segment = []
-            continue
-        segment.append((x, to_y(value)))
+        if value is not None:
+            segment.append((x, to_y(value)))
+            current = panel
     for (x, value), run_id in zip(points, run_ids):
         if value is not None:
             parts.append(f'<circle cx="{_n(x)}" cy="{_n(to_y(value))}" r="4.5" fill="{color}" stroke="{surface}" '
                          f'stroke-width="2"><title>{escape(f"{run_id}: {name} dev mean {value:.3f}")}</title>'
                          "</circle>")
+    return parts
+
+
+def _panel_bands(xs: list[float], panels: list[str | None], theme: dict) -> list[str]:
+    """A dotted divider between runs of different panels, and each panel's name at the head of its band.
+
+    A name that would touch the name before it moves down one row.
+    """
+    parts, edges = [], [-math.inf] * PANEL_NAME_ROWS
+    for start, panel in enumerate(panels):
+        if start and panel == panels[start - 1]:
+            continue
+        left = (xs[start - 1] + xs[start]) / 2 if start else float(LEFT)
+        if start:
+            parts.append(_line(left, SCORE_TOP, left, SCORE_BOTTOM, theme["muted"], dash="2 4"))
+        name = panel or PANEL_UNKNOWN
+        row = next((row for row in range(PANEL_NAME_ROWS) if left + 6 >= edges[row] + 8), PANEL_NAME_ROWS - 1)
+        parts.append(_text(left + 6, SCORE_TOP - 6 + 14 * row, name, theme["muted"], size=10))
+        edges[row] = left + 6 + 6 * len(name)
     return parts
 
 
@@ -182,6 +208,7 @@ def render(entries: list[dict], theme_name: str) -> str:
     times = [_when(entry) for entry in entries]
     xs = _x_positions(times)
     run_ids = [entry["run_id"] for entry in entries]
+    panels = [entry.get("panel") for entry in entries]
     seed = [entry.get("seed_dev_mean") for entry in entries]
     best = [entry.get("best_dev_mean") for entry in entries]
     deltas = [entry.get("paired_test_delta") for entry in entries]
@@ -198,8 +225,9 @@ def render(entries: list[dict], theme_name: str) -> str:
     body += _y_axis(score_ticks, to_score, theme)
     body += [_line(LEFT, to_score(1.0), WIDTH - RIGHT, to_score(1.0), theme["muted"], width=1.5, dash="4 4"),
              _text(LEFT + 6, to_score(1.0) - 6, "parity 1.0", theme["muted"], size=11)]
-    body += _series(list(zip(xs, seed)), to_score, theme["seed"], theme["surface"], "seed", run_ids)
-    body += _series(list(zip(xs, best)), to_score, theme["winner"], theme["surface"], "winner", run_ids)
+    body += _panel_bands(xs, panels, theme)
+    body += _series(list(zip(xs, seed)), panels, to_score, theme["seed"], theme["surface"], "seed", run_ids)
+    body += _series(list(zip(xs, best)), panels, to_score, theme["winner"], theme["surface"], "winner", run_ids)
     for x, entry, seed_value, best_value in zip(xs, entries, seed, best):
         anchor = best_value if best_value is not None else seed_value
         if entry.get("outcome") == "pr_opened" and anchor is not None:

@@ -219,7 +219,9 @@ Source: [.hallouminate/wiki/benchmark-gepa-v3-evolve.md](.hallouminate/wiki/benc
 
 The chart shows the evolve runs over time. Each run scores tilth candidates against the built-in-tools baseline.
 A score of 1.0 is cost-per-correct parity with the baseline. A score above 1.0 is cheaper per correct answer.
-The evolve loop is a GEPA search over tilth commits, which change prompt texts and `src/**`. See [benchmark/evolve/README.md](benchmark/evolve/README.md).
+Scores from different task panels do not compare, so a divider separates the panels and no line joins them.
+Each evolve run adds one entry to [benchmark/log/evolve.jsonl](benchmark/log/evolve.jsonl) and redraws the chart.
+The evolve loop is a GEPA search over tilth commits, which change prompt texts and `src/**`. See [benchmark/evolve/README.md](benchmark/evolve/README.md#benchmark-log).
 
 ## Relationship to upstream
 

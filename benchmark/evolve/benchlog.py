@@ -153,7 +153,7 @@ def entry_from_run_dir(run_dir: Path, *, recorded_at: datetime) -> dict:
         "recorded_at": _utc(recorded_at),
         "seed_sha": seed.group(1) if seed else None,
         "tilth_version": _unique(rows, "tilth_version", "tilth_forced"),
-        "panel": header.get("panel"),
+        "panel": header.get("panel", _unique(rows, "panel_name")),
         "model": header.get("model", _unique(rows, "model_alias")),
         "preamble": header.get("preamble"),
         "stop_reason": stop.group(1) if stop else None,
