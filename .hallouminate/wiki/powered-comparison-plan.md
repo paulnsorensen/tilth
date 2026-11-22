@@ -4,6 +4,7 @@ The ship gate that replaces evolve rounds (goal `powered-comparison` of the [til
 The user approved 24 tasks × 3 reps on 2026-11-08: it detects a 15% cost-per-cell difference with 80% power for about $83 (cap $100).
 A 10% target needs about 48 tasks × 5 reps ($276), so the roadmap goal now records the 15% target.
 **Verdict (2026-11-09): parity within 15%.** Tilth's mean per-task cost delta is +5.1% (95% CI −3.3% to +14.9%) and the accuracy guard does not block (66/72 against 70/72, p = 0.275).
+**Re-run (2026-11-22, goal 7): parity within 15% again, on 23 tasks.** The mean per-task cost delta is +0.1% (95% CI −7.7% to +8.3%). The accuracy guard does not block (61/69 against 67/69, p = 0.097), but accuracy is now the open risk. See [Goal 7](#goal-7-2026-11-22-re-run-after-the-hill-climb-levers).
 
 ## Design
 
@@ -55,6 +56,25 @@ The user chose a hill-climb loop after this verdict: one lever per iteration, a 
 - ripgrep-2209 (+58%): consistent across reps ($0.125 against $0.079). The tilth agents ran extra verification (full `cargo test --all`, `git stash` reruns, a scratch fixture through `cargo run`), with 11–13 API calls against 7–9. File creation per cell is equal across arms (0.44 tilth, 0.47 baseline), so the instruction that tells agents to write scripts with `tilth_write` does not explain it.
 - Replay as a lab metric: `replay_cell` on a Rust external task admits it through `external.resolve_task`, which runs its grading build in `/tmp/tilth-external-grade-*` (several GB each). Use local fixture tasks for free replay metrics.
 
+## Goal 7 (2026-11-22): re-run after the hill-climb levers
+
+The candidate `85f9f861` is main `75be91cf` (after #456–#460) plus #462 and #463. The run planned 138 cells on 23 tasks. 120 cells ran fresh, and 18 baseline cells were reused. The charge was $60.31 (budget `goal7-powered`). The rows are in `benchmark/results/goal7-powered.jsonl` (local, untracked).
+
+| Measure | goal 6, same 23 tasks | goal 7 | Rule outcome (goal 7) |
+|---|---|---|---|
+| Mean per-task cost-per-cell delta | +2.8%, 95% CI [−4.8%, +11.7%] | +0.1%, 95% CI [−7.7%, +8.3%] | parity within 15% |
+| Accuracy (pooled) | tilth 63/69, baseline 67/69; Fisher p = 0.274 | tilth 61/69, baseline 67/69; −8.7%, Newcombe 95% [−18.6%, +0.3%], Fisher p = 0.097 | does not block |
+| Mean cost per cell | tilth $0.443, baseline $0.436 | tilth $0.449, baseline $0.443 | — |
+| Failed-call waste per tilth cell | $0.022 (24 tasks) | $0.013 | — |
+
+- `burntsushi__ripgrep-2209` is not in the run. Cargo 1.100 (2026-11-05) runs test executables from a new build-dir path, so ripgrep 13 tests do not find `rg` and the gold patch grades 0/1. #464 sets the Cargo opt-out variable, and the task is admitted again (gold 1/1). The goal 6 column omits the same task. With all 24 tasks, goal 6 gives +5.1%.
+- The cost point estimate fell from +2.8% to +0.1% on the same tasks. Both CIs contain 0, so this is not a measured effect of the levers.
+- Tilth misses 8 cells: `sharkdp__bat-2650` 3 (all at the cell timeout, as in goal 6), `tokio-4867` 2, and one each in `coreutils-6682`, `vuejs__core-11739`, and `axum-1730`. The baseline misses 2: one `bat-2650` timeout and one `tokio-4867`. Except for the timeouts, every miss is a wrong patch that passes all PASS_TO_PASS tests. No miss shows an edit-tool error, and the failed `axum-1730` cell used only tagged edits.
+- The guard does not block, but its p value fell from 0.27 to 0.10. `bat-2650` (tilth 0/3 in both runs) is the largest single cause. Start the next work there, not on cost.
+- Failed calls waste $0.013 per tilth cell, against $0.022 in goal 6, and $0.017 per baseline cell (goal 6: $0.016). Hook-denied Bash is still the largest class: 43 in 69 tilth cells, and most are recursive `grep`.
+- Setup: the Rust toolchain changed after goal 6, so the stored baseline rows carry another `env_fingerprint`. A paid run refuses them until `--refreeze-baselines` re-runs them. The dry run does not show this refusal.
+- The statistics come from `verdict.py` in the session scratchpad. It reproduces the goal 6 numbers exactly (+5.1% [−3.3%, +15.0%], p = 0.275).
+
 ## Power estimate
 
 From the stock A/B rows (18 tasks × 3 reps, `tilth_stock` against `baseline_stock`): the per-task delta spread splits into true task-to-task spread and rep noise from resampling each task's reps. Power for a true mean effect d is Φ(|d|/SE − 1.96), SE = √((σ_task² + σ_rep²·3/R)/T).
@@ -67,4 +87,4 @@ From the stock A/B rows (18 tasks × 3 reps, `tilth_stock` against `baseline_sto
 - Cost per correct is noisy because pass flips on cheap tasks swing the ratio; cost per cell is not, so more tasks help it and more reps barely do.
 - The rep noise comes from resampling only 3 observed reps per task, so it is a lower bound.
 
-_Source: `power.py` in the session scratchpad over `benchmark/results/stock-ab/rows.jsonl`; `goal6.sh` dry run (2026-11-08); the goal 6 run rows `benchmark/results/goal6-powered.jsonl` and `goal6_verdict.py` (2026-11-09) · Updated: 2026-11-09 · Supersedes: none_
+_Source: `power.py` in the session scratchpad over `benchmark/results/stock-ab/rows.jsonl`; `goal6.sh` dry run (2026-11-08); the goal 6 run rows `benchmark/results/goal6-powered.jsonl` and `goal6_verdict.py` (2026-11-09); the goal 7 rows `benchmark/results/goal7-powered.jsonl` and `verdict.py` (2026-11-22) · Updated: 2026-11-22 · Supersedes: none_
