@@ -1,6 +1,6 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="800" height="440" viewBox="0 0 800 440" role="img" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="596" viewBox="0 0 800 596" role="img" font-family="system-ui, -apple-system, 'Segoe UI', sans-serif">
 <title>tilth evolve runs: score against the built-in-tools baseline</title>
-<rect width="800" height="440" rx="8" fill="#1a1a19"/>
+<rect width="800" height="596" rx="8" fill="#1a1a19"/>
 <text x="16.0" y="26.0" fill="#f0efec" font-size="15" text-anchor="start" font-weight="600">tilth evolve runs: score against the built-in-tools baseline</text>
 <line x1="16.0" y1="46.0" x2="34.0" y2="46.0" stroke="#d95926" stroke-width="2"/>
 <circle cx="25.0" cy="46" r="4.5" fill="#d95926" stroke="#1a1a19" stroke-width="2"/>
@@ -26,11 +26,11 @@
 <text x="48.0" y="76.0" fill="#a3a199" font-size="11" text-anchor="end" font-weight="normal">1.25</text>
 <line x1="56.0" y1="110.0" x2="712.0" y2="110.0" stroke="#a3a199" stroke-width="1.5" stroke-dasharray="4 4"/>
 <text x="62.0" y="104.0" fill="#a3a199" font-size="11" text-anchor="start" font-weight="normal">parity 1.0</text>
-<text x="62.0" y="66.0" fill="#a3a199" font-size="10" text-anchor="start" font-weight="normal">gepa-v1</text>
+<text x="62.0" y="66.0" fill="#a3a199" font-size="10" text-anchor="start" font-weight="normal">gepa-v1 · claude-sonnet-5-5</text>
 <line x1="358.9" y1="72.0" x2="358.9" y2="262.0" stroke="#a3a199" stroke-width="1" stroke-dasharray="2 4"/>
-<text x="364.9" y="66.0" fill="#a3a199" font-size="10" text-anchor="start" font-weight="normal">gepa-v3-long-2</text>
+<text x="364.9" y="66.0" fill="#a3a199" font-size="10" text-anchor="start" font-weight="normal">gepa-v3-long-2 · claude-sonnet-5-5</text>
 <line x1="503.6" y1="72.0" x2="503.6" y2="262.0" stroke="#a3a199" stroke-width="1" stroke-dasharray="2 4"/>
-<text x="509.6" y="66.0" fill="#a3a199" font-size="10" text-anchor="start" font-weight="normal">gepa-v3-long-3</text>
+<text x="509.6" y="80.0" fill="#a3a199" font-size="10" text-anchor="start" font-weight="normal">gepa-v3-long-3 · claude-sonnet-5-5</text>
 <polyline fill="none" stroke="#d95926" stroke-width="2" stroke-linejoin="round" points="514.1,131.6 688.0,124.4"/>
 <circle cx="96.6" cy="211.4" r="4.5" fill="#d95926" stroke="#1a1a19" stroke-width="2"><title>sonnet-r7b-finish: seed dev mean 0.333</title></circle>
 <circle cx="224.7" cy="211.4" r="4.5" fill="#d95926" stroke="#1a1a19" stroke-width="2"><title>sonnet-r8b: seed dev mean 0.333</title></circle>
@@ -87,5 +87,26 @@
 <text x="384.0" y="398.0" fill="#a3a199" font-size="11" text-anchor="middle" font-weight="normal">2026-10-27</text>
 <text x="536.0" y="398.0" fill="#a3a199" font-size="11" text-anchor="middle" font-weight="normal">2026-11-01</text>
 <text x="688.0" y="398.0" fill="#a3a199" font-size="11" text-anchor="middle" font-weight="normal">2026-11-06</text>
-<text x="16.0" y="426.0" fill="#a3a199" font-size="11" text-anchor="start" font-weight="normal">Score = pass rate × baseline cost ÷ candidate cost per task, dev-split mean. Above 1.0 is cheaper per correct.</text>
+<text x="16.0" y="428.0" fill="#c3c2b7" font-size="12" text-anchor="start" font-weight="normal">Dev split per band: pass rate · cost per correct answer (USD)</text>
+<line x1="16.0" y1="436.0" x2="784.0" y2="436.0" stroke="#383835" stroke-width="1"/>
+<text x="16.0" y="454.0" fill="#a3a199" font-size="11" text-anchor="start" font-weight="normal">panel · agent model</text>
+<text x="284.0" y="454.0" fill="#f0efec" font-size="11" text-anchor="start" font-weight="600">baseline (no tilth)</text>
+<text x="450.0" y="454.0" fill="#d95926" font-size="11" text-anchor="start" font-weight="600">tilth seed</text>
+<text x="616.0" y="454.0" fill="#3987e5" font-size="11" text-anchor="start" font-weight="600">tilth winner</text>
+<text x="16.0" y="476.0" fill="#f0efec" font-size="12" text-anchor="start" font-weight="600">gepa-v1 · claude-sonnet-5-5</text>
+<text x="16.0" y="490.0" fill="#a3a199" font-size="10" text-anchor="start" font-weight="normal">run sonnet-r8b</text>
+<text x="284.0" y="476.0" fill="#f0efec" font-size="11" text-anchor="start" font-weight="normal">33% pass · $0.68/correct</text>
+<text x="450.0" y="476.0" fill="#a3a199" font-size="11" text-anchor="start" font-weight="normal">not recorded</text>
+<text x="616.0" y="476.0" fill="#a3a199" font-size="11" text-anchor="start" font-weight="normal">not recorded</text>
+<text x="16.0" y="508.0" fill="#f0efec" font-size="12" text-anchor="start" font-weight="600">gepa-v3-long-2 · claude-sonnet-5-5</text>
+<text x="16.0" y="522.0" fill="#a3a199" font-size="10" text-anchor="start" font-weight="normal">run preamble-r1</text>
+<text x="284.0" y="508.0" fill="#f0efec" font-size="11" text-anchor="start" font-weight="normal">100% pass · $0.43/correct</text>
+<text x="450.0" y="508.0" fill="#a3a199" font-size="11" text-anchor="start" font-weight="normal">not recorded</text>
+<text x="616.0" y="508.0" fill="#a3a199" font-size="11" text-anchor="start" font-weight="normal">not recorded</text>
+<text x="16.0" y="540.0" fill="#f0efec" font-size="12" text-anchor="start" font-weight="600">gepa-v3-long-3 · claude-sonnet-5-5</text>
+<text x="16.0" y="554.0" fill="#a3a199" font-size="10" text-anchor="start" font-weight="normal">run tools-sonnet-r1</text>
+<text x="284.0" y="540.0" fill="#f0efec" font-size="11" text-anchor="start" font-weight="normal">98% pass · $0.41/correct</text>
+<text x="450.0" y="540.0" fill="#a3a199" font-size="11" text-anchor="start" font-weight="normal">not recorded</text>
+<text x="616.0" y="540.0" fill="#a3a199" font-size="11" text-anchor="start" font-weight="normal">not recorded</text>
+<text x="16.0" y="578.0" fill="#a3a199" font-size="11" text-anchor="start" font-weight="normal">Score = pass rate × baseline cost ÷ candidate cost per task, dev-split mean. Above 1.0 is cheaper per correct.</text>
 </svg>
