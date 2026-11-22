@@ -16,7 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import run
 from evolve import benchlog, chart, engine
-from evolve.loop import Evolution
+from evolve.gitops import GitError
+from evolve.loop import EvolveError, Evolution
 from evolve_support import (DEV, TEST, child, log_text, main, make_world, mcp, scripted_engine, seed_candidate,
                             seed_files)
 
@@ -51,6 +52,17 @@ def parses_as_svg(path: Path) -> bytes:
     return data
 
 
+def run_entry(world, run_id: str = "run1") -> dict:
+    """The entry that the run wrote to its own run directory."""
+    return json.loads((run.RESULTS_DIR / "evolve" / run_id / "benchmark-entry.json").read_text())
+
+
+def assert_no_round_trip_lines(world) -> None:
+    """The run builds its entry from memory, so its log holds no line that only served a text round trip."""
+    for line in log_text(world).splitlines():
+        assert not line.startswith(("run: ", "frontier: ", "arms: ")), line
+
+
 def test_a_draft_pr_run_appends_one_entry_and_draws_both_charts(monkeypatch: pytest.MonkeyPatch,
                                                                tmp_path: Path) -> None:
     world = weak_world(monkeypatch, tmp_path)
@@ -78,8 +90,10 @@ def test_a_draft_pr_run_appends_one_entry_and_draws_both_charts(monkeypatch: pyt
     # The fixture rows carry no tilth_version, so the entry records null rather than a guess.
     assert entry["tilth_version"] is None
     light, dark = parses_as_svg(log.with_suffix(".svg")), parses_as_svg(log.with_name("evolve-dark.svg"))
-    assert light != dark and b"PR" in light
+    assert light != dark and b"<title>run1: draft PR opened</title>" in light
     assert f"benchmark log: appended run1 to {log}" in log_text(world)
+    assert run_entry(world) == entry
+    assert_no_round_trip_lines(world)
 
     # A second run appends a line, keeps the first byte for byte, and redraws both charts.
     first_line = log.read_text()
@@ -105,6 +119,8 @@ def test_a_no_improvement_run_appends_an_entry_with_no_test_split(monkeypatch: p
     assert entry["test_means"] is None and entry["paired_test_delta"] is None and entry["pass_rate_delta"] is None
     assert entry["stop_reason"] == "metric-call budget"
     assert entry["spend"] is not None
+    assert run_entry(world) == entry
+    assert_no_round_trip_lines(world)
 
 
 def test_an_incomplete_run_appends_an_entry_and_keeps_its_exit_code(monkeypatch: pytest.MonkeyPatch,
@@ -126,6 +142,66 @@ def test_an_incomplete_run_appends_an_entry_and_keeps_its_exit_code(monkeypatch:
     assert entry["outcome"] == "incomplete" and entry["stop_reason"] == "ceiling"
     assert entry["pr_url"] is None and entry["paired_test_delta"] is None
 
+    assert run_entry(world) == entry
+
+
+def raise_git_error(*_args, **_kwargs):
+    raise GitError(["push"], "rejected")
+
+
+def raise_gh_error(*_args, **_kwargs):
+    raise subprocess.CalledProcessError(1, ["gh", "pr", "create"], stderr="gh: no network")
+
+
+def broken_search(_self):
+    raise EvolveError("the seed is not on the accepted frontier")
+
+
+@pytest.mark.parametrize(("fault", "outcome"), [("push", "refused"), ("create", "pr_failed"), ("run", "failed")])
+def test_a_finish_fault_records_its_outcome_kind(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, fault: str,
+                                                outcome: str) -> None:
+    world = weak_world(monkeypatch, tmp_path)
+    use_engine(monkeypatch, [winning_child()])
+    if fault == "push":
+        monkeypatch.setattr(world.pr, "push", raise_git_error)
+    elif fault == "create":
+        monkeypatch.setattr(world.pr, "create_draft", raise_gh_error)
+    else:
+        monkeypatch.setattr(Evolution, "search", broken_search)
+    log = tmp_path / "evolve.jsonl"
+
+    assert main(world, "--benchmark-log", str(log)) == 1
+
+    [entry] = entries(log)
+    assert run_entry(world) == entry
+    assert entry["outcome"] == outcome and entry["pr_url"] is None
+    assert_no_round_trip_lines(world)
+    if fault == "run":
+        assert entry["test_means"] is None and entry["paired_test_delta"] is None and entry["best_cid"] is None
+    else:
+        assert entry["paired_test_delta"] == {"point": 1.0, "low": 1.0, "high": 1.0, "tasks": 1}
+        assert entry["pass_rate_delta"] == 1.0 and len(entry["test_means"]) == 2
+
+
+def test_the_entry_records_the_version_that_the_seed_build_reports(monkeypatch: pytest.MonkeyPatch,
+                                                                   tmp_path: Path) -> None:
+    world = weak_world(monkeypatch, tmp_path)
+    use_engine(monkeypatch, [winning_child()])
+
+    def versioned(task_name, mode_name, model_name, repetition, **kwargs):
+        row = world.fake_run_single(task_name, mode_name, model_name, repetition, **kwargs)
+        sha = run.MODES[mode_name].git_sha
+        return {**row, "tilth_version": f"0.0.0-experimental+{sha[:7]}"} if sha else row
+
+    monkeypatch.setattr(run, "run_single", versioned)
+    log = tmp_path / "evolve.jsonl"
+
+    assert main(world, "--benchmark-log", str(log)) == 0
+
+    # Each candidate build reports its own commit; the entry keeps the seed's, with its build suffix.
+    [entry] = entries(log)
+    assert entry["outcome"] == "pr_opened"
+    assert entry["tilth_version"] == f"0.0.0-experimental+{world.seed_sha[:7]}"
 
 @pytest.mark.parametrize("failing", ["log", "chart"])
 def test_a_log_or_chart_failure_keeps_the_exit_code_and_the_finish_result(monkeypatch: pytest.MonkeyPatch,
@@ -152,86 +228,6 @@ def test_a_log_or_chart_failure_keeps_the_exit_code_and_the_finish_result(monkey
     [failure] = [line for line in text.splitlines() if line.startswith("benchmark log: ")]
     assert failure.startswith(f"benchmark log: {'append' if failing == 'log' else 'redraw'} failed (")
     assert text.rstrip().splitlines()[-1] == failure
-
-
-def test_import_builds_the_same_entry_from_a_run_directory(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    world = weak_world(monkeypatch, tmp_path)
-    use_engine(monkeypatch, [winning_child()])
-    live = tmp_path / "live.jsonl"
-    assert main(world, "--benchmark-log", str(live)) == 0
-    imported = tmp_path / "imported" / "evolve.jsonl"
-    run_dir = run.RESULTS_DIR / "evolve" / "run1"
-
-    assert benchlog.main(["import", str(run_dir), "--log", str(imported)]) == 0
-    assert benchlog.main(["import", str(run_dir), "--log", str(imported)]) == 0  # a known run id is skipped
-
-    [live_entry], [import_entry] = entries(live), entries(imported)
-    assert {**import_entry, "recorded_at": None} == {**live_entry, "recorded_at": None}
-    parses_as_svg(imported.with_suffix(".svg"))
-
-
-def test_import_skips_a_directory_without_a_run_log(tmp_path: Path) -> None:
-    log = tmp_path / "evolve.jsonl"
-    (tmp_path / "empty-run").mkdir()
-
-    assert benchlog.main(["import", str(tmp_path / "empty-run"), "--log", str(log)]) == 0
-    assert log.read_text() == ""
-
-
-OLD_LOG = """\
-refused: baselines: stored baseline rows were recorded under different key inputs
-reserve: $34.2300 held for finish (per finalist $17.1150)
-candidate 9708a2d9ca75: accepted (dev mean 0.333, frontier 1)
-search: ended (metric-call budget)
-finish: finalists fcb7eb780569 (dev mean 0.467), 9708a2d9ca75 (dev mean 0.333)
-finish: test-split means fcb7eb780569=0.667, 9708a2d9ca75=0.333
-finish: paired test delta +0.250 (95% CI [0.100, 0.400], 3 tasks); test pass rate delta +0.333
-finish: draft PR opened from evolve/old-winner: {'url': 'https://github.com/o/r/pull/356', 'head': 'x'}
-spend: total=$28.8068 of $150.00
-"""
-
-
-def test_an_old_log_uses_its_finalists_line_and_old_spend_form(tmp_path: Path) -> None:
-    run_dir = tmp_path / "old-run"
-    run_dir.mkdir()
-    (run_dir / "log.txt").write_text(OLD_LOG)
-    rows = [{"mode": "tilth_forced", "tilth_version": "tilth 0.8.4", "model_alias": "sonnet"},
-            {"mode": "baseline", "tilth_version": None, "model_alias": "sonnet"}]
-    (run_dir / "rows.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
-    refused = tmp_path / "refused-run"
-    refused.mkdir()
-    (refused / "log.txt").write_text("refused: baselines: drift\n")
-    log = tmp_path / "evolve.jsonl"
-
-    assert benchlog.main(["import", str(run_dir), str(refused), "--log", str(log)]) == 0
-
-    [entry] = entries(log)
-    assert entry["run_id"] == "old-run" and entry["seed_sha"] is None
-    assert entry["panel"] is None and entry["preamble"] is None and entry["model"] == "sonnet"
-    assert entry["tilth_version"] == "tilth 0.8.4"
-    assert entry["seed_dev_mean"] == 0.333 and entry["best_dev_mean"] == 0.467
-    assert entry["best_cid"] == "fcb7eb780569"
-    assert entry["test_means"] == {"fcb7eb780569": 0.667, "9708a2d9ca75": 0.333}
-    assert entry["paired_test_delta"] == {"point": 0.25, "low": 0.1, "high": 0.4, "tasks": 3}
-    assert entry["pass_rate_delta"] == 0.333
-    assert entry["spend"] == {"total": 28.8068, "max_usd": 150.0}
-    assert entry["outcome"] == "pr_opened" and entry["pr_url"] == "https://github.com/o/r/pull/356"
-    assert entry["stop_reason"] == "metric-call budget"
-
-
-def test_an_old_log_takes_its_panel_from_the_stored_rows(tmp_path: Path) -> None:
-    run_dir = tmp_path / "old-run"
-    run_dir.mkdir()
-    (run_dir / "log.txt").write_text(OLD_LOG)
-    rows = [{"mode": "tilth_forced", "panel_name": "gepa-v1", "model_alias": "sonnet"},
-            {"mode": "baseline", "panel_name": "gepa-v1", "model_alias": "sonnet"}]
-    (run_dir / "rows.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
-    log = tmp_path / "evolve.jsonl"
-
-    assert benchlog.main(["import", str(run_dir), "--log", str(log)]) == 0
-
-    [entry] = entries(log)
-    assert entry["panel"] == "gepa-v1"
 
 
 def sample_entry(run_id: str, recorded_at: str, **fields) -> dict:
@@ -378,7 +374,7 @@ def test_a_draft_pr_run_records_baseline_seed_and_best_arms(monkeypatch: pytest.
     assert arms["dev"]["baseline"]["pass_rate"] == 0.75 and arms["dev"]["baseline"]["cells"] == 4
     assert arms["dev"]["seed"]["cost_per_correct_usd"] is None and arms["test"]["best"]["pass_rate"] == 1.0
     assert arms["test"]["baseline"]["cost_per_correct_usd"] == pytest.approx(0.6)
-    assert any(line.startswith(benchlog.ARMS_PREFIX) for line in log_text(world).splitlines())
+    assert_no_round_trip_lines(world)
     # The fixture rows carry no resolved model, so the entry records null rather than a guess.
     assert entry["model_id"] is None
 
@@ -395,118 +391,6 @@ def test_a_no_improvement_run_records_dev_arms_and_no_test_arms(monkeypatch: pyt
     assert entry["arms"]["test"] is None and entry["arms"]["dev"]["best"] is None
     assert_arm(entry["arms"]["dev"]["baseline"], expected_arm(world, DEV, "baseline", lambda sha: True))
     assert_arm(entry["arms"]["dev"]["seed"], expected_arm(world, DEV, "tilth_forced", lambda sha: True))
-
-
-def old_run_dir(tmp_path: Path, name: str, rows: list[dict]) -> Path:
-    run_dir = tmp_path / name
-    run_dir.mkdir()
-    (run_dir / "log.txt").write_text(OLD_LOG)
-    (run_dir / "rows.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
-    return run_dir
-
-
-def stored_row(mode: str, split: str, task: str, rep: int, correct: bool, cost: float, **fields) -> dict:
-    return {"mode": mode, "panel_split": split, "task": task, "repetition": rep, "correct": correct,
-            "contaminated": False, "total_cost_usd": cost, "model_alias": "sonnet",
-            "resolved_model": "claude-sonnet-5-5", **fields}
-
-
-def test_an_old_run_takes_its_baseline_arms_and_model_id_from_the_stored_rows(tmp_path: Path) -> None:
-    rows = [
-        stored_row("baseline", "dev", "d1", 0, False, 9.0),  # a retried cell: the later row replaces it
-        stored_row("baseline", "dev", "d1", 0, True, 0.2),
-        stored_row("baseline", "dev", "d1", 1, False, 0.4),
-        stored_row("baseline", "dev", "d2", 0, True, 0.6),
-        stored_row("baseline", "dev", "d2", 0, True, 0.6),  # a store-only plan writes a reused row again
-        stored_row("baseline", "test", "t1", 0, False, 0.5),
-        stored_row("baseline", "cheap", "c1", 0, True, 0.1),
-        stored_row("tilth_forced", "dev", "d1", 0, True, 0.1),
-        stored_row("tilth_forced", "test", "t1", 0, True, 0.1, resolved_model=None),
-    ]
-    log = tmp_path / "evolve.jsonl"
-
-    assert benchlog.main(["import", str(old_run_dir(tmp_path, "old-run", rows)), "--log", str(log)]) == 0
-
-    [entry] = entries(log)
-    assert entry["model"] == "sonnet" and entry["model_id"] == "claude-sonnet-5-5"
-    dev, test = entry["arms"]["dev"], entry["arms"]["test"]
-    assert_arm(dev["baseline"], {"pass_rate": 2 / 3, "mean_cost_usd": 1.2 / 3, "cost_per_correct_usd": 0.6,
-                                 "cells": 3})
-    # The log has a test-split means line, so finish compared the finalists; no correct cell gives no cost per correct.
-    assert_arm(test["baseline"], {"pass_rate": 0.0, "mean_cost_usd": 0.5, "cost_per_correct_usd": None, "cells": 1})
-    # The rows do not name the candidate of a tilth row, so an old run records no seed or best arm.
-    assert dev["seed"] is dev["best"] is test["seed"] is test["best"] is None
-
-
-def test_an_old_run_takes_its_seed_and_best_arms_from_rows_of_exact_commits(tmp_path: Path) -> None:
-    seed, best, other = "a" * 40, "b" * 40, "c" * 40
-    rows = [stored_row("baseline", "dev", "d1", 0, True, 0.2),
-            stored_row("tilth_forced", "dev", "d1", 0, False, 0.3, git_sha=seed),
-            stored_row("tilth_forced", "dev", "d1", 0, True, 0.3, git_sha=seed),  # a retry: the later row wins
-            stored_row("tilth_forced", "dev", "d1", 0, True, 0.1, git_sha=best),
-            stored_row("tilth_forced", "dev", "d1", 0, False, 0.9, git_sha=other),  # not a finalist
-            stored_row("tilth_forced", "test", "t1", 0, False, 0.4, git_sha=seed),
-            stored_row("tilth_forced", "test", "t1", 0, True, 0.2, git_sha=best)]
-    with_seed = old_run_dir(tmp_path, "seeded-run", rows)
-    (with_seed / "log.txt").write_text(f"run seed: {seed}\n" + OLD_LOG)
-    unseeded = old_run_dir(tmp_path, "unseeded-run", rows)
-    log = tmp_path / "evolve.jsonl"
-
-    assert benchlog.main(["import", str(with_seed), str(unseeded), "--log", str(log)]) == 0
-
-    found = {entry["run_id"]: entry["arms"] for entry in entries(log)}
-    arms = found["seeded-run"]
-    assert arms["dev"]["seed"] == {"pass_rate": 1.0, "mean_cost_usd": 0.3, "cost_per_correct_usd": 0.3, "cells": 1}
-    assert arms["dev"]["best"] == {"pass_rate": 1.0, "mean_cost_usd": 0.1, "cost_per_correct_usd": 0.1, "cells": 1}
-    assert arms["test"]["seed"]["pass_rate"] == 0.0 and arms["test"]["best"]["pass_rate"] == 1.0
-    # Without a seed line or a ref, the two commits with test rows do not say which one is the seed.
-    assert all(found["unseeded-run"][split][name] is None for split in ("dev", "test") for name in ("seed", "best"))
-
-
-def test_an_old_run_resolves_its_finalists_through_their_refs(tmp_path: Path) -> None:
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    git_env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
-               "GIT_COMMITTER_EMAIL": "t@t"}
-
-    def git(*args: str) -> str:
-        return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True,
-                              env=git_env).stdout.strip()
-
-    git("init", "-q")
-    shas = []
-    for name in ("seed", "winner"):
-        git("commit", "-q", "--allow-empty", "-m", name)
-        shas.append(git("rev-parse", "HEAD"))
-    seed, best = shas
-    # OLD_LOG names fcb7eb780569 as the winner finalist and 9708a2d9ca75 as the seed finalist.
-    git("update-ref", "refs/evolve/old-run/fcb7eb780569", best)
-    git("update-ref", "refs/evolve/old-run/9708a2d9ca75", seed)
-    rows = [stored_row("tilth_forced", "dev", "d1", 0, True, 0.3, git_sha=seed),
-            stored_row("tilth_forced", "dev", "d1", 0, False, 0.1, git_sha=best)]
-    run_dir = repo / "old-run"
-    run_dir.mkdir()
-    (run_dir / "log.txt").write_text(OLD_LOG)
-    (run_dir / "rows.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
-    log = tmp_path / "evolve.jsonl"
-
-    assert benchlog.main(["import", str(run_dir), "--log", str(log)]) == 0
-
-    [entry] = entries(log)
-    assert entry["arms"]["dev"]["seed"]["pass_rate"] == 1.0 and entry["arms"]["dev"]["best"]["pass_rate"] == 0.0
-
-
-def test_import_skips_a_run_that_is_not_sonnet(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    haiku = old_run_dir(tmp_path, "haiku-run", [stored_row("baseline", "dev", "d1", 0, True, 0.2,
-                                                           model_alias="haiku")])
-    sonnet = old_run_dir(tmp_path, "sonnet-run", [stored_row("baseline", "dev", "d1", 0, True, 0.2)])
-    log = tmp_path / "evolve.jsonl"
-
-    assert benchlog.main(["import", str(haiku), str(sonnet), "--log", str(log)]) == 0
-
-    assert [entry["run_id"] for entry in entries(log)] == ["sonnet-run"]
-    skips = [line for line in capsys.readouterr().err.splitlines() if "haiku-run" in line]
-    assert len(skips) == 1 and "not a Sonnet model" in skips[0]
 
 
 def arm(pass_rate: float, cost_per_correct: float | None) -> dict:

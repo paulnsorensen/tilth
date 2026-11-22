@@ -358,6 +358,12 @@ def _cell_of(row: Mapping) -> tuple[str, str, int]:
     return row["task"], row["mode"], row["repetition"]
 
 
+def _one(rows: Iterable[Mapping], key: str) -> object:
+    """The one non-null value of ``key`` over ``rows``; None when the rows hold none or several."""
+    values = {row.get(key) for row in rows} - {None}
+    return values.pop() if len(values) == 1 else None
+
+
 class Evolution:
     def __init__(self, settings: Settings, *, panel: panels.Panel, ledger: SpendLedger, judge_: judge.Judge,
                  seed: dict[str, str], pr_client: PRClient, just_check: Callable[[Path], tuple[bool, str]],
@@ -376,7 +382,6 @@ class Evolution:
         self.log_path = self.run_dir / "log.txt"
         # A later run's --avoid-failures-from reads this line: its gate verdicts hold only on this seed.
         self.log(seed_line(settings.seed_sha))
-        self.log(benchlog.run_line(panel.name, settings.model, settings.preamble))
         # Gate failures from prior runs and from this run's own log (a resume) are known before the first proposal.
         self.failed = FailedPatches()
         for prior in (*settings.avoid_failures_from, self.run_dir):
@@ -435,6 +440,10 @@ class Evolution:
         self.best: float | None = None
         self.unimproved = 0
         self.finish_failure: str | None = None
+        # The benchmark log entry's finish result; ``finish`` fills it where it logs the same values.
+        self.result: dict = {"outcome": None, "test_means": None, "paired_test_delta": None,
+                             "pass_rate_delta": None, "pr_url": None}
+        self.search_end: str | None = None
 
     # --- plumbing ---
 
@@ -753,7 +762,8 @@ class Evolution:
         found = engine.optimize(self.seed, evaluator=self.evaluate, dataset=self.panel.dev,
                                 max_metric_calls=self.settings.max_metric_calls, stop=self.stop,
                                 proposer=self.dispatcher, selector=self.selector)
-        self.log(f"search: ended ({self.stop.reason or 'metric-call budget'})")
+        self.search_end = self.stop.reason or "metric-call budget"
+        self.log(f"search: ended ({self.search_end})")
         return found
 
     def evaluate(self, candidate: dict[str, str], example: str) -> tuple[float, dict]:
@@ -1184,10 +1194,20 @@ class Evolution:
 
     # --- finish ---
 
-    def _finish_failed(self, line: str) -> None:
+    def _finish_failed(self, outcome: str, line: str) -> None:
         """Log why finish opened no PR when it should have tried; the run then exits nonzero."""
         self.finish_failure = line
+        self.result["outcome"] = outcome
         self.log(line)
+
+    def _no_improvement(self, line: str) -> None:
+        self.result["outcome"] = "no_improvement"
+        self.log(line)
+
+    def _ranked_nonseed(self) -> list[Cascade]:
+        """The accepted non-seed candidates, best dev mean first; the earlier candidate wins a tie."""
+        return sorted((member for member in self.frontier if member.cid != self.seed_id),
+                      key=lambda member: (-member.dev_mean, member.seq))
 
     def finish(self):
         """Pick the best-dev non-seed candidate, confirm it against the seed on the test split, and open a draft PR.
@@ -1195,27 +1215,26 @@ class Evolution:
         The dev mean selects the winner; the seed wins a tie. The test split scores only the seed and that
         winner. The winner must beat the seed on the paired, task-level 95% bootstrap interval: the per-task
         score differences (winner minus seed, over each task's reps) need a lower bound above 0, and the
-        winner's aggregate test pass rate must not fall below the seed's.
+        winner's aggregate test pass rate must not fall below the seed's. Every return path sets the outcome in
+        ``self.result``.
         """
         self.ledger.reserve = 0.0
         no_spend = self.stop.reason in NO_SPEND_REASONS
         seed = self.new_cascade(self.seed)
         if seed.sha is None:
             seed.sha = self.settings.seed_sha
-        nonseed = sorted((member for member in self.frontier if member.cid != self.seed_id),
-                         key=lambda member: (-member.dev_mean, member.seq))
+        nonseed = self._ranked_nonseed()
         if not nonseed:
             if self.stop.is_set and self.stop.reason != "plateau":
-                return self._finish_failed(f"finish: incomplete ({self.stop.reason}); the search accepted no candidate")
-            self.log("finish: no improvement (no non-seed candidate on the frontier)")
-            return None
+                return self._finish_failed("incomplete", f"finish: incomplete ({self.stop.reason}); the search "
+                                           "accepted no candidate")
+            return self._no_improvement("finish: no improvement (no non-seed candidate on the frontier)")
         winner = nonseed[0]
         if winner.dev_mean <= seed.dev_mean:
             if self.stop.is_set and self.stop.reason != "plateau":
-                return self._finish_failed(f"finish: incomplete ({self.stop.reason}); no accepted candidate beats "
-                                           "the seed's dev mean")
-            self.log("finish: no improvement (no candidate beats the seed's dev mean)")
-            return None
+                return self._finish_failed("incomplete", f"finish: incomplete ({self.stop.reason}); no accepted "
+                                           "candidate beats the seed's dev mean")
+            return self._no_improvement("finish: no improvement (no candidate beats the seed's dev mean)")
         finalists = [winner, seed]
         self.log("finish: finalists " + ", ".join(f"{member.cid[:12]} (dev mean {member.dev_mean:.3f})"
                                                   for member in finalists))
@@ -1227,15 +1246,15 @@ class Evolution:
                          for member in finalists}
         except _Stopped as stopped:
             # The reason this finish stopped, which may be a ceiling or quota after an earlier plateau.
-            return self._finish_failed(f"finish: incomplete ({stopped})")
+            return self._finish_failed("incomplete", f"finish: incomplete ({stopped})")
         except run.BaselineDrift as error:
-            return self._finish_failed(f"finish: incomplete (baseline drift: {error})")
+            return self._finish_failed("incomplete", f"finish: incomplete (baseline drift: {error})")
         except run.CandidateBuildFailed as error:
-            return self._finish_failed(f"finish: incomplete (build failed)\n{tail(str(error))}")
+            return self._finish_failed("incomplete", f"finish: incomplete (build failed)\n{tail(str(error))}")
         expected = len(self.panel.test) * len(reps)
         if no_spend and any(len(test_rows[member.cid]) < expected for member in finalists):
-            return self._finish_failed(f"finish: incomplete ({self.stop.reason}); stored test-split scores: "
-                                       f"{_means_line(finalists, test_rows)}")
+            return self._finish_failed("incomplete", f"finish: incomplete ({self.stop.reason}); stored test-split "
+                                       f"scores: {_means_line(finalists, test_rows)}")
         arms = {"baseline": baseline_rows, **{member.cid[:12]: test_rows[member.cid] for member in finalists}}
         dropped = _incomplete_cells(arms, self.panel.test, reps)
         kept = [task for task in self.panel.test if task not in dropped]
@@ -1245,7 +1264,7 @@ class Evolution:
                      + ", ".join(f"{task}/{cell}" for task, cells in dropped.items() for cell in cells))
         if not kept:
             unfinished = sorted({cell.split("/")[0] for cells in dropped.values() for cell in cells})
-            return self._finish_failed(f"finish: incomplete (test-split cells did not complete for "
+            return self._finish_failed("incomplete", f"finish: incomplete (test-split cells did not complete for "
                                        f"{', '.join(unfinished)}); no test task has complete paired rows; "
                                        f"test-split means not compared: {_means_line(finalists, test_rows)}")
         # Paired: every finalist and the baseline are scored on the same test tasks, each with all its reps.
@@ -1254,33 +1273,36 @@ class Evolution:
         test_means = {cid: mean(correct(row) for row in rows) for cid, rows in test_rows.items()}
         scores = _means_line(finalists, test_rows)
         self.log(f"finish: test-split means {scores}")
+        # The entry keeps the precision of the logged line.
+        self.result["test_means"] = {member.cid[:12]: round(test_means[member.cid], 3) for member in finalists}
         self.test_arm_rows = {"baseline": baseline_rows, "seed": test_rows[seed.cid], "best": test_rows[winner.cid]}
         test_base = _baseline_costs(baseline_rows, kept)
         deltas = _paired_score_deltas(test_rows[winner.cid], test_rows[seed.cid], kept, test_base)
         if not deltas:
-            self.log("finish: no improvement (no test task has paired winner and seed rows)")
-            return None
+            return self._no_improvement("finish: no improvement (no test task has paired winner and seed rows)")
         point = sum(deltas) / len(deltas)
         low, high = stats.paired_bootstrap_ci(deltas, n_resamples=10_000, seed=0)
         pass_delta = test_means[winner.cid] - test_means[seed.cid]
+        self.result["paired_test_delta"] = {"point": round(point, 3), "low": round(low, 3), "high": round(high, 3),
+                                            "tasks": len(deltas)}
+        self.result["pass_rate_delta"] = round(pass_delta, 3)
         dropped_note = f"; dropped incomplete: {', '.join(dropped)}" if dropped else ""
         paired_line = (f"paired test delta {point:+.3f} (95% CI [{low:.3f}, {high:.3f}], {len(deltas)} tasks"
                        f"{dropped_note})")
         pass_line = f"test pass rate delta {pass_delta:+.3f}"
         self.log(f"finish: {paired_line}; {pass_line}")
         if not low > 0:
-            self.log("finish: no improvement (the paired test-split interval does not exclude 0)")
-            return None
+            return self._no_improvement("finish: no improvement (the paired test-split interval does not exclude 0)")
         if test_means[winner.cid] < test_means[seed.cid]:
-            self.log("finish: no improvement (the winner's test pass rate is below the seed's)")
-            return None
+            return self._no_improvement("finish: no improvement (the winner's test pass rate is below the seed's)")
         if not winner.just_check_ok:
-            return self._finish_failed(f"finish: refused; winner {winner.cid[:12]} has no just check pass "
-                                       "in its cascade record")
+            return self._finish_failed("refused", f"finish: refused; winner {winner.cid[:12]} has no just check "
+                                       "pass in its cascade record")
         changed = git("diff", "--name-only", "--no-renames", self.settings.seed_sha, winner.sha,
                       cwd=self.settings.repo).split()
         if outside := outside_allowlist(changed):
-            return self._finish_failed(f"finish: refused; winner {winner.cid[:12]} changes {', '.join(outside)}")
+            return self._finish_failed("refused", f"finish: refused; winner {winner.cid[:12]} changes "
+                                       f"{', '.join(outside)}")
         dev_delta = winner.delta or self._dev_delta(winner)
         test_delta = self._delta_report(winner, "test", test_rows[winner.cid], baseline_rows)
         branch = f"evolve/{self.settings.run_id}-winner"
@@ -1301,16 +1323,19 @@ class Evolution:
         try:
             self.pr_client.push(winner.sha, branch)
         except GitError as error:
-            return self._finish_failed(f"finish: refused; pushing {branch} failed (it may already exist): {error}")
+            return self._finish_failed("refused", f"finish: refused; pushing {branch} failed (it may already "
+                                       f"exist): {error}")
         try:
             pr = self.pr_client.create_draft(base=self.settings.base_branch, head=branch,
                                              title=f"evolve {self.settings.run_id}: candidate {winner.cid[:12]}",
                                              body=body)
         except (subprocess.CalledProcessError, OSError) as error:
             detail = getattr(error, "stderr", None) or str(error)
-            return self._finish_failed(f"finish: pushed {branch} but opening the draft PR failed: "
+            return self._finish_failed("pr_failed", f"finish: pushed {branch} but opening the draft PR failed: "
                                        f"{tail(str(detail))}")
         self.log(f"finish: draft PR opened from {branch}: {pr}")
+        self.result["outcome"] = "pr_opened"
+        self.result["pr_url"] = pr.get("url") if isinstance(pr, Mapping) else None
         return pr
 
     # --- the whole run ---
@@ -1326,15 +1351,16 @@ class Evolution:
                 self.search()
             self.finish()
         except (GitError, OSError, EvolveError, run.CandidateBuildFailed) as error:
-            self._finish_failed(f"finish: run failed ({type(error).__name__}): {error}")
+            self._finish_failed("failed", f"finish: run failed ({type(error).__name__}): {error}")
         finally:
             self.materializer.cleanup()
-            totals = {**self.spend, "reflection": self.paid.total("reflection"),
-                      "proposer": self.paid.total("proposer")}
-            self.log("spend: " + " ".join(f"{kind}=${value:.4f}" for kind, value in totals.items())
+            self.log("spend: " + " ".join(f"{kind}=${value:.4f}" for kind, value in self._spend_totals().items())
                      + f" total=${self.ledger.spent:.4f} of ${self.settings.max_usd:.2f}")
             self._record_benchmark()
         return 1 if self.finish_failure else 0
+
+    def _spend_totals(self) -> dict[str, float]:
+        return {**self.spend, "reflection": self.paid.total("reflection"), "proposer": self.paid.total("proposer")}
 
     def _arms(self, seed: Cascade | None, best: Cascade | None) -> dict:
         """The benchmark log's arm numbers per split: the baseline, the seed, and the best accepted candidate.
@@ -1348,27 +1374,53 @@ class Evolution:
                 if self.test_arm_rows is not None else None)
         return {"dev": dev, "test": test}
 
+    def benchmark_entry(self, recorded_at: datetime) -> dict:
+        """This run's benchmark log entry, from its own state; a value the run did not reach is None."""
+        seed = self.results.get(self.seed_id)
+        seed_mean = seed.dev_mean if seed is not None and (seed.means or seed.scores) else None
+        ranked = self._ranked_nonseed()
+        best = ranked[0] if ranked else None
+        test_rows = self.test_arm_rows or {}
+        seed_rows = [*(seed.rows if seed is not None else []), *test_rows.get("seed", [])]
+        rows = [*self.baseline_plan_rows, *(row for member in self.results.values() for row in member.rows),
+                *(row for split_rows in test_rows.values() for row in split_rows)]
+        totals = {kind: round(value, 4) for kind, value in self._spend_totals().items()}
+        return {
+            "schema": benchlog.SCHEMA,
+            "run_id": self.settings.run_id,
+            "recorded_at": benchlog.utc(recorded_at),
+            "seed_sha": self.settings.seed_sha,
+            # Each build embeds its own commit, so the seed's rows give the version of the seed build.
+            "tilth_version": _one(seed_rows, "tilth_version"),
+            "panel": self.panel.name,
+            "model": self.settings.model,
+            "model_id": _one(rows, "resolved_model"),
+            "preamble": self.settings.preamble,
+            "stop_reason": self.stop.reason or self.search_end,
+            "outcome": self.result["outcome"],
+            "seed_dev_mean": seed_mean,
+            "best_cid": best.cid[:12] if best is not None else None,
+            "best_dev_mean": best.dev_mean if best is not None else None,
+            "test_means": self.result["test_means"],
+            "paired_test_delta": self.result["paired_test_delta"],
+            "pass_rate_delta": self.result["pass_rate_delta"],
+            "arms": self._arms(seed, best),
+            "spend": {**totals, "total": round(self.ledger.spent, 4), "max_usd": round(self.settings.max_usd, 2)},
+            "pr_url": self.result["pr_url"],
+        }
+
     def _record_benchmark(self) -> None:
-        """Log the frontier and the arms, then append this run's entry to the benchmark log and redraw its charts.
+        """Write this run's entry to its run directory, then append it to the benchmark log and redraw the charts.
 
         A failure writes one log line and changes nothing else: the exit code and the finish result stay.
         """
-        step = "frontier"
+        step = "entry"
         try:
-            seed = self.results.get(self.seed_id)
-            seed_mean = seed.dev_mean if seed is not None and (seed.means or seed.scores) else None
-            nonseed = sorted((member for member in self.frontier if member.cid != self.seed_id),
-                             key=lambda member: (-member.dev_mean, member.seq))
-            best = nonseed[0] if nonseed else None
-            self.log(benchlog.frontier_line(seed_mean, best.cid[:12] if best else None,
-                                            best.dev_mean if best else None))
-            step = "arms"
-            self.log(benchlog.arms_line(self._arms(seed, best)))
+            entry = self.benchmark_entry(datetime.now(timezone.utc))
+            benchlog.write_entry(self.run_dir, entry)
             path = self.settings.benchmark_log
             if path is None:
                 return
-            step = "entry"
-            entry = benchlog.entry_from_run_dir(self.run_dir, recorded_at=datetime.now(timezone.utc))
             step = "append"
             benchlog.append(path, entry)
             step = "redraw"

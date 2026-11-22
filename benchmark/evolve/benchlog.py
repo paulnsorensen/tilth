@@ -2,17 +2,13 @@
 """The append-only evolve benchmark log: one JSON entry per finished run, and its light and dark SVG charts.
 
     python3 benchmark/evolve/benchlog.py redraw [--log PATH]
-    python3 benchmark/evolve/benchlog.py import RUN_DIR [RUN_DIR ...] [--log PATH]
 
-``entry_from_run_dir`` builds an entry from a run directory's ``log.txt`` and ``rows.jsonl``. A live run and
-``import`` use it alike, so an imported entry equals the live one except ``recorded_at``. The builder reads only
-values the run logged or stored; a value the run did not reach is ``null``. The log holds Sonnet runs only.
+A run builds its entry from its own state (``loop.Evolution.benchmark_entry``) and writes it to
+``<run_dir>/benchmark-entry.json``. A value the run did not reach is ``null``. The log holds Sonnet runs only.
 """
 
 import argparse
 import json
-import re
-import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,48 +24,8 @@ SCHEMA = 2
 COMMITTED_LOG = Path(__file__).resolve().parent.parent / "log" / "evolve.jsonl"
 # The log a run appends to when --benchmark-log is absent; the test suite points it at a temp path.
 DEFAULT_LOG = COMMITTED_LOG
-
-RUN_PREFIX = "run: "
-FRONTIER_PREFIX = "frontier: "
-ARMS_PREFIX = "arms: "
-ARM_NAMES = ("baseline", "seed", "best")
-_SEED = re.compile(r"^run seed: (\S+)$")
-_STOP = re.compile(r"^stop: (.+)$")
-_SEARCH_END = re.compile(r"^search: ended \((.+)\)$")
-_MEANS = re.compile(r"^finish: test-split means (.+)$")
-_MEAN_PAIR = re.compile(r"([0-9a-f]+)=(-?\d+(?:\.\d+)?)")
-_PAIRED = re.compile(r"paired test delta ([+-]?\d+\.\d+) \(95% CI \[(-?\d+\.\d+), (-?\d+\.\d+)\], (\d+) tasks")
-_PASS = re.compile(r"test pass rate delta ([+-]?\d+\.\d+)")
-_SPEND = re.compile(r"^spend: (?:(.*) )?total=\$(\d+(?:\.\d+)?) of \$(\d+(?:\.\d+)?)$")
-_FINALISTS = re.compile(r"^finish: finalists ([0-9a-f]+) \(dev mean (-?\d+\.\d+)\), ([0-9a-f]+) \(dev mean (-?\d+\.\d+)\)$")
-_SPEND_PART = re.compile(r"(\w+)=\$(\d+(?:\.\d+)?)")
-_PR = re.compile(r"^finish: draft PR opened from \S+: ")
-_URL = re.compile(r"https?://[^\s'\",}]+")
-# The first matching prefix names the outcome of a ``finish:`` line; a later finish line wins.
-_OUTCOMES = (
-    ("finish: draft PR opened from ", "pr_opened"),
-    ("finish: no improvement", "no_improvement"),
-    ("finish: incomplete", "incomplete"),
-    ("finish: refused", "refused"),
-    ("finish: run failed", "failed"),
-    ("finish: pushed ", "pr_failed"),
-)
-
-
-def run_line(panel: str, model: str, preamble: bool) -> str:
-    """The run-log line that records the run's panel, agent model, and preamble flag."""
-    return RUN_PREFIX + json.dumps({"model": model, "panel": panel, "preamble": preamble}, sort_keys=True)
-
-
-def frontier_line(seed_dev_mean: float | None, best_cid: str | None, best_dev_mean: float | None) -> str:
-    """The run-log line that records the seed's dev mean and the best accepted non-seed candidate."""
-    return FRONTIER_PREFIX + json.dumps({"best_cid": best_cid, "best_dev_mean": best_dev_mean,
-                                         "seed_dev_mean": seed_dev_mean}, sort_keys=True)
-
-
-def arms_line(arms: dict) -> str:
-    """The run-log line that records the pass rate and costs of the baseline, seed, and best arms per split."""
-    return ARMS_PREFIX + json.dumps(arms, sort_keys=True)
+# The file in a run directory that holds the run's entry.
+ENTRY_FILE = "benchmark-entry.json"
 
 
 def sonnet_models() -> list[str]:
@@ -85,179 +41,16 @@ def chart_paths(log: Path) -> tuple[Path, Path]:
     return log.with_suffix(".svg"), log.with_name(f"{log.stem}-dark.svg")
 
 
-def _utc(moment: datetime) -> str:
+def utc(moment: datetime) -> str:
+    """``moment`` as the entry's ``recorded_at`` text: UTC, to the second, with a ``Z``."""
     return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _session(lines: list[str]) -> list[str]:
-    """The lines of the last session: a resumed run appends to the same log, and each session logs its seed first."""
-    starts = [index for index, line in enumerate(lines) if _SEED.match(line)]
-    return lines[starts[-1]:] if starts else lines
-
-
-def _json_after(lines: list[str], prefix: str) -> dict:
-    found = [line[len(prefix):] for line in lines if line.startswith(prefix)]
-    return json.loads(found[-1]) if found else {}
-
-
-def _last(lines: list[str], pattern: re.Pattern) -> re.Match | None:
-    matches = [match for line in lines if (match := pattern.search(line))]
-    return matches[-1] if matches else None
-
-
-def _unique(rows: list[dict], key: str, mode: str | None = None) -> object:
-    """The one non-null value of ``key`` over ``rows`` (of ``mode``); None when the rows hold none or several."""
-    values = {row.get(key) for row in rows if mode is None or row.get("mode") == mode} - {None}
-    return values.pop() if len(values) == 1 else None
-
-
-def _outcome(lines: list[str]) -> str | None:
-    outcome = None
-    for line in lines:
-        outcome = next((name for prefix, name in _OUTCOMES if line.startswith(prefix)), outcome)
-    return outcome
-
-
-def _spend(lines: list[str]) -> dict | None:
-    match = _last(lines, _SPEND)
-    if match is None:
-        return None
-    parts = {name: float(value) for name, value in _SPEND_PART.findall(match.group(1) or "")}
-    return {**parts, "total": float(match.group(2)), "max_usd": float(match.group(3))}
-
-
-def _frontier(lines: list[str]) -> dict:
-    """The seed and best dev means: the ``frontier:`` line, else a ``finish: finalists`` line (winner, then seed).
-
-    A log from before the ``frontier:`` line that has no finalists line records no dev mean.
-    """
-    if any(line.startswith(FRONTIER_PREFIX) for line in lines):
-        return _json_after(lines, FRONTIER_PREFIX)
-    finalists = _last(lines, _FINALISTS)
-    if finalists is None:
-        return {}
-    return {"best_cid": finalists.group(1), "best_dev_mean": float(finalists.group(2)),
-            "seed_dev_mean": float(finalists.group(4))}
-
-
-def _ref(run_dir: Path, ref: str) -> str | None:
-    """The commit that ``ref`` names in the repository that holds ``run_dir``; None when it names none."""
-    done = subprocess.run(["git", "-C", str(run_dir), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
-                          capture_output=True, text=True, check=False)
-    return (done.stdout.strip() or None) if done.returncode == 0 else None
-
-
-def _stored_finalists(run_dir: Path, lines: list[str], rows: list[dict]) -> tuple[str | None, str | None]:
-    """The seed and best commits of a log from before the ``arms:`` line, from exact evidence only.
-
-    The seed is the ``run seed:`` commit, else the commit of the seed finalist's ``refs/evolve/<run-id>/<cid>``.
-    The best is the commit of the winner finalist's ref, else the one non-seed commit with test-split rows (only
-    finalists get test rows), else the pushed ``origin/evolve/<run-id>-winner`` when it is one of the two commits
-    with test-split rows. Two sources that do not agree, or no source, give None.
-    """
-    tested = {row.get("git_sha") for row in rows
-              if row.get("mode") == "tilth_forced" and row.get("panel_split") == "test"} - {None}
-    finalists = _last(lines, _FINALISTS)
-    refs = f"refs/evolve/{run_dir.name}/"
-    seed_line = _last(lines, _SEED)
-    seed = seed_line.group(1) if seed_line else None
-    if finalists:
-        seed_ref = _ref(run_dir, refs + finalists.group(3))
-        seed = seed or seed_ref
-        if seed_ref and seed_ref != seed:
-            seed = None
-    best = _ref(run_dir, refs + finalists.group(1)) if finalists else None
-    if best is None and seed is not None and len(tested - {seed}) == 1:
-        best = next(iter(tested - {seed}))
-    pushed = _ref(run_dir, f"refs/remotes/origin/evolve/{run_dir.name}-winner")
-    if pushed in tested and len(tested) == 2:
-        other = next(iter(tested - {pushed}))
-        if (best or pushed) != pushed or (seed or other) != other:
-            return None, None
-        best, seed = pushed, other
-    if seed is not None and seed == best:
-        return None, None
-    return seed, best
-
-
-def _stored_arms(run_dir: Path, lines: list[str], rows: list[dict]) -> dict:
-    """The arms of a log from before the ``arms:`` line, from the stored rows only.
-
-    The baseline arm takes the baseline rows of each split. The seed and best arms take the ``tilth_forced`` rows
-    whose ``git_sha`` is the commit that ``_stored_finalists`` names; without that commit the arm is None. A retried
-    or reused cell is in the rows more than once; its last row is the one the run used. The test arms exist only
-    when finish compared the finalists.
-    """
-    from evolve.loop import EvolveError, arm_stats  # The harness loads only here, so ``redraw`` runs without it.
-
-    def arm(split: str, mode: str, sha: str | None = None) -> dict | None:
-        if mode != "baseline" and sha is None:
-            return None
-        cells = {(row.get("task"), row.get("repetition")): row for row in rows
-                 if row.get("mode") == mode and row.get("panel_split") == split
-                 and (sha is None or row.get("git_sha") == sha)}
-        try:
-            return arm_stats(cells.values())
-        except (EvolveError, KeyError, TypeError):
-            return None
-
-    seed, best = _stored_finalists(run_dir, lines, rows)
-
-    def split_arms(split: str) -> dict:
-        return {"baseline": arm(split, "baseline"), "seed": arm(split, "tilth_forced", seed),
-                "best": arm(split, "tilth_forced", best)}
-
-    return {"dev": split_arms("dev"), "test": split_arms("test") if _last(lines, _MEANS) else None}
-
-
-def entry_from_run_dir(run_dir: Path, *, recorded_at: datetime) -> dict:
-    """One log entry from ``run_dir``'s ``log.txt`` and ``rows.jsonl``; ``FileNotFoundError`` without a ``log.txt``.
-
-    Every field comes from a logged line or a stored row. A field the run did not reach is None. A log without a
-    ``spend:`` line raises ``ValueError``: that run was refused at preflight or did not reach its end.
-    """
-    run_dir = Path(run_dir)
-    lines = _session((run_dir / "log.txt").read_text().splitlines())
-    rows_path = run_dir / "rows.jsonl"
-    rows = ([json.loads(line) for line in rows_path.read_text().splitlines() if line.strip()]
-            if rows_path.is_file() else [])
-    if _last(lines, _SPEND) is None:
-        raise ValueError(f"{run_dir / 'log.txt'} has no spend line: the run was refused or did not end")
-    header = _json_after(lines, RUN_PREFIX)
-    frontier = _frontier(lines)
-    seed = _last(lines, _SEED)
-    stop = _last(lines, _STOP) or _last(lines, _SEARCH_END)
-    means = _last(lines, _MEANS)
-    paired = _last(lines, _PAIRED)
-    passed = _last(lines, _PASS)
-    pr = [line for line in lines if _PR.match(line)]
-    url = _URL.search(pr[-1]) if pr else None
-    return {
-        "schema": SCHEMA,
-        "run_id": run_dir.name,
-        "recorded_at": _utc(recorded_at),
-        "seed_sha": seed.group(1) if seed else None,
-        "tilth_version": _unique(rows, "tilth_version", "tilth_forced"),
-        "panel": header.get("panel", _unique(rows, "panel_name")),
-        "model": header.get("model", _unique(rows, "model_alias")),
-        "model_id": _unique(rows, "resolved_model"),
-        "preamble": header.get("preamble"),
-        "stop_reason": stop.group(1) if stop else None,
-        "outcome": _outcome(lines),
-        "seed_dev_mean": frontier.get("seed_dev_mean"),
-        "best_cid": frontier.get("best_cid"),
-        "best_dev_mean": frontier.get("best_dev_mean"),
-        "test_means": ({cid: float(value) for cid, value in _MEAN_PAIR.findall(means.group(1))}
-                       if means else None),
-        "paired_test_delta": ({"point": float(paired.group(1)), "low": float(paired.group(2)),
-                               "high": float(paired.group(3)), "tasks": int(paired.group(4))}
-                              if paired else None),
-        "pass_rate_delta": float(passed.group(1)) if passed else None,
-        "arms": (_json_after(lines, ARMS_PREFIX) if any(line.startswith(ARMS_PREFIX) for line in lines)
-                 else _stored_arms(run_dir, lines, rows)),
-        "spend": _spend(lines),
-        "pr_url": url.group(0) if url else None,
-    }
+def write_entry(run_dir: Path, entry: dict) -> Path:
+    """Write ``entry`` to ``run_dir``'s entry file and return its path; a resumed run replaces it."""
+    path = Path(run_dir) / ENTRY_FILE
+    path.write_text(json.dumps(entry, indent=2, sort_keys=True) + "\n")
+    return path
 
 
 def load(log: Path) -> list[dict]:
@@ -296,53 +89,13 @@ def redraw(log: Path) -> tuple[Path, Path]:
     return light, dark
 
 
-def import_runs(run_dirs: list[Path], log: Path) -> list[str]:
-    """Append an entry for each run directory, oldest ``log.txt`` first; the imported run ids.
-
-    A directory without a ``log.txt``, one whose log does not parse, a run whose model is not a Sonnet, or a run id
-    the log holds already is skipped with one line on stderr. ``recorded_at`` is the ``log.txt`` modification time.
-    """
-    known = {entry.get("run_id") for entry in load(log)}
-    sonnet = sonnet_models()
-    found = [Path(run_dir) for run_dir in run_dirs if (Path(run_dir) / "log.txt").is_file()]
-    for run_dir in run_dirs:
-        if Path(run_dir) not in found:
-            print(f"skip {run_dir}: no log.txt", file=sys.stderr)
-    imported = []
-    for run_dir in sorted(found, key=lambda path: ((path / "log.txt").stat().st_mtime, path.name)):
-        if run_dir.name in known:
-            print(f"skip {run_dir}: run id {run_dir.name} is in the log", file=sys.stderr)
-            continue
-        modified = datetime.fromtimestamp((run_dir / "log.txt").stat().st_mtime, tz=timezone.utc)
-        try:
-            entry = entry_from_run_dir(run_dir, recorded_at=modified)
-        except (OSError, ValueError) as error:
-            print(f"skip {run_dir}: {error}", file=sys.stderr)
-            continue
-        if entry["model"] not in sonnet:
-            print(f"skip {run_dir}: model {entry['model']} is not a Sonnet model ({', '.join(sonnet)})",
-                  file=sys.stderr)
-            continue
-        append(log, entry)
-        known.add(run_dir.name)
-        imported.append(run_dir.name)
-    return imported
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     commands = parser.add_subparsers(dest="command", required=True)
     redraw_parser = commands.add_parser("redraw", help="draw both charts from the log")
-    import_parser = commands.add_parser("import", help="append entries built from existing run directories")
-    import_parser.add_argument("run_dirs", type=Path, nargs="+", metavar="RUN_DIR")
-    for sub in (redraw_parser, import_parser):
-        sub.add_argument("--log", type=Path, default=None, help=f"the log file (default {COMMITTED_LOG})")
+    redraw_parser.add_argument("--log", type=Path, default=None, help=f"the log file (default {COMMITTED_LOG})")
     args = parser.parse_args(argv)
-    log = args.log or DEFAULT_LOG
-    if args.command == "import":
-        for run_id in import_runs(args.run_dirs, log):
-            print(f"imported {run_id}")
-    for path in redraw(log):
+    for path in redraw(args.log or DEFAULT_LOG):
         print(f"wrote {path}")
     return 0
 
