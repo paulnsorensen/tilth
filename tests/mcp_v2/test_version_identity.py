@@ -35,6 +35,39 @@ def cli_version():
     return proc.stdout.strip()
 
 
+def has_push_tag_trigger(text):
+    """True when a workflow's `on.push` trigger has a `tags` or `tags-ignore` filter.
+
+    A line scan, not a YAML parser: it reads the block form that the workflows use, and a
+    flow form (`on: {push: {tags: ...}}`) that names `tags` on the `on` or `push` line.
+    """
+    on_indent = push_indent = None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip())
+        key, _, rest = stripped.partition(":")
+        key = key.strip("'\"")
+        if push_indent is not None and indent <= push_indent:
+            push_indent = None
+        if on_indent is not None and indent <= on_indent:
+            on_indent = None
+        if on_indent is None:
+            if indent == 0 and key == "on":
+                if re.search(r"\btags", rest):
+                    return True
+                on_indent = indent
+        elif push_indent is None:
+            if key == "push":
+                if re.search(r"\btags", rest):
+                    return True
+                push_indent = indent
+        elif key in ("tags", "tags-ignore"):
+            return True
+    return False
+
+
 class VersionIdentity(unittest.TestCase):
     def test_cli_version_names_fork_version_and_head(self):
         line = cli_version()
@@ -45,7 +78,10 @@ class VersionIdentity(unittest.TestCase):
             self.skipTest("no git metadata: the commit suffix is optional")
         suffix = match.group(1)
         self.assertIsNotNone(suffix, f"git checkout build has no commit suffix: {line!r}")
-        self.assertTrue(head.startswith(suffix[1:]), f"{line!r} does not name HEAD {head}")
+        self.assertTrue(
+            head.startswith(suffix[1:]),
+            f"{line!r} does not name HEAD {head}: {harness.BIN} is stale. Run `cargo build`.",
+        )
 
     def test_mcp_server_info_matches_cli_version(self):
         result = harness.run_mcp([], [harness.initialize_request()])
@@ -61,3 +97,16 @@ class VersionIdentity(unittest.TestCase):
 
     def test_no_tag_release_workflow(self):
         self.assertFalse((harness.REPO_ROOT / ".github" / "workflows" / "release.yml").exists())
+        workflows = sorted((harness.REPO_ROOT / ".github" / "workflows").glob("*.y*ml"))
+        self.assertTrue(workflows, "no workflow files found")
+        tagged = [path.name for path in workflows if has_push_tag_trigger(path.read_text())]
+        self.assertEqual(tagged, [], "a workflow runs on a tag push; the fork has no tagged releases")
+
+    def test_push_tag_trigger_scan(self):
+        self.assertTrue(has_push_tag_trigger("on:\n  push:\n    tags: ['v*']\n"))
+        self.assertTrue(has_push_tag_trigger("on:\n  push:\n    branches: [main]\n    tags-ignore: [x]\n"))
+        self.assertTrue(has_push_tag_trigger("'on':\n  push:\n    tags:\n      - 'v*'\n"))
+        self.assertTrue(has_push_tag_trigger("on: {push: {tags: ['v*']}}\n"))
+        self.assertFalse(has_push_tag_trigger("on:\n  push:\n    branches: [main]\n  pull_request:\n"))
+        self.assertFalse(has_push_tag_trigger("on:\n  pull_request:\n    tags: [x]\njobs:\n  tags:\n"))
+        self.assertFalse(has_push_tag_trigger("on:\n  push:\n    branches: [main]\njobs:\n  tags:\n    runs-on: x\n"))
