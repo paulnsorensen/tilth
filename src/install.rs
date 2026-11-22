@@ -311,7 +311,12 @@ fn build_hook_invocation(
     } else {
         path
     };
-    for word in extra_args.iter().map(String::as_str).chain(tail) {
+    // A scoped npm package name starts with `@`, which PowerShell reads as splatting.
+    for word in extra_args {
+        command.push(' ');
+        command.push_str(&shell_quote(word)?);
+    }
+    for word in tail {
         command.push(' ');
         command.push_str(word);
     }
@@ -743,24 +748,46 @@ fn write_toml_config(host_info: &HostInfo) -> Result<(), String> {
 
 /// Returns (command, args) for the tilth MCP server entry.
 fn tilth_command_and_args() -> (String, Vec<String>) {
-    let mcp_args: Vec<String> = vec!["--mcp".into()];
+    let exe = std::env::current_exe().ok();
+    command_and_args_for(exe.as_ref().and_then(|p| p.to_str()))
+}
 
-    let via_npm = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(|s| s.contains("node_modules")))
-        .unwrap_or(false);
-
-    if via_npm {
-        let mut args = vec!["tilth".to_string()];
-        args.extend(mcp_args);
-        ("npx".into(), args)
-    } else {
-        let command = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_else(|| "tilth".into());
-        (command, mcp_args)
+/// The MCP entry for the binary at `exe`. A binary inside `node_modules` runs as
+/// `npx <package>`, where `<package>` is the npm package that holds the binary, so the host
+/// runs code from the same publisher. Any other binary runs by its absolute path.
+fn command_and_args_for(exe: Option<&str>) -> (String, Vec<String>) {
+    let mcp_args = vec!["--mcp".to_string()];
+    let Some(exe) = exe else {
+        return ("tilth".into(), mcp_args);
+    };
+    match npm_package_name(exe) {
+        Some(package) => ("npx".into(), vec![package, "--mcp".into()]),
+        None => (exe.to_string(), mcp_args),
     }
+}
+
+/// The npm package name from the path segments after the last `node_modules` component.
+/// A scoped name (`@scope/name`) takes two segments. `None` when the path has no
+/// `node_modules` component or the segments do not make a valid npm package name.
+fn npm_package_name(path: &str) -> Option<String> {
+    let segments: Vec<&str> = path.split(['/', '\\']).collect();
+    let at = segments.iter().rposition(|s| *s == "node_modules")?;
+    let first = *segments.get(at + 1)?;
+    if let Some(scope) = first.strip_prefix('@') {
+        let name = *segments.get(at + 2)?;
+        return (is_npm_name_part(scope) && is_npm_name_part(name))
+            .then(|| format!("{first}/{name}"));
+    }
+    is_npm_name_part(first).then(|| first.to_string())
+}
+
+/// One part of an npm package name: lowercase, URL-safe, and not starting with `.` or `_`.
+fn is_npm_name_part(part: &str) -> bool {
+    !part.is_empty()
+        && !part.starts_with(['.', '_'])
+        && part
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-._~".contains(c))
 }
 
 #[derive(Debug)]
@@ -2484,18 +2511,94 @@ mod tests {
 
     #[test]
     fn npx_hook_is_shell_form_and_replaces_stale_exec_entry() {
-        let args = vec!["tilth".to_string()];
+        let args = vec!["@paulnsorensen/tilth-nightly".to_string()];
         let ok = exec_form_applies(true, "npx", true);
         let inv = build_hook_invocation(ok, true, "claude", "npx", &args).unwrap();
-        assert_eq!(inv.command, "npx tilth hook --host claude");
+        assert_eq!(
+            inv.command,
+            "npx '@paulnsorensen/tilth-nightly' hook --host claude"
+        );
         assert!(inv.args.is_none());
-        let stale_exec = "npx tilth hook --host claude";
+        let stale_exec = "npx @paulnsorensen/tilth-nightly hook --host claude";
         assert!(is_tilth_hook_command(stale_exec, &inv.own_prefix));
+        assert!(is_tilth_hook_command(&inv.command, &inv.own_prefix));
+        assert!(is_tilth_hook_command(
+            "npx tilth hook --host claude",
+            &inv.own_prefix
+        ));
         let native = build_hook_invocation(true, false, "claude", "/a/tilth", &[]).unwrap();
         assert!(is_tilth_hook_command(
             &native.line(),
             "/a/tilth hook --host "
         ));
+    }
+
+    #[test]
+    fn npm_install_entry_names_the_scoped_package_it_runs_from() {
+        let exe = "/home/u/.npm/_npx/ab12/node_modules/@paulnsorensen/tilth-nightly/bin/tilth";
+        assert_eq!(
+            command_and_args_for(Some(exe)),
+            (
+                "npx".to_string(),
+                vec![
+                    "@paulnsorensen/tilth-nightly".to_string(),
+                    "--mcp".to_string()
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn npm_install_entry_names_the_unscoped_package_it_runs_from() {
+        let exe = "/usr/lib/node_modules/tilth/bin/tilth";
+        assert_eq!(
+            command_and_args_for(Some(exe)),
+            (
+                "npx".to_string(),
+                vec!["tilth".to_string(), "--mcp".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn npm_install_entry_reads_a_windows_path() {
+        let exe = r"C:\Users\u\AppData\Roaming\npm\node_modules\@paulnsorensen\tilth-nightly\bin\tilth.exe";
+        assert_eq!(
+            command_and_args_for(Some(exe)),
+            (
+                "npx".to_string(),
+                vec![
+                    "@paulnsorensen/tilth-nightly".to_string(),
+                    "--mcp".to_string()
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn non_npm_install_entry_is_the_absolute_binary_path() {
+        let exe = "/home/u/.cargo/bin/tilth";
+        assert_eq!(
+            command_and_args_for(Some(exe)),
+            (exe.to_string(), vec!["--mcp".to_string()])
+        );
+    }
+
+    #[test]
+    fn npm_path_without_a_valid_package_name_falls_back_to_the_binary_path() {
+        for exe in [
+            "/x/node_modules/@scope",
+            "/x/node_modules/",
+            "/x/node_modules/Bad Name/bin/tilth",
+            "/x/node_modules/.bin/tilth",
+            "/x/node_modules/@/tilth/bin/tilth",
+        ] {
+            assert_eq!(
+                command_and_args_for(Some(exe)),
+                (exe.to_string(), vec!["--mcp".to_string()]),
+                "{exe}"
+            );
+        }
     }
 
     #[test]
