@@ -131,6 +131,12 @@
 - 2026-11-05 · evolve-isolation · merged · benchmark-harness-gotchas.md · Capture probe of each evolve agent process: Claude cells, proposer, reflection, and judge send no host CLAUDE.md or hook text. `--deep-diagnosis` leaked `~/.codex/AGENTS.md`, hook output, and host skills until the temp `CODEX_HOME` fix. `run.py` Codex cells still send `~/.codex/AGENTS.md`.
 - 2026-11-05 · litmus-rg-edit-6 · merged · stock-ab-trajectory-diagnosis.md · Add the `--bare` litmus re-run: tilth_stock $2.17 against baseline $2.46 per cell (−12%, n=3, not significant). Two of three reps edit through `perl` or Python in the shell, because no hook blocks it under `--bare`.
 - 2026-11-06 · 0a90f52564811751 · merged · benchmark-gepa-v3-evolve.md · Add the tools-sonnet-r1 round: setup, `tools-r1.json` directive outcomes, the `write.md` winner, the finish verdict (+0.081, CI [-0.057, 0.220], no PR), the test table, the `ab-write-md` follow-up, and its $174.88 spend. Frozen probes rank 1, 3, and 1.
-- 2026-11-06 · 0a90f52564811751 · merged · benchmark-gepa-gotchas.md · Add the tools-sonnet-r1 harness gaps (hung test labeled infra, no seed-test repair, unfinishable dev tier) and four monitoring gotchas, plus two symptom rows. Frozen probes rank 1, 2, and 2.
+- 2026-11-06 · 0a90f52564811751 · merged · benchmark-gepa-gotchas.md · Add the tools-sonnet-r1 harness gaps (hung test labeled infra, no seed-test repair, unfinishable dev tier) and four monitoring gotchas, plus two symptom rows. Frozen probes rank 1, 2, and 2.<<<<<<< ours
 - 2026-11-22 · bat-agent-env · merged · benchmark-harness-gotchas.md · Record why `sharkdp__bat-2650` timed out in 7 of 12 goal 6 and goal 7 cells: under Rust 1.80+, bat's pty test aborts and leaves a `bat` that holds the pipe of a piped `cargo test`. Record the bat-only `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` agent setting and the leftover-process sweep.
 - 2026-11-22 · bat-agent-env · merged · powered-comparison-plan.md · Correct the goal 6 bat-2650 cause (a hung test, not build time). Add the bat-2650 re-run (3/3 in both arms) and the spliced goal 7 estimate: accuracy 64/69 against 68/69, p = 0.208; cost +1.6% [−6.4%, +9.9%].
+||||||| original
+
+=======
+- 2026-11-22 · wiki-harvest-auto/tilth-20261122 · merged · adr/tilth-write-teaching-errors.md; adr/tilth-search-resilience.md · Record ADR-013 (unseen-match refusals print the matches, #444), ADR-014 (a tagless line-op section takes the live tag only after a read, #462), and ADR-003 (qualified names and pasted declarations route to definitions, #443).
+
+>>>>>>> theirs
