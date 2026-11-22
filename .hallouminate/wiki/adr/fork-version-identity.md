@@ -21,6 +21,7 @@ On an upstream sync, take the fork side for the `version` lines in `Cargo.toml`,
 - `build.rs` uses the sha only when `git rev-parse --show-toplevel` is the package directory. A tarball inside an unrelated repository, or a `GIT_DIR` that points elsewhere, gets the bare version. `build.rs` reruns when `GIT_DIR` changes.
 - `build.rs` watches `HEAD`, the HEAD reflog `logs/HEAD`, the current branch ref, and `packed-refs` through `git rev-parse --git-path`. That resolves in a linked worktree too, where `.git` is a file. The reflog catches a commit after `git pack-refs`, when the branch has no loose ref. It skips absent paths, because Cargo reruns a build script on every build for a path that does not exist.
 - A commit or checkout reruns the build script and recompiles the crate with the new suffix.
+- A checkout with a `.git` entry where git gives no commit (one failed git call, a sandbox that hides the repository, no `git` on `PATH`) gets the bare version for that build. `build.rs` then prints a Cargo warning with the reason and watches a path that does not exist, so Cargo runs it again on the next build. Without that retry the result is sticky: no git file is watched, so no later build gets the suffix. A `just check` run on 2026-11-22 failed `test_version_identity.py` this way.
 
 ## Consequences
 

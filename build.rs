@@ -12,36 +12,45 @@ fn main() {
     println!("cargo:rerun-if-env-changed=GIT_DIR");
     let package = env!("CARGO_PKG_VERSION");
     let version = match short_head() {
-        Some(sha) => format!("{package}+{sha}"),
-        None => package.to_owned(),
+        Ok(sha) => format!("{package}+{sha}"),
+        Err(reason) => {
+            retry_on_next_build(&reason);
+            package.to_owned()
+        }
     };
     println!("cargo:rustc-env=TILTH_VERSION={version}");
 }
 
-fn short_head() -> Option<String> {
-    if !is_repository_root() {
-        return None;
-    }
-    let sha = git(&["rev-parse", "--short", "HEAD"])?;
-    watch_head();
-    Some(sha)
-}
-
-/// True when the git top level is this package. `git rev-parse` walks up to any enclosing
-/// repository and obeys `GIT_DIR`, so without this check an unrelated repository gives its
-/// commit.
-fn is_repository_root() -> bool {
-    let Some(toplevel) = git(&["rev-parse", "--show-toplevel"]) else {
-        return false;
-    };
+/// The short commit of this package's repository, or the reason git gave none.
+fn short_head() -> Result<String, String> {
+    // `git rev-parse` walks up to any enclosing repository and obeys `GIT_DIR`, so an
+    // unrelated repository would give its commit. Use the commit only when the git top
+    // level is this package.
+    let toplevel = git(&["rev-parse", "--show-toplevel"])?;
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     match (
         Path::new(&toplevel).canonicalize(),
         Path::new(manifest_dir).canonicalize(),
     ) {
-        (Ok(toplevel), Ok(manifest_dir)) => toplevel == manifest_dir,
-        _ => false,
+        (Ok(toplevel), Ok(manifest_dir)) if toplevel == manifest_dir => {}
+        _ => return Err(format!("the git top level is {toplevel}")),
     }
+    let sha = git(&["rev-parse", "--short", "HEAD"])?;
+    watch_head();
+    Ok(sha)
+}
+
+/// A checkout with git metadata that gave no commit must not keep that result. The cause can
+/// be one failed git call, a sandbox that hides the repository, or no git on `PATH`. Without
+/// a watched git file, Cargo would not run this script again, and each later build would
+/// lack the commit. A watched path that does not exist makes Cargo run the script on each
+/// build until git gives the commit. A package without git metadata stays quiet.
+fn retry_on_next_build(reason: &str) {
+    if !Path::new(env!("CARGO_MANIFEST_DIR")).join(".git").exists() {
+        return;
+    }
+    println!("cargo:rerun-if-changed=.git/tilth-version-retry");
+    println!("cargo:warning=`tilth --version` has no commit suffix: {reason}");
 }
 
 /// Rerun when HEAD moves. `--git-path` resolves each file in a linked worktree too, where
@@ -56,11 +65,11 @@ fn watch_head() {
         "logs/HEAD".to_owned(),
         "packed-refs".to_owned(),
     ];
-    if let Some(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
+    if let Ok(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
         files.push(branch);
     }
     for file in files {
-        let Some(path) = git(&["rev-parse", "--git-path", &file]) else {
+        let Ok(path) = git(&["rev-parse", "--git-path", &file]) else {
             continue;
         };
         // Cargo reruns on every build for a path that does not exist, so skip absent files.
@@ -70,12 +79,18 @@ fn watch_head() {
     }
 }
 
-fn git(args: &[&str]) -> Option<String> {
-    let output = Command::new("git").args(args).output().ok()?;
-    if !output.status.success() {
-        return None;
+/// The trimmed output of one git command, or one line that says why there is none.
+fn git(args: &[&str]) -> Result<String, String> {
+    let command = format!("git {}", args.join(" "));
+    let output = Command::new("git")
+        .args(args)
+        .output()
+        .map_err(|error| format!("{command} did not start ({error})"))?;
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if output.status.success() && !text.is_empty() {
+        return Ok(text);
     }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let text = text.trim();
-    (!text.is_empty()).then(|| text.to_owned())
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.lines().next().unwrap_or("no output").trim();
+    Err(format!("{command} failed ({detail})"))
 }
