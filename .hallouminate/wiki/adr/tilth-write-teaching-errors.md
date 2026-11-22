@@ -230,7 +230,6 @@ Session 2026-08-02; spec at the durable corpus
 [^seen-persist]: `src/edit/seen_store.rs`; `src/session.rs` (`take_unsaved_seen`, `save_seen`, `persisted_seen`); `src/mcp/mod.rs` (`run_tool_with_timeout`); `src/mcp/tools/write.rs` (`resolve_edit`, `carried_seen_lines`). Decision: November 4, 2026, from the stock A/B trajectory diagnosis, cause 3.
 
 
-
 ### ADR-012: Held-edit confirms, nested-match drops, a 50-section cap, and own-file overwrite (amends ADR-005, ADR-009, ADR-010) [status: accepted]
 
 - **Approval:** This is a guard change. The user approved the seen-gate confirm, the 50-section cap, and own-file edits on 2026-11-15. The nested-match rule is not a guard change.
@@ -270,3 +269,22 @@ Session 2026-08-02; spec at the durable corpus
     - Correct: 14 of 15. The goal 6 tilth and baseline cells passed 15 of 15. The miss is an `rg_edit_flow_migration` patch that did not compile.[^write-friction]
 
 [^write-friction]: `src/edit/apply.rs` (`nested_in_other_op`, `nested_drops`); `src/edit/recovery.rs` (`unseen_anchor_lines`); `src/mcp/tools/write.rs` (`show_unseen_matches`, `settle_shown`, `confirm_held`, `own_file_unchanged`); `src/session.rs` (`hold_edit`, `take_held_edit`, `note_created`); `src/edit/json.rs` (`lower_edits`). Decision: November 15, 2026, from the goal 6 write-failure analysis.
+
+### ADR-013: Unseen-match refusals print the matches (amends ADR-009) [status: accepted]
+
+- **Context:** ADR-009 names one unblocking read for a refused `rewrite` or `replace_text all|count`. The agent still needs a second call to read, then a third call to retry. The `tools-sonnet-r1` evolve round proposed a patch that prints the matches in the refusal. That patch deadlocked, so it never reached a measurement ([[../benchmark-gepa-v3-evolve]]).
+- **Decision:** PR #444 ships the idea. ADR-012 extends it with held-edit confirms.
+  1. A refusal whose only reason is unseen `rewrite` or `replace_text all|count` matches prints each match as `N:content` lines under `[path#TAG]`.
+  2. The printed lines count as displayed. The refusal records them in the snapshot store, and the seen store persists them (ADR-011). A resumed tilth process also applies the retry.
+  3. Every other refusal stays plain. This includes a drifted section and a tag collision.
+  4. The response has a limit: `read::HOST_VISIBLE_MAX - HOST_CAP_RESERVE`, measured on the escaped length of the joined sections (`settle_shown` in `src/mcp/tools/write.rs`). While the response is over that limit, the last printed refusal reverts to its plain form and records nothing. A file over the tag cap mints no tag, so it reverts too. `WRITE_RESPONSE_BUDGET` is a different budget; it bounds only the receipt diff.
+- **Why record after the response is built:** A host shows no text past its limit. Lines that the agent never saw must not count as seen. `settle_shown` records the lines only after it knows that the whole response fits.
+- **Gotcha:** The snapshots mutex (`Session::snapshots`) is not reentrant. The patch from the evolve round took it again while it still held it, and that deadlocked. Do not take the lock again while you hold it. To take it again after you release it is safe: `settle_shown` calls `record_snapshot` once for each refusal. The test harness runs `tool_write` on its own thread with a 30 s wait, so a deadlock fails the test and does not hang the suite.
+- **Verification:** `tests/mcp_v2/test_unseen_match_refusal.py` and the unit tests in `src/mcp/tools/write.rs`.
+
+### ADR-014: A tagless line-op section takes the live tag only after a read (amends ADR-010) [status: accepted]
+
+- **Context:** ADR-010 filled the live tag for a tagless `replace_text` or `rewrite` section. A tagless line-anchored section got an empty seen-line record, so the gate rejected every line, also lines that the agent had just read.
+- **Decision:** PR #462 makes `fill_live_tag` in `src/mcp/tools/write.rs` fill line-anchored sections too. The fill needs two facts. The head snapshot of the file must come from a read, not a write. Its text must equal the live file. `create_file` sections stay tagless. Text-op sections keep the ADR-010 rule.
+- **Why a write snapshot does not count:** A line number carries no content check. After a write shifts the lines, the numbers of an earlier view are stale. The first version of the fix let a tagless replace land on a shifted line. A read of the live file proves that the numbers are current.
+- **Verification:** the unit tests in `src/mcp/tools/write.rs`.
