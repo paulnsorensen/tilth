@@ -104,6 +104,35 @@ A second independent review of PR #466 found eleven issues. Real gdb 17.1, sqlit
 
 Open gaps added by this round: `sqlite3 -append FILE` writes a database into an existing file; `ATTACH` and `VACUUM INTO` create database files; the rejoined words of `pixi run`, `devbox run`, and `hatch run` lose their quotes, so a quoted argument with a shell operator can deny.
 
+### Review fixes, round 3 (PR #466, 2026-11-22, user-approved guard change)
+
+A third review of PR #466 found nine bypasses. Real sqlite3 3.54.1, bun, yarn, npm, and hatch (through `uvx`) confirmed each bypass for those tools. gdb, lldb, and nix are not installed on the test machine. Their fixes follow the gdb and lldb source and the nix manual. The fixes:
+
+- sqlite3 `-lookaside SIZE N` and `-pagecache SIZE N` take two values. `-nonce`, `-cmdline-edit`, `-screenwidth`, `-threadsafe`, and `-sorterref` take one value. The rules skip these values, so `sqlite3 -lookaside 64 8 app.db` denies as `stdin repl`. The SQL check skips them too, so it never reads the database operand as SQL.
+- `bun repl` starts a REPL that reads stdin, so it denies as `shell stdin`.
+- `yarn node ARGS` runs `node ARGS`. The runner field `program_subs` unwraps it, and the interpreter rules check `node`.
+- `npm explore PKG [--] CMD` runs CMD as shell source. Without CMD, it starts a shell that reads stdin. The runner field `shell_subs` reparses CMD, and a missing CMD denies as `shell stdin`. `scan` now skips the operands that a runner still needs after `--`, so `npm explore -- PKG CMD` denies too.
+- gdb `edit` runs `$EDITOR` through `/bin/sh`, so it denies as `debugger script`.
+- gdb aliases of denied commands deny: `gr` and `guile-repl` start a Guile REPL, and `expression` is an alias of `compile`. Only gdb denies `expression`, because lldb `expression` prints values. The alias list comes from `gdb/python/python.c`, `gdb/guile/guile.c`, `gdb/compile/compile.c`, and `gdb/cli/cli-cmds.c`.
+- lldb `platform file`, `platform get-file`, and `platform put-file` read and write files, so they deny as `debugger script`. The rules check `platform process launch ARGS` as `process launch ARGS`. The `debugger script` hint now says that the command can read or write a file.
+- hatch: `env` is a group word, so `hatch env run` unwraps like `hatch run`. `-i`, `-x`, and `-f` take values for `env run`. The hatch root has no short options with these letters.
+- `nix run` follows the rule below.
+
+The `nix run` rule:
+
+- `nix run INSTALLABLE ARGS` runs the main program of INSTALLABLE with ARGS. The hook cannot evaluate Nix, so it takes the program name from the last attribute of INSTALLABLE (`nixpkgs#hello` runs `hello`).
+- The rules remove a `_VERSION` suffix (`nodejs_22`). `NIX_PROGRAMS` maps common packages whose program has another name (`ripgrep` runs `rg`, `bashInteractive` runs `bash`).
+- The rules check the command line with `nix run INSTALLABLE` replaced by the program name. Thus `nix run nixpkgs#bash` denies as `shell stdin`, and `nix run nixpkgs#bat -- f` denies as `bat`.
+- ARGS are the operands after INSTALLABLE and all words after `--`. With `-f FILE` or `--expr`, INSTALLABLE is an attribute path.
+- Without an attribute (`nix run`, `nix run .`, a store path, a variable), the hook cannot name the program, so the command denies as `unresolved`.
+- A word after an unlisted `--long` option has two readings, as in the other runners: INSTALLABLE, or the value of the option.
+- This is the simplest rule that allows `nix run nixpkgs#hello` and denies a shell. Its limit: the rules do not check a package whose program name is not its attribute and not in `NIX_PROGRAMS`. A flake app can also run any program under any name.
+
+Open gaps added by this round:
+
+- From the review (not fixed): `make -p -f FILE` prints the make database, which holds the text of FILE. `uv run --env-file FILE printenv` prints the variables in FILE. gdb `search` and `forward-search` print matching source lines. `bundle console` starts a Ruby REPL that reads stdin.
+- Found during the round-3 work (not fixed): `deno` and `deno repl` start a REPL that reads stdin. `nix repl` reads stdin, and `nix eval --expr 'builtins.readFile ./f'` prints a file. lldb `repl` and `expression --repl` start a REPL that reads stdin.
+
 ## Deferred
 
 - vscode, copilot-cli, antigravity, gemini, qwen-code, and kiro install support waits until each host's docs and event shape are verified.

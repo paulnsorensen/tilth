@@ -31,8 +31,8 @@ pub(super) const PYTHON_M: Rule = "python -m";
 pub(super) const GIT_CONFIG: Rule = "git -c";
 /// A REPL or debugger that reads its commands from stdin (`irb`, `make -f -`, `gdb`).
 pub(super) const STDIN_REPL: Rule = "stdin repl";
-/// A gdb or lldb command that runs a script, a shell, or a meta command, or that gives the program
-/// arguments the rules cannot check.
+/// A gdb or lldb command that runs a script, a shell, or a meta command, that reads or writes a
+/// file (lldb `platform file`), or that gives the program arguments the rules cannot check.
 pub(super) const DEBUGGER_SCRIPT: Rule = "debugger script";
 /// sqlite3 SQL or a dot-command that reads or writes files or runs a shell (`readfile`, `.shell`).
 pub(super) const SQLITE_IO: Rule = "sqlite3 io";
@@ -215,8 +215,8 @@ fn tilth_reason(rule: &str, kind: Kind) -> String {
         ),
         Kind::Generic if rule == DEBUGGER_SCRIPT => format!(
             "Blocked: a gdb or lldb command (`-ex`, `-o`) runs a script, a shell, or another \
-             command, or it gives the program arguments, so the hook cannot see what it reads. \
-             {DEBUGGER_FIX} Read files with tilth_read, search with tilth_search, and write \
+             command, reads or writes a file, or gives the program arguments, so the hook \
+             cannot see what it reads. {DEBUGGER_FIX} Read files with tilth_read, search with tilth_search, and write \
              with tilth_write."
         ),
         Kind::Generic if rule == SQLITE_IO => "Blocked: this sqlite3 SQL or dot-command reads \
@@ -292,8 +292,8 @@ fn native_reason(rule: &str, kind: Kind) -> String {
             .to_string(),
         Kind::Generic if rule == DEBUGGER_SCRIPT => format!(
             "Blocked: a gdb or lldb command (`-ex`, `-o`) runs a script, a shell, or another \
-             command, or it gives the program arguments, so the hook cannot see what it reads. \
-             {DEBUGGER_FIX} Use the Read, Grep, Glob, Edit, and Write tools for file work."
+             command, reads or writes a file, or gives the program arguments, so the hook \
+             cannot see what it reads. {DEBUGGER_FIX} Use the Read, Grep, Glob, Edit, and Write tools for file work."
         ),
         Kind::Generic if rule == SQLITE_IO => "Blocked: this sqlite3 SQL or dot-command reads \
              or writes files or runs a shell (`readfile()`, `.read`, `.output`, `.shell`). \

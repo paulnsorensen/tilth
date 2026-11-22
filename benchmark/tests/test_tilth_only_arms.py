@@ -874,6 +874,8 @@ def test_run_plan_turns_a_probe_crash_into_an_invalid_cell_before_any_cell(
     "make --eval='$(info $(file <src/main.rs))'",
     "gdb -batch -eval 'shell cat src/main.rs'", "sqlite3 x.db --Ac src/main.rs", "bun run cat src/main.rs",
     "pnpm --shell-m exec 'cat src/main.rs'", "printf 'cat src/main.rs' | mise en",
+    "sqlite3 -lookaside 64 8 app.db", "bun repl", "npm explore foo -- cat src/main.rs", "npm explore foo",
+    "hatch env run -- cat src/main.rs", "nix run nixpkgs#bash",
 ])
 def test_the_codex_hook_denies_bare_shells_and_file_reads(command: str) -> None:
     binary = str(config.REPO_ROOT / "target" / "debug" / "tilth")
@@ -883,6 +885,7 @@ def test_the_codex_hook_denies_bare_shells_and_file_reads(command: str) -> None:
     assert run._hook_replay(binary, "mise exec -- cargo test", hint="tilth", host="codex") is False
     assert run._hook_replay(binary, "npx --yes prettier --check .", hint="tilth", host="codex") is False
     assert run._hook_replay(binary, "bun run test", hint="tilth", host="codex") is False
+    assert run._hook_replay(binary, "nix run nixpkgs#hello", hint="tilth", host="codex") is False
 
 
 # --- reporting: a missing experiment mode and an unknown legacy mode stay visible ---

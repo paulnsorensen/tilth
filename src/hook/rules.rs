@@ -439,7 +439,8 @@ fn option_file_rule(name: &str, given: &[Arg], opts: &WrapOpts) -> Option<Rule> 
 
 /// Strip wrapper commands and tool runners. Returns the wrapped command and whether `xargs`
 /// feeds it operands. `Err` holds the final outcome: a runner runs shell source or Python
-/// itself, or a runner has two readings and the rules checked both.
+/// itself, a runner has two readings and the rules checked both, or `nix run` runs a program
+/// that the rules checked.
 fn unwrap<'w>(
     cmd: &Cmd,
     mut words: &'w [Arg],
@@ -448,6 +449,11 @@ fn unwrap<'w>(
     while let Some(first) = words.first() {
         let name = base(&first.text);
         let rest = &words[1..];
+        if name == "nix" {
+            if let Some(outcome) = nix_run(cmd, words) {
+                return Err(outcome);
+            }
+        }
         let i = match name {
             "env" | "command" | "builtin" | "exec" | "nohup" | "time" | "setsid" | "stdbuf"
             | "nice" | "ionice" | "timeout" | "sudo" | "doas" | "xargs" | "flock" | "taskset"
@@ -572,6 +578,11 @@ struct Runner {
     groups: &'static [&'static str],
     /// Subcommands that start an interactive shell, which reads stdin (`mise en`).
     shells: &'static [&'static str],
+    /// Subcommands that name the program they run: `yarn node ARGS` runs `node ARGS`.
+    program_subs: &'static [&'static str],
+    /// Subcommands that take one operand and run the words after it as shell source. Without
+    /// those words, they start a shell that reads stdin (`npm explore PKG -- CMD`).
+    shell_subs: &'static [&'static str],
     /// The runner's own commands. When this list is not empty, a first operand outside it and
     /// outside `subs` is a command too: `pnpm cat f` runs `cat`.
     builtins: &'static [&'static str],
@@ -604,6 +615,8 @@ const fn runner(name: &'static str, subs: &'static [&'static str]) -> Runner {
         subs,
         groups: &[],
         shells: &[],
+        program_subs: &[],
+        shell_subs: &[],
         builtins: &[],
         at: CommandAt::Operand,
         positionals: 0,
@@ -841,7 +854,24 @@ const NIX_VALUED: &[&str] = &[
     "--expr",
     "--profile",
     "--phase",
+    "--inputs-from",
+    "--reference-lock-file",
+    "--output-lock-file",
+    "--update-input",
+    "--arg-from-stdin",
+    "-j",
+    "--max-jobs",
+    "--cores",
+    "--system",
 ];
+/// `nix develop` and `nix shell` run the words after `-c`. Without them, they start a shell.
+/// `nix_run` checks `nix run`.
+const NIX: Runner = Runner {
+    at: CommandAt::Option,
+    valued: NIX_VALUED,
+    rest: &["-c", "--command"],
+    ..runner("nix", &["develop", "shell"])
+};
 
 const RUNNERS: &[Runner] = &[
     Runner {
@@ -880,6 +910,7 @@ const RUNNERS: &[Runner] = &[
         valued: NPM_VALUED,
         shell: NPM_SHELL,
         stdin_shell: true,
+        shell_subs: &["explore"],
         ..runner("npm", &["exec", "x"])
     },
     Runner {
@@ -904,6 +935,7 @@ const RUNNERS: &[Runner] = &[
         ..runner("pnpx", &[])
     },
     Runner {
+        program_subs: &["node"],
         valued: &["-p", "--package", "--cwd"],
         ..runner("yarn", &["exec", "dlx"])
     },
@@ -912,6 +944,7 @@ const RUNNERS: &[Runner] = &[
         ..runner("bunx", &[])
     },
     Runner {
+        shells: &["repl"],
         valued: BUN_VALUED,
         ..runner("bun", &["x", "run"])
     },
@@ -919,12 +952,7 @@ const RUNNERS: &[Runner] = &[
         positionals: 1,
         ..runner("direnv", &["exec"])
     },
-    Runner {
-        at: CommandAt::Option,
-        valued: NIX_VALUED,
-        rest: &["-c", "--command"],
-        ..runner("nix", &["develop", "shell"])
-    },
+    NIX,
     Runner {
         at: CommandAt::Option,
         shell: &["--run", "--command"],
@@ -971,7 +999,9 @@ const RUNNERS: &[Runner] = &[
         valued: &["-p", "--project", "-c", "--config", "--venv", "--skip"],
         ..runner("pdm", &["run"])
     },
+    // `hatch env run` takes `-i`, `-x`, and `-f` to select environments.
     Runner {
+        groups: &["env"],
         shells: &["shell"],
         valued: &[
             "-e",
@@ -981,6 +1011,12 @@ const RUNNERS: &[Runner] = &[
             "--data-dir",
             "--cache-dir",
             "--config",
+            "-i",
+            "--include",
+            "-x",
+            "--exclude",
+            "-f",
+            "--filter",
         ],
         shell_words: true,
         env_select: true,
@@ -1107,6 +1143,16 @@ fn find_sub(spec: &Runner, args: &[Arg], mut i: usize, mut shell_mode: bool) -> 
         if spec.subs.contains(&t) {
             return scan(spec, args, i + 1, spec.positionals, shell_mode, true);
         }
+        if spec.program_subs.contains(&t) {
+            return Run::At(i);
+        }
+        if spec.shell_subs.contains(&t) {
+            // In shell mode, `At` means that no command follows the operand.
+            return match scan(spec, args, i + 1, 1, true, true) {
+                Run::At(_) => Run::Done(Outcome::Deny(SHELL_STDIN)),
+                run => run,
+            };
+        }
         if spec.shells.contains(&t) {
             return Run::Done(Outcome::Deny(SHELL_STDIN));
         }
@@ -1148,7 +1194,8 @@ fn scan(
     let mut maybe_value = false;
     while let Some(t) = args.get(i).map(|a| a.text.as_str()) {
         if t == "--" || spec.rest.contains(&t) {
-            return command_at(spec, args, i + 1, shell_mode);
+            // Operands that the runner still needs come after `--` (`npm explore -- PKG CMD`).
+            return command_at(spec, args, i + 1 + positionals, shell_mode);
         }
         if let Some(outcome) = shell_option(spec, args, i) {
             return Run::Done(outcome);
@@ -1223,6 +1270,154 @@ fn command_at(spec: &Runner, args: &[Arg], k: usize, shell_mode: bool) -> Run {
         words[0].text = command.to_string();
     }
     Run::Done(reparse(&words))
+}
+
+/// nix options that take two values (`--arg NAME EXPR`).
+const NIX_PAIRS: &[&str] = &[
+    "--arg",
+    "--argstr",
+    "--arg-from-file",
+    "--option",
+    "--override-input",
+    "--override-flake",
+];
+
+/// nixpkgs attributes whose main program has another name.
+const NIX_PROGRAMS: &[(&str, &str)] = &[
+    ("bashInteractive", "bash"),
+    ("ripgrep", "rg"),
+    ("gnugrep", "grep"),
+    ("gnused", "sed"),
+    ("gnutar", "tar"),
+    ("the_silver_searcher", "ag"),
+    ("diffutils", "diff"),
+    ("findutils", "find"),
+    ("neovim", "nvim"),
+    ("gnumake", "make"),
+    ("yq-go", "yq"),
+];
+
+/// The number of words that the nix option at `args[i]` uses.
+fn nix_opt_words(args: &[Arg], i: usize) -> usize {
+    if match_opt(&args[i].text, NIX_PAIRS) == Some(OptValue::Next) {
+        3
+    } else {
+        opt_words(&NIX, args, i)
+    }
+}
+
+/// Checks `nix run` in `words`, a tail of `cmd.words` that starts at `nix`. `None` when the nix
+/// subcommand is not `run`.
+///
+/// `nix run INSTALLABLE ARGS` runs the main program of INSTALLABLE with ARGS. The hook cannot
+/// evaluate Nix, so it takes the program name from the last attribute of INSTALLABLE
+/// (`nixpkgs#hello` runs `hello`). The rules then check that program and ARGS like any other
+/// command, so `nix run nixpkgs#bash` denies as a shell that reads stdin. Without an attribute
+/// (`nix run`, `nix run .`, a store path), INSTALLABLE runs a program that the hook cannot
+/// name, so the command denies as `unresolved`.
+fn nix_run(cmd: &Cmd, words: &[Arg]) -> Option<Outcome> {
+    let args = &words[1..];
+    let mut i = 0;
+    while args.get(i).is_some_and(|a| is_runner_opt(&a.text)) {
+        i += nix_opt_words(args, i);
+    }
+    if args.get(i)?.text != "run" {
+        return None;
+    }
+    // The positional words, and whether each one can be the value of an unlisted option.
+    let mut positional: Vec<(&Arg, bool)> = Vec::new();
+    let (mut attr_path, mut maybe_value) = (false, false);
+    i += 1;
+    while let Some(a) = args.get(i) {
+        let t = a.text.as_str();
+        if t == "--" {
+            positional.extend(args[i + 1..].iter().map(|a| (a, false)));
+            break;
+        }
+        if is_runner_opt(t) {
+            // With `-f FILE` or `--expr EXPR`, INSTALLABLE is an attribute path.
+            attr_path |= match_opt(t, &["-f", "--file", "--expr"]).is_some();
+            maybe_value = unlisted_long(&NIX, t) && match_opt(t, NIX_PAIRS).is_none();
+            i += nix_opt_words(args, i);
+            continue;
+        }
+        positional.push((a, std::mem::take(&mut maybe_value)));
+        i += 1;
+    }
+    let prefix = &cmd.words[..cmd.words.len() - words.len()];
+    // As in `scan`, a word after an unlisted option has two readings: INSTALLABLE, or the
+    // value of the option. Only the first reading denies a missing INSTALLABLE.
+    let mut outcome = Outcome::Allow;
+    let mut k = 0;
+    loop {
+        let reading = match positional.get(k) {
+            Some(&(installable, _)) => {
+                nix_program_run(cmd, prefix, installable, &positional[k + 1..], attr_path)
+            }
+            None if k == 0 => Outcome::Deny(UNRESOLVED),
+            None => Outcome::Allow,
+        };
+        outcome = either(outcome, reading);
+        if !positional.get(k).is_some_and(|&(_, value)| value) {
+            return Some(outcome);
+        }
+        k += 1;
+    }
+}
+
+/// One reading of `nix run`: INSTALLABLE runs its program with `args`. The rules check the
+/// command line with `nix run INSTALLABLE` replaced by the program name.
+fn nix_program_run(
+    cmd: &Cmd,
+    prefix: &[Arg],
+    installable: &Arg,
+    args: &[(&Arg, bool)],
+    attr_path: bool,
+) -> Outcome {
+    let program = nix_program(&installable.text, attr_path)
+        .filter(|_| installable.literal && !installable.opaque);
+    let Some(text) = program else {
+        return Outcome::Deny(UNRESOLVED);
+    };
+    let mut words = prefix.to_vec();
+    words.push(Arg {
+        text,
+        literal: true,
+        opaque: false,
+    });
+    words.extend(args.iter().map(|&(a, _)| a.clone()));
+    check(&Cmd {
+        words: &words,
+        assigns: cmd.assigns,
+        piped: cmd.piped,
+        here: cmd.here,
+    })
+}
+
+/// The program that a nix INSTALLABLE runs: its last attribute without a `_VERSION` suffix
+/// (`nixpkgs#nodejs_22` runs `nodejs`), mapped through `NIX_PROGRAMS`. With `attr_path`, the
+/// whole INSTALLABLE is an attribute path. `None` when INSTALLABLE names no attribute.
+fn nix_program(installable: &str, attr_path: bool) -> Option<String> {
+    let attr = if attr_path {
+        installable
+    } else {
+        installable.split_once('#')?.1
+    };
+    // `^out` selects outputs.
+    let attr = attr.split('^').next().unwrap_or(attr);
+    let name = attr.rsplit('.').next().unwrap_or(attr).trim_matches('"');
+    let name = match name.split_once('_') {
+        Some((stem, version)) if version.bytes().all(|b| b.is_ascii_digit() || b == b'_') => stem,
+        _ => name,
+    };
+    if name.is_empty() {
+        return None;
+    }
+    let program = NIX_PROGRAMS
+        .iter()
+        .find(|&&(attr, _)| attr == name)
+        .map_or(name, |&(_, program)| program);
+    Some(program.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -2861,7 +3056,7 @@ fn debugger(spec: &Debugger, args: &[Arg]) -> Outcome {
                 if value.opaque {
                     return Outcome::Deny(UNRESOLVED);
                 }
-                match debugger_command(&value.text) {
+                match debugger_command(&value.text, spec.gdb) {
                     Ok(Some(source)) => scripts.push(source),
                     Ok(None) => {}
                     Err(rule) => return Outcome::Deny(rule),
@@ -2890,18 +3085,20 @@ fn debugger(spec: &Debugger, args: &[Arg]) -> Outcome {
 }
 
 /// Debugger commands that run a script or a shell, define or rename commands, read a command
-/// body from stdin, or run another command (`eval`, `with`, `make`). Each entry is a name and
-/// the shortest abbreviation that the rules match.
+/// body from stdin, run another command (`eval`, `with`, `make`), or run `$EDITOR` through a
+/// shell (`edit`). Each entry is a name and the shortest abbreviation that the rules match.
 const DEBUGGER_DENY: &[(&str, usize)] = &[
     ("pipe", 3),
     ("python", 3),
     ("python-interactive", 3),
     ("guile", 3),
+    ("guile-repl", 3),
     ("script", 3),
     ("eval", 3),
     ("alias", 2),
     ("with", 1),
     ("make", 3),
+    ("edit", 2),
     ("define", 3),
     ("define-prefix", 3),
     ("document", 3),
@@ -2915,11 +3112,16 @@ const DEBUGGER_DENY: &[(&str, usize)] = &[
     ("command", 3),
 ];
 
-/// Classifies one gdb or lldb command. `Ok(Some(source))` is a shell command to reparse.
+/// lldb `platform` subcommands that read or write files. Each entry is a name and the shortest
+/// abbreviation that the rules match.
+const PLATFORM_FILE: &[(&str, usize)] = &[("file", 1), ("get-file", 5), ("put-file", 2)];
+
+/// Classifies one gdb or lldb command; `gdb` is false for lldb. `Ok(Some(source))` is a shell
+/// command to reparse.
 ///
 /// The rules deny known meta commands instead of allowing only known-safe ones. A deny list is
 /// simpler, and it keeps every plain inspection command (`bt`, `info`, `frame`, `print`) allowed.
-fn debugger_command(text: &str) -> Result<Option<String>, Rule> {
+fn debugger_command(text: &str, gdb: bool) -> Result<Option<String>, Rule> {
     let text = text.trim_start();
     // `$_shell(CMD)` runs CMD inside any expression (`print $_shell("cat f")`).
     if text.contains("$_shell") {
@@ -2932,10 +3134,23 @@ fn debugger_command(text: &str) -> Result<Option<String>, Rule> {
     } else {
         first_word(text)
     };
-    let (head, rest) = match first_word(rest) {
-        (sub, after) if abbrev(head, "platform", 3) && abbrev(sub, "shell", 2) => ("shell", after),
-        _ if abbrev(head, "platform", 3) => return Ok(None),
-        _ => (head, rest),
+    // lldb `platform shell` runs a shell, `platform process launch` runs a program, and
+    // `PLATFORM_FILE` reads and writes files.
+    let (head, rest) = if abbrev(head, "platform", 3) {
+        match first_word(rest) {
+            (sub, after) if abbrev(sub, "shell", 2) => ("shell", after),
+            (sub, after) if abbrev(sub, "process", 2) => ("process", after),
+            (sub, _)
+                if PLATFORM_FILE
+                    .iter()
+                    .any(|&(full, min)| abbrev(sub, full, min)) =>
+            {
+                return Err(DEBUGGER_SCRIPT);
+            }
+            _ => return Ok(None),
+        }
+    } else {
+        (head, rest)
     };
     let rest = rest.trim();
     if abbrev(head, "shell", 2) {
@@ -2948,12 +3163,15 @@ fn debugger_command(text: &str) -> Result<Option<String>, Rule> {
     let (sub, after) = first_word(rest);
     // `thread apply all bt` and `taas bt` run another command on each thread or frame.
     if matches!(head, "taas" | "faas" | "tfaas") {
-        return debugger_command(apply_body(rest));
+        return debugger_command(apply_body(rest), gdb);
     }
     if (abbrev(head, "thread", 1) || abbrev(head, "frame", 1)) && abbrev(sub, "apply", 1) {
-        return debugger_command(apply_body(after));
+        return debugger_command(apply_body(after), gdb);
     }
-    let denied = matches!(head, "py" | "pi" | "gu")
+    // gdb aliases of denied commands (`gdb/python/python.c`, `gdb/guile/guile.c`,
+    // `gdb/compile/compile.c`). lldb `expression` prints values, so only gdb denies it.
+    let denied = matches!(head, "py" | "pi" | "gu" | "gr")
+        || (gdb && abbrev(head, "expression", 3))
         || DEBUGGER_DENY
             .iter()
             .any(|&(full, min)| abbrev(head, full, min))
@@ -3014,6 +3232,8 @@ struct Repl {
     operands: usize,
     /// Options that take a value.
     valued: &'static [&'static str],
+    /// Options that take two values (`sqlite3 -lookaside SIZE N`).
+    pairs: &'static [&'static str],
     /// Options, and bare words such as `R CMD`, that name the program. A `-` value is stdin.
     program: &'static [&'static str],
     /// Flags that start the REPL even after a program runs (`lua -i`).
@@ -3028,6 +3248,7 @@ const fn repl(name: &'static str, operands: usize) -> Repl {
         name,
         operands,
         valued: &[],
+        pairs: &[],
         program: &[],
         interactive: &[],
         default_program: false,
@@ -3036,10 +3257,14 @@ const fn repl(name: &'static str, operands: usize) -> Repl {
 
 const MAKE_PROGRAM: &[&str] = &["-f", "--file", "--makefile"];
 const LUA_VALUED: &[&str] = &["-l", "-j"];
+/// sqlite3 options that take a value (`sqlite3 -help` in 3.54.1, and `-heap`, `-threadsafe`, and
+/// `-sorterref` from `shell.c`).
 const SQLITE_VALUED: &[&str] = &[
     "-cmd",
+    "-cmdline-edit",
     "-separator",
     "-newline",
+    "-nonce",
     "-nullvalue",
     "-vfs",
     "-mmap",
@@ -3047,7 +3272,12 @@ const SQLITE_VALUED: &[&str] = &[
     "-maxsize",
     "-escape",
     "-init",
+    "-screenwidth",
+    "-threadsafe",
+    "-sorterref",
 ];
+/// sqlite3 options that take two values.
+const SQLITE_PAIRS: &[&str] = &["-lookaside", "-pagecache"];
 
 const REPLS: &[Repl] = &[
     Repl {
@@ -3081,6 +3311,7 @@ const REPLS: &[Repl] = &[
     },
     Repl {
         valued: SQLITE_VALUED,
+        pairs: SQLITE_PAIRS,
         interactive: &["-interactive"],
         ..repl("sqlite", 2)
     },
@@ -3164,6 +3395,8 @@ fn repl_program(spec: &Repl, args: &[Arg]) -> Outcome {
             interactive = true;
         } else if INFO_FLAGS.contains(&t) {
             info = true;
+        } else if match_opt(t, spec.pairs) == Some(OptValue::Next) {
+            i += 2;
         } else if match_opt(t, spec.valued) == Some(OptValue::Next) {
             i += 1;
         }
@@ -3304,7 +3537,9 @@ fn sqlite_io(args: &[Arg]) -> bool {
             .into_iter()
             .find_map(|n| Some((n, match_opt(t, &[n])?)))
         else {
-            if match_opt(t, SQLITE_VALUED) == Some(OptValue::Next) {
+            if match_opt(t, SQLITE_PAIRS) == Some(OptValue::Next) {
+                i += 2;
+            } else if match_opt(t, SQLITE_VALUED) == Some(OptValue::Next) {
                 i += 1;
             }
             continue;

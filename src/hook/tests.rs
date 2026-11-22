@@ -2087,3 +2087,204 @@ fn round2_more_runners_unwrap() {
         "pixi install",
     ]);
 }
+
+#[test]
+fn round3_sqlite_skips_every_option_value() {
+    assert_rules(&[
+        ("sqlite3 -lookaside 64 8 app.db", "stdin repl"),
+        ("sqlite3 -pagecache 64 8 app.db", "stdin repl"),
+        ("sqlite3 -nonce x app.db", "stdin repl"),
+        ("sqlite3 --lookaside 64 8 app.db", "stdin repl"),
+        ("sqlite3 -screenwidth 80 app.db", "stdin repl"),
+        ("sqlite3 -threadsafe 1 app.db", "stdin repl"),
+        ("sqlite3 -cmdline-edit off app.db", "stdin repl"),
+        (
+            "sqlite3 -lookaside 64 8 app.db \"select readfile('README.md')\"",
+            "sqlite3 io",
+        ),
+    ]);
+    assert_all_allow(&[
+        "sqlite3 -lookaside 64 8 app.db \"select 1\"",
+        "sqlite3 -pagecache 64 8 app.db .tables",
+        "sqlite3 -nonce x app.db \"select 1\"",
+        "sqlite3 -cmd 'pragma foreign_keys=on' app.db \"select 1\"",
+        // The database operand is not SQL, so its name cannot deny.
+        "sqlite3 -lookaside 64 8 edit.db \"select 1\"",
+    ]);
+}
+
+#[test]
+fn round3_bun_repl_reads_stdin() {
+    assert_rules(&[
+        ("bun repl", "shell stdin"),
+        ("bun --cwd web repl", "shell stdin"),
+    ]);
+    assert_all_allow(&[
+        "bun test",
+        "bun run build",
+        "bun install",
+        "bun x prettier --check .",
+    ]);
+}
+
+#[test]
+fn round3_yarn_node_runs_node() {
+    assert_rules(&[
+        (
+            "yarn node -p \"require('fs').readFileSync('README.md','utf8')\"",
+            "node",
+        ),
+        ("yarn node -e 'console.log(1)'", "node"),
+        ("yarn --cwd web node -p 1", "node"),
+        ("yarn node", "node"),
+    ]);
+    assert_all_allow(&[
+        "yarn test",
+        "yarn build",
+        "yarn node scripts/build.js",
+        "yarn node --version",
+        "yarn add -D vitest",
+    ]);
+}
+
+#[test]
+fn round3_npm_explore_runs_shell_source() {
+    assert_rules(&[
+        ("npm explore foo -- cat README.md", "cat"),
+        ("npm explore foo cat README.md", "cat"),
+        ("npm explore -- foo cat README.md", "cat"),
+        ("npm explore foo -- 'cat README.md'", "cat"),
+        ("npm --prefix web explore foo -- cat README.md", "cat"),
+        ("npm explore foo", "shell stdin"),
+        ("npm explore foo --", "shell stdin"),
+        ("npm explore foo -- sh", "shell stdin"),
+    ]);
+    assert_all_allow(&[
+        "npm explore foo -- npm test",
+        "npm explore foo -- ls",
+        "npm test",
+        "npm run build",
+    ]);
+}
+
+#[test]
+fn round3_gdb_edit_runs_the_editor_through_a_shell() {
+    assert_rules(&[
+        ("gdb -batch -ex 'edit main' ./a.out", "debugger script"),
+        ("gdb -batch -ex 'ed main' ./a.out", "debugger script"),
+        (
+            "gdb -batch -ex 'thread apply all edit' -p 1",
+            "debugger script",
+        ),
+    ]);
+    assert_all_allow(&[
+        "gdb -batch -ex 'info frame' ./core",
+        "gdb -batch -ex 'echo hi' ./a.out",
+        "gdb -batch -ex 'enable 1' ./a.out",
+    ]);
+}
+
+#[test]
+fn round3_gdb_aliases_of_denied_commands_deny() {
+    assert_rules(&[
+        ("gdb -batch -ex guile-repl", "debugger script"),
+        ("gdb -batch -ex gr", "debugger script"),
+        ("gdb -batch -ex guile-r", "debugger script"),
+        ("gdb -batch -ex pi", "debugger script"),
+        ("gdb -batch -ex python-interactive", "debugger script"),
+        (
+            "gdb -batch -ex 'expression int x = 1;' -p 1",
+            "debugger script",
+        ),
+        ("gdb -batch -ex 'expr 1' -p 1", "debugger script"),
+    ]);
+    assert_all_allow(&[
+        "gdb -batch -ex 'info frame' ./core",
+        "gdb -batch -ex 'explore x' ./a.out",
+        "lldb -b -o 'expr x' ./a.out",
+        "lldb -b -o 'expression x' ./a.out",
+    ]);
+}
+
+#[test]
+fn round3_lldb_platform_file_and_process_commands() {
+    assert_rules(&[
+        (
+            "lldb -b -o 'platform file open README.md'",
+            "debugger script",
+        ),
+        (
+            "lldb -b -o 'platform file read -o 0 -c 100 0'",
+            "debugger script",
+        ),
+        (
+            "lldb -b -o 'platform get-file README.md out'",
+            "debugger script",
+        ),
+        (
+            "lldb -b -o 'platform put-file README.md out'",
+            "debugger script",
+        ),
+        (
+            "lldb -b -o 'platform process launch -- /bin/cat README.md'",
+            "debugger script",
+        ),
+        ("lldb -b -o 'platform shell cat README.md'", "cat"),
+    ]);
+    assert_all_allow(&[
+        "lldb -b -o 'platform status'",
+        "lldb -b -o 'platform list'",
+        "lldb -b -o 'platform process list'",
+        "lldb -b -o 'platform file-exists README.md'",
+    ]);
+}
+
+#[test]
+fn round3_hatch_env_run_unwraps() {
+    assert_rules(&[
+        ("hatch env run -- cat README.md", "cat"),
+        ("hatch env run -e test -- cat README.md", "cat"),
+        ("hatch env run -i py=3.12 -- cat README.md", "cat"),
+        ("hatch env run 'cat README.md'", "cat"),
+    ]);
+    assert_all_allow(&[
+        "hatch env run -- pytest",
+        "hatch env run -i py=3.12 -x version=9000 test:pytest",
+        "hatch env create",
+        "hatch env show",
+        "hatch env prune",
+        "hatch run test",
+    ]);
+}
+
+#[test]
+fn round3_nix_run_checks_the_program_of_the_installable() {
+    assert_rules(&[
+        ("nix run nixpkgs#bash", "shell stdin"),
+        ("nix run nixpkgs#bashInteractive", "shell stdin"),
+        ("nix run nixpkgs#bash -- -c 'cat README.md'", "cat"),
+        ("nix run nixpkgs#bat -- README.md", "bat"),
+        ("nix run nixpkgs#bat README.md", "bat"),
+        ("nix run nixpkgs#python3", "python"),
+        ("nix run -- nixpkgs#bash", "shell stdin"),
+        ("nix run --option sandbox false nixpkgs#bash", "shell stdin"),
+        (
+            "nix run --new-opt nixpkgs#hello nixpkgs#bash",
+            "shell stdin",
+        ),
+        ("nix run -f '<nixpkgs>' bash", "shell stdin"),
+        ("env GIT_PAGER='cat f' nix run nixpkgs#git -- log", "git -c"),
+        ("nix run", "unresolved"),
+        ("nix run .", "unresolved"),
+        ("nix run \"$X\"", "unresolved"),
+    ]);
+    assert_all_allow(&[
+        "nix run nixpkgs#hello",
+        "nix run nixpkgs#hello -- --greeting hi",
+        "nix run --impure nixpkgs#hello",
+        "nix run .#test",
+        "nix develop -c cargo test",
+        "nix build",
+        "nix flake check",
+    ]);
+}

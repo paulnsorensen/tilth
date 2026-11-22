@@ -212,7 +212,18 @@
     {"command": "hatch run dev:cat src/main.rs", "rule": "cat"},
     {"command": "rye run cat src/main.rs", "rule": "cat"},
     {"command": "devbox run cat src/main.rs", "rule": "cat"},
-    {"command": "pixi exec cat src/main.rs", "rule": "cat"}
+    {"command": "pixi exec cat src/main.rs", "rule": "cat"},
+    {"command": "sqlite3 -lookaside 64 8 app.db", "rule": "stdin repl"},
+    {"command": "sqlite3 -nonce x app.db", "rule": "stdin repl"},
+    {"command": "bun repl", "rule": "shell stdin"},
+    {"command": "yarn node -p \"require('fs').readFileSync('src/main.rs','utf8')\"", "rule": "node"},
+    {"command": "npm explore foo -- cat src/main.rs", "rule": "cat"},
+    {"command": "npm explore foo", "rule": "shell stdin"},
+    {"command": "gdb -batch -ex 'edit main' ./a.out", "rule": "debugger script"},
+    {"command": "gdb -batch -ex gr", "rule": "debugger script"},
+    {"command": "lldb -b -o 'platform file open src/main.rs'", "rule": "debugger script"},
+    {"command": "hatch env run -- cat src/main.rs", "rule": "cat"},
+    {"command": "nix run nixpkgs#bash", "rule": "shell stdin"}
   ],
   "must_allow": [
     {"command": "go test ./..."},
@@ -312,6 +323,14 @@
     {"command": "make CFLAGS=-O2 test"},
     {"command": "sqlite3 app.db \"select count(*) from t\""},
     {"command": "sqlite3 app.db .tables"},
-    {"command": "gdb --batch --ex 'info threads' -p 1"}
+    {"command": "gdb --batch --ex 'info threads' -p 1"},
+    {"command": "bun test"},
+    {"command": "yarn node scripts/build.js"},
+    {"command": "npm explore foo -- npm test"},
+    {"command": "hatch env run -- pytest"},
+    {"command": "nix run nixpkgs#hello"},
+    {"command": "nix develop -c cargo test"},
+    {"command": "sqlite3 -cmd 'pragma foreign_keys=on' app.db \"select 1\""},
+    {"command": "gdb -batch -ex 'info frame' ./core"}
   ]
 }
