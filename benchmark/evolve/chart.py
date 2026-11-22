@@ -239,44 +239,33 @@ def _y_axis(ticks: list[float], to_y, theme: dict, *, sign: str = "") -> list[st
 
 
 def _direct_labels(labels: list[tuple[float, float, str, str]]) -> list[str]:
-    """Series names right of their last point, pushed apart when they sit closer than 14px."""
+    """Series names right of their last point, pushed apart when they sit closer than 14px.
+
+    A label that the push moves below the score panel moves the group up instead, so no name crosses the delta panel.
+    """
     labels = sorted(labels, key=lambda label: label[1])
     for index in range(1, len(labels)):
         x, y, text, color = labels[index]
         if y - labels[index - 1][1] < 14:
             labels[index] = (x, labels[index - 1][1] + 14, text, color)
+    if labels and labels[-1][1] > SCORE_BOTTOM:
+        for index in reversed(range(len(labels))):
+            x, y, text, color = labels[index]
+            limit = SCORE_BOTTOM if index == len(labels) - 1 else labels[index + 1][1] - 14
+            labels[index] = (x, min(y, limit), text, color)
     return [_text(x + 10, y + 4, text, color, weight="600") for x, y, text, color in labels]
 
 
-def render(entries: list[dict], theme_name: str) -> str:
-    """The chart of ``entries`` in the ``light`` or ``dark`` theme, as SVG text; runs sort by time, then run id."""
-    theme = THEMES[theme_name]
-    if not entries:
-        return _frame(theme, [
-            _line(LEFT, SCORE_BOTTOM, WIDTH - RIGHT, SCORE_BOTTOM, theme["axis"]),
-            _text(WIDTH / 2, (SCORE_TOP + SCORE_BOTTOM) / 2, "No evolve runs yet", theme["secondary"], size=16,
-                  anchor="middle"),
-            _text(16, TABLE_TOP, NOTE, theme["muted"], size=11),
-        ], TABLE_TOP + 18)
-    entries = sorted(entries, key=lambda entry: (entry["recorded_at"], entry["run_id"]))
-    times = [_when(entry) for entry in entries]
-    xs = _x_positions(times)
+def _score_panel(entries: list[dict], xs: list[float], bands: list[str], theme: dict) -> list[str]:
+    """The seed and winner dev means per run against the parity line, with band names and PR rings."""
     run_ids = [entry["run_id"] for entry in entries]
-    bands = [band_label(entry) for entry in entries]
     seed = [entry.get("seed_dev_mean") for entry in entries]
     best = [entry.get("best_dev_mean") for entry in entries]
-    deltas = [entry.get("paired_test_delta") for entry in entries]
-
     scores = [value for value in (*seed, *best) if value is not None]
     score_ticks = nice_ticks(min([0.0, *scores]), max([1.2, *(value * 1.05 for value in scores)]))
     to_score = _scale(score_ticks[0], score_ticks[-1], SCORE_TOP, SCORE_BOTTOM)
-    spread = [value for delta in deltas if delta for value in (delta["low"], delta["high"], delta["point"])]
-    reach = max([0.1, *(abs(value) * 1.1 for value in spread)])
-    delta_ticks = nice_ticks(-reach, reach, 2)
-    to_delta = _scale(delta_ticks[0], delta_ticks[-1], DELTA_TOP, DELTA_BOTTOM)
 
-    body = _legend(theme)
-    body += _y_axis(score_ticks, to_score, theme)
+    body = _y_axis(score_ticks, to_score, theme)
     body += [_line(LEFT, to_score(1.0), WIDTH - RIGHT, to_score(1.0), theme["muted"], width=1.5, dash="4 4"),
              _text(LEFT + 6, to_score(1.0) - 6, "parity 1.0", theme["muted"], size=11)]
     body += _panel_bands(xs, bands, theme)
@@ -295,9 +284,18 @@ def render(entries: list[dict], theme_name: str) -> str:
         last = [(x, value) for x, value in zip(xs, values) if value is not None]
         if last:
             labels.append((last[-1][0], to_score(last[-1][1]), name, theme[name]))
-    body += _direct_labels(labels)
+    return body + _direct_labels(labels)
 
-    body.append(_text(LEFT, DELTA_TOP - 10, "Paired test delta, winner minus seed, with 95% CI", theme["secondary"]))
+
+def _delta_panel(entries: list[dict], xs: list[float], theme: dict) -> list[str]:
+    """The paired test delta (winner minus seed) per run, with its 95% CI."""
+    deltas = [entry.get("paired_test_delta") for entry in entries]
+    spread = [value for delta in deltas if delta for value in (delta["low"], delta["high"], delta["point"])]
+    reach = max([0.1, *(abs(value) * 1.1 for value in spread)])
+    delta_ticks = nice_ticks(-reach, reach, 2)
+    to_delta = _scale(delta_ticks[0], delta_ticks[-1], DELTA_TOP, DELTA_BOTTOM)
+
+    body = [_text(LEFT, DELTA_TOP - 10, "Paired test delta, winner minus seed, with 95% CI", theme["secondary"])]
     body += _y_axis(delta_ticks, to_delta, theme, sign="+")
     body.append(_line(LEFT, to_delta(0.0), WIDTH - RIGHT, to_delta(0.0), theme["axis"], width=1.5))
     for x, entry, delta in zip(xs, entries, deltas):
@@ -315,15 +313,39 @@ def render(entries: list[dict], theme_name: str) -> str:
     if not any(deltas):
         body.append(_text((LEFT + WIDTH - RIGHT) / 2, (DELTA_TOP + DELTA_BOTTOM) / 2 - 6,
                           "No run reached the test split yet", theme["muted"], size=11, anchor="middle"))
+    return body
 
-    body.append(_line(LEFT, DELTA_BOTTOM + 4, WIDTH - RIGHT, DELTA_BOTTOM + 4, theme["axis"]))
+
+def _time_axis(entries: list[dict], times: list[datetime], xs: list[float], theme: dict) -> list[str]:
+    """The time axis under the delta panel: one tick per run, and up to five date labels."""
+    body = [_line(LEFT, DELTA_BOTTOM + 4, WIDTH - RIGHT, DELTA_BOTTOM + 4, theme["axis"])]
     # One tick per run, so a run that reached no score still shows on the time axis.
     for x, entry in zip(xs, entries):
         tip = f"{entry['run_id']}: {entry.get('outcome') or 'no finish result'}"
         tick = _line(x, DELTA_BOTTOM, x, DELTA_BOTTOM + 8, theme["muted"], width=2)
         body.append(f"<g><title>{escape(tip)}</title>{tick}</g>")
-    body += [_text(x, TICK_LABEL_Y, label, theme["muted"], size=11, anchor="middle")
-             for x, label in _time_ticks(times, xs)]
+    return body + [_text(x, TICK_LABEL_Y, label, theme["muted"], size=11, anchor="middle")
+                   for x, label in _time_ticks(times, xs)]
+
+
+def render(entries: list[dict], theme_name: str) -> str:
+    """The chart of ``entries`` in the ``light`` or ``dark`` theme, as SVG text; runs sort by time, then run id."""
+    theme = THEMES[theme_name]
+    if not entries:
+        return _frame(theme, [
+            _line(LEFT, SCORE_BOTTOM, WIDTH - RIGHT, SCORE_BOTTOM, theme["axis"]),
+            _text(WIDTH / 2, (SCORE_TOP + SCORE_BOTTOM) / 2, "No evolve runs yet", theme["secondary"], size=16,
+                  anchor="middle"),
+            _text(16, TABLE_TOP, NOTE, theme["muted"], size=11),
+        ], TABLE_TOP + 18)
+    entries = sorted(entries, key=lambda entry: (entry["recorded_at"], entry["run_id"]))
+    times = [_when(entry) for entry in entries]
+    xs = _x_positions(times)
+    bands = [band_label(entry) for entry in entries]
+    body = _legend(theme)
+    body += _score_panel(entries, xs, bands, theme)
+    body += _delta_panel(entries, xs, theme)
+    body += _time_axis(entries, times, xs, theme)
     table, bottom = _arm_table(entries, bands, theme)
     body += table
     body.append(_text(16, bottom, NOTE, theme["muted"], size=11))

@@ -20,8 +20,6 @@ if not __package__:
     # Run as a script: import ``evolve`` from benchmark/ without the harness modules.
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from evolve import chart  # noqa: E402
-
 SCHEMA = 2
 # The committed log; the README embeds the two charts next to it.
 COMMITTED_LOG = Path(__file__).resolve().parent.parent / "log" / "evolve.jsonl"
@@ -90,6 +88,9 @@ def redraw(log: Path) -> tuple[Path, Path]:
 
     The charts show the last entry of each run id; the log keeps every line.
     """
+    # ``chart`` loads only here: loop.py imports this module, and an import fault in chart.py must not stop a run.
+    from evolve import chart
+
     log = Path(log)
     log.parent.mkdir(parents=True, exist_ok=True)
     log.touch()

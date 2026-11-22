@@ -5,6 +5,7 @@ Every run here writes to a temp log; no test touches the committed ``benchmark/l
 
 import json
 import os
+import re
 import subprocess
 import sys
 import xml.etree.ElementTree as ElementTree
@@ -145,6 +146,22 @@ def test_an_incomplete_run_appends_an_entry_and_keeps_its_exit_code(monkeypatch:
     assert run_entry(world) == entry
 
 
+def test_a_malformed_log_line_names_its_place_and_keeps_the_run_result(monkeypatch: pytest.MonkeyPatch,
+                                                                      tmp_path: Path) -> None:
+    log = tmp_path / "evolve.jsonl"
+    log.write_text('{"run_id": "ok"}\n{not json\n')
+    with pytest.raises(ValueError, match=rf"^{re.escape(str(log))}:2: "):
+        benchlog.load(log)
+    world = make_world(monkeypatch, tmp_path)
+    use_engine(monkeypatch)
+
+    assert main(world, "--benchmark-log", str(log)) == 0
+
+    [failure] = [line for line in log_text(world).splitlines() if line.startswith("benchmark log: ")]
+    assert failure.startswith(f"benchmark log: redraw failed (ValueError: {log}:2: ")
+    assert run_entry(world)["outcome"] == "no_improvement"
+
+
 def raise_git_error(*_args, **_kwargs):
     raise GitError(["push"], "rejected")
 
@@ -250,9 +267,61 @@ def test_the_chart_is_deterministic_and_valid(theme: str) -> None:
     first = chart.render(SAMPLES, theme)
     assert chart.render(list(reversed(SAMPLES)), theme) == first
     root = ElementTree.fromstring(first)
-    texts = " ".join("".join(node.itertext()) for node in root.iter("{http://www.w3.org/2000/svg}text"))
-    assert "parity 1.0" in texts and "PR" in texts and "95% CI" in texts
-    assert root.find(".//{http://www.w3.org/2000/svg}line[@stroke-dasharray]") is not None
+    svg = "{http://www.w3.org/2000/svg}"
+    # The per-run elements: one PR ring for the run that opened a PR, and one CI group per run with a test delta.
+    rings = [circle.findtext(f"{svg}title") for circle in root.iter(f"{svg}circle") if circle.get("r") == "9"]
+    assert rings == ["b: draft PR opened"]
+    groups = [group.findtext(f"{svg}title") or "" for group in root.iter(f"{svg}g")]
+    ci = sorted(title.split(":")[0] for title in groups if "95% CI" in title)
+    assert ci == ["a", "b"]
+    assert any(title.startswith("b: paired test delta +0.200, 95% CI [0.050, 0.400]") for title in groups)
+
+
+@pytest.mark.parametrize("theme", ["light", "dark"])
+def test_a_log_without_any_dev_mean_renders(theme: str) -> None:
+    """A first run that stops before the seed is scored has no mean; the chart still draws its tick."""
+    runs = [sample_entry("x", "2026-11-01T10:00:00Z", outcome="failed"),
+            sample_entry("y", "2026-11-02T10:00:00Z", outcome="incomplete")]
+
+    svg = chart.render(runs, theme)
+
+    assert "x: failed" in svg and "y: incomplete" in svg
+    assert polylines(svg) == 0
+
+
+def test_two_runs_at_one_time_get_one_x_and_both_ticks() -> None:
+    runs = [sample_entry("p", "2026-11-01T10:00:00Z", seed_dev_mean=0.5, outcome="no_improvement"),
+            sample_entry("q", "2026-11-01T10:00:00Z", seed_dev_mean=0.7, outcome="no_improvement")]
+
+    root = ElementTree.fromstring(chart.render(runs, "light"))
+
+    svg = "{http://www.w3.org/2000/svg}"
+    dots = {circle.findtext(f"{svg}title").split(":")[0]: circle.get("cx") for circle in root.iter(f"{svg}circle")
+            if (circle.findtext(f"{svg}title") or "").endswith(("0.500", "0.700"))}
+    assert dots["p"] == dots["q"]
+    ticks = [group.findtext(f"{svg}title") for group in root.iter(f"{svg}g")]
+    assert "p: no_improvement" in ticks and "q: no_improvement" in ticks
+
+
+def test_narrow_adjacent_bands_put_their_names_on_distinct_rows() -> None:
+    runs = [sample_entry(name, f"2026-11-01T10:0{index}:00Z", panel=f"panel-{name}", model="sonnet",
+                         seed_dev_mean=0.5)
+            for index, name in enumerate(("a", "b", "c"))] + [
+        sample_entry("z", "2026-11-20T10:00:00Z", panel="panel-z", model="sonnet", seed_dev_mean=0.5)]
+
+    root = ElementTree.fromstring(chart.render(runs, "light"))
+
+    names = {node.text: float(node.get("y")) for node in root.iter("{http://www.w3.org/2000/svg}text")
+             if (node.text or "").startswith("panel-")}
+    assert len({names[f"panel-{name} · sonnet"] for name in ("a", "b", "c")}) == 3
+
+
+def test_a_pushed_series_label_stays_inside_the_score_panel() -> None:
+    labels = [(700.0, chart.SCORE_BOTTOM, "seed", "#000"), (700.0, chart.SCORE_BOTTOM, "winner", "#111")]
+
+    ys = sorted(float(ElementTree.fromstring(part).get("y")) - 4 for part in chart._direct_labels(labels))
+
+    assert ys[-1] <= chart.SCORE_BOTTOM and ys[1] - ys[0] >= 14
 
 
 def test_the_themes_use_their_own_surface() -> None:
@@ -297,6 +366,16 @@ def test_the_committed_charts_match_the_committed_log(tmp_path: Path) -> None:
     rows = benchlog.latest(benchlog.load(benchlog.COMMITTED_LOG))
     assert light.read_text() == chart.render(rows, "light")
     assert dark.read_text() == chart.render(rows, "dark")
+
+
+def test_loading_benchlog_does_not_load_the_chart() -> None:
+    """loop.py imports benchlog, so an import fault in chart.py must not stop a run before preflight."""
+    code = ("import sys; sys.path.insert(0, sys.argv[1]); from evolve import benchlog; "
+            "print('evolve.chart' in sys.modules)")
+    done = subprocess.run([sys.executable, "-c", code, str(Path(benchlog.__file__).parent.parent)],
+                          capture_output=True, text=True, env={**os.environ, "PYTHONPATH": ""})
+    assert done.returncode == 0, done.stderr
+    assert done.stdout.strip() == "False"
 
 
 def test_the_redraw_script_runs_without_the_harness(tmp_path: Path) -> None:
