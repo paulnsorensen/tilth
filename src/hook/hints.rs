@@ -29,6 +29,15 @@ pub(super) const PERL_I: Rule = "perl -i";
 pub(super) const AWK_INPLACE: Rule = "awk -i inplace";
 pub(super) const PYTHON_M: Rule = "python -m";
 pub(super) const GIT_CONFIG: Rule = "git -c";
+/// A REPL or debugger that reads its commands from stdin (`irb`, `make -f -`, `gdb`).
+pub(super) const STDIN_REPL: Rule = "stdin repl";
+/// A gdb or lldb command that runs a script, a shell, or a meta command, that reads or writes a
+/// file (lldb `platform file`), or that gives the program arguments the rules cannot check.
+pub(super) const DEBUGGER_SCRIPT: Rule = "debugger script";
+/// sqlite3 SQL or a dot-command that reads or writes files or runs a shell (`readfile`, `.shell`).
+pub(super) const SQLITE_IO: Rule = "sqlite3 io";
+/// `make --eval`, or a command-line make variable that runs a shell or a make function.
+pub(super) const MAKE_EVAL: Rule = "make --eval";
 
 /// Host-event rules. They never come from a command string, so the corpus does not cover them.
 pub(super) const MALFORMED_EVENT: Rule = "malformed event";
@@ -116,7 +125,16 @@ const WRITE_RULES: &[Rule] = &[
 const INTERPRETER_RULES: &[Rule] = &["python", "perl", "ruby", "node", "deno", "bun", "php"];
 
 #[cfg(test)]
-const OTHER_RULES: &[Rule] = &[PARSE_ERROR, UNRESOLVED, SHELL_STDIN, GIT_CONFIG];
+const OTHER_RULES: &[Rule] = &[
+    PARSE_ERROR,
+    UNRESOLVED,
+    SHELL_STDIN,
+    GIT_CONFIG,
+    STDIN_REPL,
+    DEBUGGER_SCRIPT,
+    SQLITE_IO,
+    MAKE_EVAL,
+];
 
 /// Every rule name the command rules can cite.
 #[cfg(test)]
@@ -153,6 +171,10 @@ const SHELL_MAP: &str = "Shell cannot cat/head/tail/sed/awk/wc/grep/rg/git grep 
     in a unique scratch dir (`mktemp -d`), then run that file with Bash; ls/find; git history \
     and review; tests; builds.";
 
+/// How to run a debugger so the hook can check it, shared by both deny-hint styles.
+const DEBUGGER_FIX: &str = "Use plain debugger commands with -batch, and pass program \
+    arguments with `--args` (gdb) or after `--` (lldb).";
+
 /// Formats a denial reason with tilth tool calls for the rule's kind.
 fn tilth_reason(rule: &str, kind: Kind) -> String {
     let read = "mcp__tilth__tilth_read(paths:[\"<path>\"], cwd:\"<checkout>\")";
@@ -182,6 +204,34 @@ fn tilth_reason(rule: &str, kind: Kind) -> String {
              {SHELL_MAP}"
         ),
         Kind::Write => write_reason(rule, write),
+        Kind::Generic if rule == STDIN_REPL => format!(
+            "Blocked: this command starts a REPL or debugger that reads its commands from stdin, \
+             so the hook cannot see what it runs. Give it a program instead. \
+             Create a script with tilth_write in a unique scratch dir (`mktemp -d`), \
+             then run that file with Bash (`lua <file>`, `irb <file>`, `make -f <file>`). \
+             Pass plain SQL as an argument (`sqlite3 <db> \"select ...\"`), and run gdb or lldb \
+             with -batch.\n\n\
+             {SHELL_MAP}"
+        ),
+        Kind::Generic if rule == DEBUGGER_SCRIPT => format!(
+            "Blocked: a gdb or lldb command (`-ex`, `-o`) runs a script, a shell, or another \
+             command, reads or writes a file, or gives the program arguments, so the hook \
+             cannot see what it reads. {DEBUGGER_FIX} Read files with tilth_read, search with tilth_search, and write \
+             with tilth_write."
+        ),
+        Kind::Generic if rule == SQLITE_IO => "Blocked: this sqlite3 SQL or dot-command reads \
+             or writes files or runs a shell (`readfile()`, `fsdir()`, `.read`, `.import`, \
+             `.output`, `.shell`), so the hook cannot see what it touches. Query the database \
+             with plain SQL. Read files with tilth_read, search with tilth_search, and write \
+             with tilth_write."
+            .to_string(),
+        Kind::Generic if rule == MAKE_EVAL => format!(
+            "Blocked: `make --eval`, or a make variable on the command line that calls \
+             `$(shell)`, `$(file)`, or `$(eval)` or uses `!=`, runs make code the hook cannot \
+             see. Create a makefile with tilth_write in a unique scratch dir (`mktemp -d`), \
+             then run `make -f <file>`.\n\n\
+             {SHELL_MAP}"
+        ),
         Kind::Generic => format!(
             "Blocked: the hook cannot allow this command (`{rule}`). \
              Read files with tilth_read, search with tilth_search, and write with tilth_write."
@@ -235,6 +285,26 @@ fn native_reason(rule: &str, kind: Kind) -> String {
             "Blocked: shell `{rule}` writes files or runs inline code. \
              Use the Edit tool to change an existing file and the Write tool to create a new one."
         ),
+        Kind::Generic if rule == STDIN_REPL => "Blocked: this command starts a REPL or debugger \
+             that reads its commands from stdin, so the hook cannot see what it runs. Give it a \
+             script file or the program as an argument, and run gdb or lldb with -batch. \
+             Use the Read, Grep, Glob, Edit, and Write tools for file work."
+            .to_string(),
+        Kind::Generic if rule == DEBUGGER_SCRIPT => format!(
+            "Blocked: a gdb or lldb command (`-ex`, `-o`) runs a script, a shell, or another \
+             command, reads or writes a file, or gives the program arguments, so the hook \
+             cannot see what it reads. {DEBUGGER_FIX} Use the Read, Grep, Glob, Edit, and Write tools for file work."
+        ),
+        Kind::Generic if rule == SQLITE_IO => "Blocked: this sqlite3 SQL or dot-command reads \
+             or writes files or runs a shell (`readfile()`, `.read`, `.output`, `.shell`). \
+             Query the database with plain SQL. \
+             Use the Read, Grep, Glob, Edit, and Write tools for file work."
+            .to_string(),
+        Kind::Generic if rule == MAKE_EVAL => "Blocked: `make --eval`, or a make variable on \
+             the command line that calls `$(shell)`, `$(file)`, or `$(eval)` or uses `!=`, \
+             runs make code the hook cannot see. Put the code in a makefile and run \
+             `make -f <file>`. Use the Read, Grep, Glob, Edit, and Write tools for file work."
+            .to_string(),
         Kind::Generic => format!(
             "Blocked: the hook cannot allow this command (`{rule}`). \
              Use the Read, Grep, Glob, Edit, and Write tools for file work."
