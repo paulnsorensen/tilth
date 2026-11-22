@@ -55,7 +55,14 @@ version is pinned at `0.8.4` across the whole fork (see CLAUDE.md fork law),
 so `tilth --version` cannot distinguish a stale binary from current HEAD.
 
 **Check byte sizes (or rebuild from source), not `--version`, when a fork
-binary's prompt surface is in question.**
+binary's prompt surface is in question.** This applies to builds before
+2026-11-22.
+
+Fix (2026-11-22, [fork version identity](adr/fork-version-identity.md)): the
+fork version is now `0.0.0-experimental`, and `tilth --version` adds the short
+git commit (`tilth 0.0.0-experimental+<sha>`). Compare that suffix with
+`git rev-parse --short HEAD`. A build without git metadata prints no suffix,
+so its age stays unknown.
 
 ## Related
 

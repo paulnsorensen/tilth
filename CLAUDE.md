@@ -89,10 +89,11 @@ CI runs `fmt --check`, `clippy -D warnings`, `cargo test`, the `tests/mcp_v2` an
 
 This is a **fork**. Some divergence from upstream is permanent and intentional; do not "fix" it toward upstream on a sync.
 
-**Version stays 0.8.4.** Do **not** bump the version on this fork. Leave `version` in `Cargo.toml` and `npm/package.json` untouched; do not tag releases. Version bumps are owned upstream and synced in via the upstream-merge commits — a fork-side bump diverges from upstream and conflicts on the next sync.
+**Fork version is `0.0.0-experimental`.** The fork has its own version identity. It never tracks upstream's number. `version` in `Cargo.toml` and `npm/package.json` is `0.0.0-experimental`. `build.rs` adds the short git commit, so `tilth --version` prints `tilth 0.0.0-experimental+<sha>`. Do not tag releases. `tests/mcp_v2/test_version_identity.py` fails when a sync brings back upstream's number.
 
 **Keep-ours fork features** (take the fork side on any sync conflict):
 
+- The fork version. On a sync, the `version` lines in `Cargo.toml`, `npm/package.json`, `Cargo.lock`, and `fuzz/Cargo.lock` resolve to `0.0.0-experimental`. Upstream's `.github/workflows/release.yml` stays deleted.
 - The whole-file-tag edit model — JSON `edits` array of `{path, tag?, ops}` sections lowered onto the tag/seen-lines-gate/3-way-merge-recovery machinery (per #116) — the fork's `tilth_write` surface, not upstream's.
 - cwd anchoring and the trust-absolute posture: every path-taking MCP tool takes a required `cwd` (renamed from upstream's optional `root`); relative paths anchor under `cwd` with `..` refused, absolute paths are trusted as-is. The MCP roots one-shot handshake is removed. The `root`→`cwd` rename and the trust-absolute posture are permanent fork patches — expect them to conflict on every upstream sync and always resolve to the fork side.
 - Edit-only MCP. The server has no read-only mode: `tilth_write` is always registered and `prompts/mcp.md` is the only instruction file. Upstream's `prompts/mcp-base.md`, `prompts/mcp-edit.md`, and `edit_mode` branches resolve to the fork side on a sync.
@@ -109,7 +110,7 @@ This is a **fork**. Some divergence from upstream is permanent and intentional; 
 - **Sync-back mechanics.** How upstream is pulled back down is the fork-law keep-ours rules above — see the **Fork law** / **Sync mechanics** blocks and `.hallouminate/wiki/`.
 - **Roadmap.** Contribute-back state is a wiki roadmap at `.hallouminate/wiki/roadmaps/upstream-contrib/` (ground or read it to see status); the routine owns advancing it.
 
-Releases publish **two npm names** from the same `npm/` wrapper: the canonical unscoped `tilth` and the org anchor `@plotplot/tilth` (the `publish-npm` job renames the artifact and republishes with `--access public`). Both publishes authenticate with `NPM_TOKEN` (`NODE_AUTH_TOKEN`); the `@plotplot/tilth` step is `continue-on-error` (best-effort) so a scope-setup failure never fails the release.
+The fork publishes one npm package: `@paulnsorensen/tilth-nightly`. `.github/workflows/nightly.yml` builds it from `npm-nightly/` on every push to `main` and stamps the version `0.0.0-experimental.<run>.<attempt>`. Nothing publishes to crates.io, the unscoped `tilth` npm name, or `@plotplot/tilth`. A `v*` tag publishes nothing.
 
 ## Benchmarks
 
