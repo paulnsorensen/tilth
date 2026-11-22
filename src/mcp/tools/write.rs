@@ -23,7 +23,7 @@ use crate::cache::OutlineCache;
 use crate::edit::apply::{ApplyError, FileOp, Written};
 use crate::edit::json::{lower_edits, teaching_error_for_string};
 use crate::edit::mismatch::MismatchError;
-use crate::edit::parser::{Op, Section};
+use crate::edit::parser::{Cursor, Op, Section};
 use crate::edit::recovery::{
     check_seen_lines, current_match_ranges, gated_apply, try_recover, unseen_anchor_lines,
     unseen_match_spans, EditError,
@@ -515,26 +515,48 @@ fn has_text_op(ops: &[Op]) -> bool {
     })
 }
 
-/// Give a tagless `replace_text`/`rewrite` section the live tag when this
+/// True when an op targets a line: a line edit, a block edit, or an insert
+/// before or after a line. File ops and head or tail inserts target no line.
+fn has_line_anchor(ops: &[Op]) -> bool {
+    ops.iter().any(|op| match op {
+        Op::Swap { .. } | Op::Del { .. } | Op::Block { .. } => true,
+        Op::Ins { cursor, .. } => matches!(cursor, Cursor::Pre(_) | Cursor::Post(_)),
+        _ => false,
+    })
+}
+
+/// Give a tagless text or line-anchored section the live tag when this
 /// session already displayed the live content. The server holds that tag, so
 /// a rejection that asks the agent to resend it only costs a round trip. The
 /// filled section then takes the tagged path, seen-lines gate included. Every
-/// other section passes through unchanged.
+/// other section, and every `create_file` section, passes through unchanged.
+///
+/// Text ops match on content, so any snapshot of the live content serves.
+/// Line numbers carry no content check, so a line-anchored section is filled
+/// only when the agent's latest view of the file is a read of the live
+/// content. After a write, the numbers of an earlier view can be stale.
 fn fill_live_tag<'a>(
     section: &'a Section,
     path: &Path,
     session: &Session,
     live: &str,
 ) -> Cow<'a, Section> {
-    if section.tag.is_some() || !has_text_op(&section.ops) {
+    let creates = section.ops.iter().any(|op| matches!(op, Op::Create { .. }));
+    let anchored = has_text_op(&section.ops) || has_line_anchor(&section.ops);
+    if section.tag.is_some() || creates || !anchored {
         return Cow::Borrowed(section);
     }
     let key = crate::edit::normalize_path_key(path);
     let live_tag = compute_file_hash(live);
-    let Some(snap) = session.snapshots().by_tag(&key, live_tag) else {
-        return Cow::Borrowed(section);
+    let store = session.snapshots();
+    let snap = if has_line_anchor(&section.ops) {
+        store
+            .head(path)
+            .filter(|_| !store.head_recorded_by_write(path))
+    } else {
+        store.by_tag(&key, live_tag)
     };
-    if snap.text != live {
+    if snap.is_none_or(|snap| snap.text != live) {
         return Cow::Borrowed(section);
     }
     let mut section = section.clone();
@@ -546,8 +568,8 @@ fn fill_live_tag<'a>(
 /// matched tag with intact content, the seen-lines-gated apply runs; on a
 /// drifted (or tag-collided) tag, [`recover_edit`] runs; a tagless section
 /// seeds/edits against live with synthetic empty provenance. A tagless text
-/// edit reaches this point only when [`fill_live_tag`] found no snapshot of
-/// the live content, so it is rejected. On a matched tag, lines that an
+/// or line-anchored edit reaches this point only when [`fill_live_tag`] found
+/// no snapshot of the live content, so it is rejected. On a matched tag, lines that an
 /// earlier tilth process in the checkout of `cwd` displayed for the exact live
 /// content also pass the gate.
 fn resolve_edit(
@@ -2868,6 +2890,87 @@ mod tests {
             "fn seeded() {}\n",
             "tagless section seeds the file with the inserted content"
         );
+    }
+
+    /// A tagless line-op section takes the live tag when this session displayed
+    /// the live content, so the seen-lines gate checks the real record: a
+    /// displayed line applies, and a line that was not displayed is not written.
+    #[test]
+    fn tagless_line_op_is_gated_by_the_lines_this_session_displayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("lines.rs");
+        let mut original = String::new();
+        for n in 1..=80 {
+            let _ = writeln!(original, "l{n}");
+        }
+        std::fs::write(&path, &original).unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let run = |line: u32| {
+            let ops = json!([{"op": "replace", "start": line, "end": line, "content": "edited"}]);
+            let args = json!({"cwd": dir.path(), "edits": edits(&path, None, ops)});
+            match super::tool_write(&args, &session, &bloom, &cache) {
+                Ok(out) => out,
+                Err(e) => e,
+            }
+        };
+
+        let cold = run(2);
+        assert!(cold.contains("line 2 was never displayed"), "{cold}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let spec = format!("{}#1-10", path.to_str().unwrap());
+        read_tag(dir.path(), &spec, "lines.rs#", &session, &cache);
+        // The tagged path's confirm flow: show the unseen lines, hold the edit.
+        let unseen = run(60);
+        assert!(
+            unseen.contains("never displayed under this tag, so nothing was written")
+                && unseen.contains("60:l60"),
+            "{unseen}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+        let applied = run(2);
+        assert!(applied.contains("applied"), "{applied}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            original.replacen("l2\n", "edited\n", 1)
+        );
+    }
+
+    /// Line numbers carry no content check. After a write shifts lines, the
+    /// numbers of the earlier view are stale, so a tagless line op is not
+    /// filled from the write's snapshot and cannot land on a shifted line.
+    #[test]
+    fn tagless_line_op_after_a_write_is_not_filled() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shift.rs");
+        let mut original = String::new();
+        for n in 1..=80 {
+            let _ = writeln!(original, "l{n}");
+        }
+        std::fs::write(&path, &original).unwrap();
+        let (session, bloom) = services();
+        let cache = OutlineCache::new();
+        let run = |ops: Value| {
+            let args = json!({"cwd": dir.path(), "edits": edits(&path, None, ops)});
+            match super::tool_write(&args, &session, &bloom, &cache) {
+                Ok(out) => out,
+                Err(e) => e,
+            }
+        };
+        let spec = format!("{}#1-80", path.to_str().unwrap());
+        read_tag(dir.path(), &spec, "shift.rs#", &session, &cache);
+
+        let insert = run(json!([{"op": "insert_after", "line": 10, "content": "a\nb\nc"}]));
+        assert!(insert.contains("applied"), "{insert}");
+        let shifted = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(shifted.lines().nth(49), Some("l47"));
+
+        // Line 50 of the read was l50; it is now line 53.
+        let stale = run(json!([{"op": "replace", "start": 50, "end": 50, "content": "edited"}]));
+        assert!(!stale.contains("applied"), "{stale}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), shifted);
     }
 
     #[test]

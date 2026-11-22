@@ -146,6 +146,39 @@ Grade in a fresh fixture copy, as `express_edit_example_start` now does for both
 
 A grader that shares one cargo target dir across grades must lock it from the mtime refresh through the last cargo command.
 Otherwise two parallel grades can build each other's sources. `rg_edit_flow_migration` holds `TARGET_DIR/.grade.lock` for the whole grade (PR #371).
+
+## Cargo 1.100 build-dir layout breaks ripgrep 13 integration tests
+
+Cargo 1.100 runs test executables from `target/debug/build/<pkg>/<hash>/out/`, not `target/debug/deps/`.
+ripgrep 13 finds `rg` from the parent of `env::current_exe()`, so every integration test fails.
+The gold patch of `burntsushi__ripgrep-2209` then grades 0/1 and the verdict is `gold_unresolved`.
+Setting `__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT=1` restores the old layout.
+A shell variable does not reach grading, because `toolchain_env` keeps only `_KEPT_KEYS` (`benchmark/external/proc.py`).
+So `toolchain_env` sets the variable itself, and `build_runner_env` (`benchmark/run.py`) sets it for rust tasks.
+The agent's `cargo test` then sees the same layout as the grade.
+Editing `proc.py` changes `package_digest`, so every external instance is admitted again on the next run.
+
+## Rust 1.80+ IO-safety abort hangs bat's piped `cargo test`
+
+`sharkdp__bat-2650` timed out in 7 of 12 goal 6 and goal 7 cells (both arms), although every agent made the correct one-line fix in its first minute.
+bat's pty test `no_args_doesnt_break` closes one file descriptor two times.
+From Rust 1.80, a debug build aborts there (`fatal runtime error: IO Safety violation: owned file descriptor already closed`).
+The `bat` process that the test started stays alive and holds the pty master and the test's stderr pipe.
+So `cargo test 2>&1 | tail` (or `| grep`) never sees end of file and never ends. A backgrounded run that writes to a file ends, because no reader waits on a pipe.
+Claude Code then waits for the backgrounded task, and kills it only 10 minutes later, so the cell passes the 1800 s limit.
+
+`run._AGENT_ENV_BY_REPO` sets `CARGO_PROFILE_DEV_DEBUG_ASSERTIONS=false` in the agent shell for `sharkdp/bat` only, which skips the check: the full piped suite then passes in 15 s.
+A paid re-run of the six goal 7 `bat-2650` cells (PR #467) then passed 3/3 in both arms, in 20–31 s per cell.
+The grade keeps its own env and runs only the held-out tests, which pass with debug assertions on.
+The setting joins `harness_digest` only when it is not empty (`agent_env`), so only bat cells get new run keys.
+That includes every `sharkdp/bat` task, not only bat-2650 (gepa-v2 has six). A stored baseline row for a bat task now raises `BaselineDrift`, so a run that plans bat baseline cells needs `--refreeze-baselines`. The dry run does not show this.
+A chain task has no `upstream_repo`, so a chain key leaves the setting out while its turns get it. No chain has a bat turn today.
+
+Claude Code starts each Bash command in a new session, so `proc.kill()` on the runner does not stop what a tool call leaves behind.
+Four orphaned `bat` processes from goal 6 were still running 13 days later.
+The runner env carries `TILTH_BENCH_CELL=<random>` per cell. After the runner exits and on timeout, `run._reap_cell_processes` kills each process whose env holds that value, or whose executable is under the cell workspace (a built binary run with a cleared env).
+It does not match by cwd, so a developer shell that is `cd`'d into a live workspace survives. It reads `/proc` and kills through a pidfd, so a reused PID is never hit. The executable rule needs a workspace strictly under the temp dir.
+
 ## Related GEPA gotchas
 
 The October 2026 GEPA overhaul gotchas moved to [Benchmark GEPA overhaul gotchas](benchmark-gepa-gotchas.md). That page covers the bare flag, quota events, gepa 0.1.4, and external-task data.

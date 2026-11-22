@@ -18,6 +18,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import sysconfig
@@ -350,6 +351,77 @@ def _agent_venv(task: object, workdir: Path) -> Path | None:
     return venv if (venv / "bin").is_dir() else None
 
 
+# Extra agent-shell settings for one upstream repo. build_runner_env sets only per-language settings.
+# sharkdp/bat: the pty test `no_args_doesnt_break` closes one file descriptor two times. From Rust 1.80,
+# a debug build aborts there, and the `bat` process that the test started stays alive. That process
+# holds the output pipe of a piped `cargo test` open, so the command never ends. With debug assertions
+# off, the check does not run. The grade keeps its own env and runs only the held-out tests.
+_AGENT_ENV_BY_REPO: dict[str, dict[str, str]] = {
+    "sharkdp/bat": {"CARGO_PROFILE_DEV_DEBUG_ASSERTIONS": "false"},
+}
+
+
+def _agent_env(task: object) -> dict[str, str]:
+    """The extra agent-shell settings for the task's upstream repo, or an empty dict."""
+    return dict(_AGENT_ENV_BY_REPO.get(getattr(task, "upstream_repo", ""), {}))
+
+
+# The runner env carries this variable with a random value per cell; each child process inherits it.
+_CELL_MARKER = "TILTH_BENCH_CELL"
+
+
+def _reap_cell_processes(root: Path, marker: str) -> int:
+    """Kill each leftover process of one cell, and return the count.
+
+    A process belongs to the cell when its environment holds ``TILTH_BENCH_CELL=<marker>``, or when its
+    executable is under the cell workspace ``root`` (a binary the cell built, run with a cleared env).
+    Claude Code starts each Bash command in a new session, so ``proc.kill()`` does not stop a process
+    that a tool call leaves behind. Such a process can hold a pipe open and take CPU from later cells.
+    The sweep reads ``/proc`` and kills through a pidfd, so a reused PID is never hit. It does nothing
+    without ``/proc``, and it ignores ``root`` unless ``root`` is strictly under the temp dir.
+    """
+    procfs = Path("/proc")
+    if not procfs.is_dir() or not hasattr(os, "pidfd_open"):
+        return 0
+    root, temp = root.resolve(), Path(tempfile.gettempdir()).resolve()
+    workspace = root if root != temp and root.is_relative_to(temp) else None
+    tag = f"{_CELL_MARKER}={marker}".encode()
+    killed = 0
+    for entry in procfs.iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            pidfd = os.pidfd_open(int(entry.name))
+        except OSError:
+            continue
+        try:
+            if _in_cell(entry, workspace, tag):
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                killed += 1
+        except OSError:
+            pass
+        finally:
+            os.close(pidfd)
+    if killed:
+        print(f"    killed {killed} leftover process(es) of the cell in {root}", file=sys.stderr)
+    return killed
+
+
+def _in_cell(entry: Path, workspace: Path | None, tag: bytes) -> bool:
+    """Whether ``/proc/<pid>`` holds the cell marker in its env, or runs an executable from ``workspace``."""
+    try:
+        if tag in (entry / "environ").read_bytes().split(b"\0"):
+            return True
+    except OSError:
+        pass
+    if workspace is None:
+        return False
+    try:
+        return Path(os.readlink(entry / "exe")).is_relative_to(workspace)
+    except OSError:
+        return False
+
+
 def _host_runner_argv(cmd: list[str], env: Mapping[str, str], agent_venv: Path | None) -> list[str]:
     """Resolve the runner on PATH without the agent venv, so a task-installed console script cannot replace it."""
     if agent_venv is None:
@@ -393,6 +465,8 @@ def build_runner_env(
     env["DISABLE_AUTOUPDATER"] = "1"
     if language is not None:
         env.update(external.proc.c_build_env(language))
+    if language == "rust":
+        env[external.proc.CARGO_OLD_BUILD_LAYOUT_KEY] = "1"  # same cargo layout as the grade
     if language == "javascript":
         env["PATH"] = str(external.javascript.node_bin()) + os.pathsep + env.get("PATH", "")
 
@@ -1283,6 +1357,7 @@ def cell_identity(
             ),
             hook_source_key=hook_source_key,
             home_isolation=_CODEX_HOME_ISOLATION if runner == "codex" else None,
+            agent_env=_agent_env(task),
         ),
         "task_digest": _cell_task_digest(task),
         "env_fingerprint": env_fingerprint(task),
@@ -1967,6 +2042,9 @@ def _run_single_cell(
         language=task.language,
         agent_venv=agent_venv,
     )
+    env.update(_agent_env(task))
+    cell_marker = os.urandom(16).hex()
+    env[_CELL_MARKER] = cell_marker
     if runner == "codex":
         home_stack.enter_context(isolated_codex_home(env, "tilth-bench-codex-"))
     if runner == "claude":
@@ -2006,9 +2084,17 @@ def _run_single_cell(
             nonlocal timed_out
             timed_out = True
             proc.kill()
+            _reap_cell_processes(repo_path, cell_marker)
+
+        def _reap_when_runner_exits() -> None:
+            # A leftover that inherited the runner's stdout or stderr holds the pipe open, so the reads
+            # below would not end. Sweep when the runner exits, not only after end of file.
+            proc.wait()
+            _reap_cell_processes(repo_path, cell_marker)
 
         stderr_thread = threading.Thread(target=_drain_stderr)
         stderr_thread.start()
+        threading.Thread(target=_reap_when_runner_exits, daemon=True).start()
         timer = threading.Timer(timeout_s, _kill_on_timeout)
         timer.start()
         try:
@@ -2034,6 +2120,7 @@ def _run_single_cell(
             timer.cancel()
             proc.stdout.close()
             stderr_pipe.close()
+            _reap_cell_processes(repo_path, cell_marker)
 
         stderr_text = "".join(stderr_chunks)
         if auth_error is not None:
@@ -2068,6 +2155,11 @@ def _run_single_cell(
                 _audit_codex_commands(
                     seen.decode(errors="replace") if isinstance(seen, bytes) else seen or "", hook_binary, partial=True)
             raise
+        finally:
+            # capture_output reads to end of file first, so a leftover that holds the runner's pipe
+            # delays this sweep until the timeout. Claude and Codex cells with a stream log use the
+            # Popen path above, which sweeps when the runner exits.
+            _reap_cell_processes(repo_path, cell_marker)
         if runner == "claude":
             auth.check_captured(result.stdout)
     elapsed_ms = int((time.time() - start_time) * 1000)

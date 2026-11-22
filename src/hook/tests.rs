@@ -1361,3 +1361,930 @@ fn hint_rewording_leaves_every_corpus_decision_and_rule_unchanged() {
         assert!(!denies(&command), "denied but must allow: {command:?}");
     }
 }
+
+// Tool runners, debuggers, and programs that read commands from stdin.
+
+#[test]
+fn runners_unwrap_to_the_command_they_run() {
+    assert_rules(&[
+        ("mise exec -- cat src/lib.rs", "cat"),
+        ("mise x -- cat f", "cat"),
+        ("mise exec node@20 -- cat f", "cat"),
+        ("mise -C /tmp exec -- cat f", "cat"),
+        ("mise exec -c 'cat f'", "cat"),
+        ("mise exec --command='cat f'", "cat"),
+        ("mise exec -- sh", "shell stdin"),
+        ("uv run cat f", "cat"),
+        ("uv run --python 3.12 cat f", "cat"),
+        ("uv run --with=x -- head f", "head"),
+        ("uv --directory d run grep x f", "grep"),
+        ("uv run python", "python"),
+        ("uv run -m json.tool f", "python -m json.tool"),
+        ("uv run --module=base64 f", "python -m"),
+        ("uv run -", "python"),
+        ("uvx --from x cat f", "cat"),
+        ("npx cat f", "cat"),
+        ("npx -p x cat f", "cat"),
+        ("npx -c 'cat f'", "cat"),
+        ("npm exec -- cat f", "cat"),
+        ("poetry run cat f", "cat"),
+        ("poetry -C d run python -c 1", "python"),
+        ("bundle exec cat f", "cat"),
+        ("pnpm exec cat f", "cat"),
+        ("pnpm dlx -c 'cat f'", "cat"),
+        ("pnpm --filter x exec head f", "head"),
+        ("yarn exec cat f", "cat"),
+        ("yarn dlx -p x cat f", "cat"),
+        ("bunx cat f", "cat"),
+        ("bun x cat f", "cat"),
+        ("direnv exec . cat f", "cat"),
+        ("nix develop -c cat f", "cat"),
+        ("nix develop .#x --command bash -c 'cat f'", "cat"),
+        ("nix develop", "shell stdin"),
+        ("nix shell nixpkgs#jq", "shell stdin"),
+        ("nix-shell --run 'cat f'", "cat"),
+        ("nix-shell -p jq --command 'cat f'", "cat"),
+        ("nix-shell", "shell stdin"),
+        ("asdf exec cat f", "cat"),
+        ("pixi run -e dev cat f", "cat"),
+        ("conda run -n env cat f", "cat"),
+        ("micromamba run -n env cat f", "cat"),
+        ("timeout 5 mise exec -- env cat f", "cat"),
+        ("mise exec -- uv run cat f", "cat"),
+        ("echo f | xargs uv run cat", "cat"),
+    ]);
+    assert_all_allow(&[
+        "mise exec -- cargo test",
+        "mise exec go@1.24.7 -- python3 script.py",
+        "mise install",
+        "uv run pytest -q",
+        "uv run --frozen pytest",
+        "uv run pytest -q -p no:cacheprovider tests",
+        "uv run --with pytest-xdist pytest -n 4",
+        "uv run -m pytest",
+        "uv run script.py",
+        "uv sync",
+        "npx jest",
+        "npx jest --ci",
+        "npm test",
+        "npm exec -- tsc",
+        "bundle exec rspec",
+        "bundle install",
+        "poetry run pytest",
+        "pnpm exec vitest run",
+        "pnpm test",
+        "yarn test",
+        "yarn exec jest",
+        "bunx tsc",
+        "bun run build",
+        "bun test",
+        "direnv exec . go test ./...",
+        "nix develop -c cargo test",
+        "nix build",
+        "nix-shell --run 'cargo test'",
+        "asdf exec go test ./...",
+        "pixi run pytest",
+        "conda run -n env pytest",
+    ]);
+}
+
+#[test]
+fn debuggers_need_batch_and_plain_commands() {
+    assert_rules(&[
+        ("gdb -batch -ex \"shell cat src/main.rs\"", "cat"),
+        ("gdb -batch -ex '!cat f'", "cat"),
+        ("gdb --batch --ex='shell head f'", "head"),
+        ("gdb -batch -ex 'shell true' -ex 'shell cat f'", "cat"),
+        ("gdb -batch -eval-command 'she grep x f'", "grep"),
+        ("gdb -batch -ex shell", "shell stdin"),
+        (
+            "gdb -batch -ex 'python print(open(\"f\").read())'",
+            "debugger script",
+        ),
+        ("gdb -batch -ex 'py print(1)'", "debugger script"),
+        ("gdb -batch -ex pi", "debugger script"),
+        ("gdb -batch -ex 'pipe info frame | cat'", "debugger script"),
+        ("gdb -batch -ex '| bt | cat'", "debugger script"),
+        ("gdb -batch -iex 'guile (display 1)'", "debugger script"),
+        ("gdb -batch -x -", "stdin repl"),
+        ("gdb ./a.out", "stdin repl"),
+        ("gdb -p 1234", "stdin repl"),
+        ("gdb", "stdin repl"),
+        ("rust-gdb ./a.out", "stdin repl"),
+        ("lldb ./a.out", "stdin repl"),
+        ("lldb-18 ./a.out", "stdin repl"),
+        ("lldb -b -o 'platform shell cat f'", "cat"),
+        (
+            "lldb --batch --one-line='script print(1)'",
+            "debugger script",
+        ),
+        ("lldb -b -o script", "debugger script"),
+    ]);
+    assert_all_allow(&[
+        "gdb -batch -ex run --args ./a.out",
+        "gdb -batch -ex bt -ex 'info registers' ./a.out core",
+        "gdb -batch -ex 'shell make test'",
+        "gdb -batch -x cmds.gdb ./a.out",
+        "gdb --version",
+        "lldb -b -o run -- ./a.out",
+        "lldb --batch -o 'bt all' -p 1234",
+        "rust-gdb -batch -ex bt ./a.out",
+    ]);
+}
+
+#[test]
+fn stdin_repls_need_a_program() {
+    assert_rules(&[
+        ("irb", "stdin repl"),
+        ("irb -r json", "stdin repl"),
+        ("pry", "stdin repl"),
+        ("pry -e 'x = 1'", "stdin repl"),
+        ("lua", "stdin repl"),
+        ("lua -", "stdin repl"),
+        ("lua -i script.lua", "stdin repl"),
+        ("lua5.4 -l socket", "stdin repl"),
+        ("luajit", "stdin repl"),
+        ("sqlite3", "stdin repl"),
+        ("sqlite3 db.sqlite", "stdin repl"),
+        ("sqlite3 -cmd .tables db.sqlite", "stdin repl"),
+        ("sqlite3 -interactive db.sqlite 'select 1'", "stdin repl"),
+        ("echo 'select 1' | sqlite3 db.sqlite", "stdin repl"),
+        ("make -f -", "stdin repl"),
+        ("make -f-", "stdin repl"),
+        ("make --file=- all", "stdin repl"),
+        ("gmake --makefile - all", "stdin repl"),
+        ("R", "stdin repl"),
+        ("R --vanilla", "stdin repl"),
+        ("R -f -", "stdin repl"),
+        ("R script.R", "stdin repl"),
+        ("tclsh", "stdin repl"),
+        ("tclsh8.6 -encoding utf-8", "stdin repl"),
+        ("guile", "stdin repl"),
+        ("guile -l init.scm", "stdin repl"),
+        ("ghci", "stdin repl"),
+        ("ghci Main.hs", "stdin repl"),
+        ("jshell", "stdin repl"),
+        ("jshell script.jsh", "stdin repl"),
+        ("mise exec -- irb", "stdin repl"),
+    ]);
+    assert_all_allow(&[
+        "irb script.rb",
+        "irb --version",
+        "pry script.rb",
+        "lua script.lua",
+        "lua -- script.lua",
+        "lua script.lua -i",
+        "lua -e 'print(1)'",
+        "lua -v",
+        "luajit -b in.lua out.o",
+        "sqlite3 db.sqlite \"select 1\"",
+        "sqlite3 -line db.sqlite .tables",
+        "sqlite3 -version",
+        "make",
+        "make test",
+        "make -j4 build",
+        "make -f Makefile test",
+        "make --file=build.mk all",
+        "gmake -C dir test",
+        "R -f script.R",
+        "R --file=script.R",
+        "R -e 'testthat::test_dir(\"tests\")'",
+        "R CMD check pkg",
+        "R --version",
+        "tclsh script.tcl",
+        "guile script.scm",
+        "guile -s script.scm",
+        "guile -c '(display 1)'",
+        "ghci -e main Main.hs",
+        "jshell --version",
+    ]);
+}
+
+#[test]
+fn hint_stdin_repl_and_debugger_script_name_the_fix() {
+    for command in ["irb", "gdb -batch -ex 'python print(1)'"] {
+        let reason = tilth_reason_for(command);
+        assert!(names_tilth_tool(&reason), "{command:?}: {reason}");
+        assert!(reason.contains("-batch"), "{reason}");
+        match verdict(command, Hint::Native) {
+            Verdict::Deny { reason, .. } => {
+                assert!(!reason.to_lowercase().contains("tilth"), "{reason}");
+                assert!(reason.contains("-batch"), "{reason}");
+            }
+            Verdict::Allow => panic!("allowed: {command:?}"),
+        }
+    }
+    let repl = tilth_reason_for("irb");
+    assert!(repl.contains("reads its commands from stdin"), "{repl}");
+    assert!(repl.contains("run that file with Bash"), "{repl}");
+}
+
+// Review fixes for PR #466. Each test failed before its fix.
+
+#[test]
+fn review1_debugger_checks_the_program_and_its_arguments() {
+    assert_rules(&[
+        ("gdb -batch -ex run --args cat README.md", "cat"),
+        ("gdb -batch -ex run --args bash -c 'cat README.md'", "cat"),
+        ("lldb -b -o run /bin/cat -- README.md", "cat"),
+        ("lldb -b -o run -- cat README.md", "cat"),
+        ("lldb -b -o run -f /bin/cat -- README.md", "cat"),
+        ("gdb -batch -ex 'run README.md' /bin/cat", "debugger script"),
+        ("gdb -batch -ex 'r < README.md' /bin/cat", "debugger script"),
+        (
+            "gdb -batch -ex 'set args README.md' -ex run /bin/cat",
+            "debugger script",
+        ),
+        (
+            "lldb -b -o 'process launch -- README.md' /bin/cat",
+            "debugger script",
+        ),
+        (
+            "lldb -b -o 'settings set target.run-args README.md' -o run /bin/cat",
+            "debugger script",
+        ),
+    ]);
+    assert_all_deny(&["gdb -batch -ex run python3"]);
+    assert_all_allow(&[
+        "gdb -batch -ex run --args ./a.out",
+        "gdb -batch -ex run --args ./a.out --flag value",
+        "gdb -batch -ex bt ./core",
+        "gdb -batch -ex bt ./a.out core",
+        "gdb -batch -e ./a.out -ex run",
+        "gdb -batch -ex run -ex bt -p 1234",
+        "lldb -b -o run -- ./a.out arg",
+        "lldb -b -o run ./a.out -- arg",
+        "lldb --batch -o 'bt all' -p 1234",
+    ]);
+}
+
+#[test]
+fn review2_debugger_meta_commands_deny() {
+    assert_rules(&[
+        (
+            "gdb -batch -ex 'eval \"shell cat README.md\"'",
+            "debugger script",
+        ),
+        (
+            "gdb -batch -ex 'alias xx = shell' -ex 'xx cat README.md'",
+            "debugger script",
+        ),
+        (
+            "gdb -batch -ex 'with language c -- shell cat README.md'",
+            "debugger script",
+        ),
+        ("gdb -batch -ex 'make -v; cat README.md'", "debugger script"),
+        (
+            "lldb -b -o 'command alias xx platform shell' -o 'xx cat README.md'",
+            "debugger script",
+        ),
+        ("lldb -b -o 'command script import x.py'", "debugger script"),
+        ("gdb -batch -ex 'define xx' ./a.out", "debugger script"),
+        ("gdb -batch -ex 'document xx'", "debugger script"),
+        ("gdb -batch -ex 'source cmds.gdb'", "debugger script"),
+        ("gdb -batch -ex 'if 1'", "debugger script"),
+        ("gdb -batch -ex 'while 1'", "debugger script"),
+        (
+            "gdb -batch -ex 'compile code system(\"cat f\")'",
+            "debugger script",
+        ),
+        (
+            "gdb -batch -ex 'print $_shell(\"cat f\")'",
+            "debugger script",
+        ),
+        ("gdb -batch -ex 'thread apply all shell cat f'", "cat"),
+        ("gdb -batch -ex 'taas shell cat f'", "cat"),
+        ("gdb -batch -ex 't a a py print(1)'", "debugger script"),
+    ]);
+    assert_all_allow(&[
+        "gdb -batch -ex 'thread apply all bt' ./a.out core",
+        "gdb -batch -ex 't a a bt full' -p 1234",
+        "gdb -batch -ex 'frame apply all -q p $pc' -p 1234",
+        "gdb -batch -ex 'info source' -ex 'info frame' ./a.out core",
+        "gdb -batch -ex 'set pagination off' -ex bt ./a.out core",
+        "gdb -batch -ex 'print x' -ex 'p/x y' ./a.out core",
+        "lldb -b -o 'thread backtrace all' -o 'frame variable' -p 1234",
+        "lldb -b -o 'process launch' -- ./a.out",
+    ]);
+}
+
+#[test]
+fn review3_bare_npx_and_npm_exec_start_a_stdin_shell() {
+    assert_rules(&[
+        ("npx", "shell stdin"),
+        ("npm exec", "shell stdin"),
+        ("npm x", "shell stdin"),
+        ("npx --yes", "shell stdin"),
+        ("npx -p cowsay", "shell stdin"),
+        ("npx --", "shell stdin"),
+        ("npm exec --", "shell stdin"),
+    ]);
+    assert_all_allow(&[
+        "npx -c 'npm test'",
+        "npm exec -- jest",
+        "npx --yes prettier --check .",
+        "npm",
+        "npm test",
+    ]);
+}
+
+#[test]
+fn review4_short_option_equals_is_not_part_of_the_value() {
+    assert_rules(&[
+        ("mise exec -c='cat README.md'", "cat"),
+        ("npx -c='cat README.md'", "cat"),
+        ("gdb -batch -x=-", "stdin repl"),
+        ("uv run -m=json.tool f", "python -m json.tool"),
+    ]);
+    assert_all_allow(&["uv run -p=3.12 pytest", "mise exec -c='cargo test'"]);
+}
+
+#[test]
+fn review5_shell_mode_before_the_subcommand_reparses() {
+    assert_rules(&[
+        ("pnpm -c exec 'cat README.md'", "cat"),
+        ("pnpm --shell-mode exec 'cat README.md'", "cat"),
+        ("npm -c 'cat README.md' exec", "cat"),
+        ("npm --call='cat README.md' x", "cat"),
+    ]);
+    assert_all_allow(&[
+        "pnpm -c exec 'npm test'",
+        "pnpm --filter x exec vitest run",
+        "npm -c 'npm test' exec",
+    ]);
+}
+
+#[test]
+fn review6_unlisted_runner_option_checks_both_readings() {
+    assert_rules(&[
+        ("uv run --fork-strategy fewest cat README.md", "cat"),
+        ("npx --registry https://r cat README.md", "cat"),
+        ("npx -C /tmp cat README.md", "cat"),
+        ("uvx -c constraints.txt cat README.md", "cat"),
+        ("npx --some-new-option v cat README.md", "cat"),
+        ("uv run --some-new-option v cat README.md", "cat"),
+        ("uv --some-new-option v run cat README.md", "cat"),
+        ("npm --some-new-option v exec cat README.md", "cat"),
+        ("npx --some-new-option v -c 'cat README.md'", "cat"),
+    ]);
+    assert_all_allow(&[
+        "uv run --with pytest-xdist pytest -n 4",
+        "uv run --frozen pytest -q",
+        "uv run --isolated python script.py",
+        "uv run --no-sync python -m pytest",
+        "npx --yes prettier --check .",
+        "npx --prefer-offline jest",
+        "pnpm --recursive exec tsc",
+        "bundle exec --keep-file-descriptors rake test",
+    ]);
+}
+
+#[test]
+fn review8_sqlite_file_and_shell_commands_deny() {
+    assert_rules(&[
+        ("sqlite3 db \"select readfile('README.md')\"", "sqlite3 io"),
+        ("sqlite3 db \"SELECT ReadFile ('README.md')\"", "sqlite3 io"),
+        ("sqlite3 db \"select writefile('x', 'y')\"", "sqlite3 io"),
+        (
+            "sqlite3 db \"select name, data from fsdir('src')\"",
+            "sqlite3 io",
+        ),
+        ("sqlite3 db \"select load_extension('x')\"", "sqlite3 io"),
+        (
+            "sqlite3 db \"select edit('', 'cat README.md;')\"",
+            "sqlite3 io",
+        ),
+        ("sqlite3 db '.shell cat README.md'", "sqlite3 io"),
+        ("sqlite3 db '.system cat README.md'", "sqlite3 io"),
+        ("sqlite3 db '.sh cat README.md'", "sqlite3 io"),
+        ("sqlite3 db '.read README.md'", "sqlite3 io"),
+        ("sqlite3 db '.import README.md t'", "sqlite3 io"),
+        ("sqlite3 db '.output out.txt'", "sqlite3 io"),
+        ("sqlite3 db '.once out.txt'", "sqlite3 io"),
+        (
+            "sqlite3 -cmd '.shell cat README.md' db 'select 1'",
+            "sqlite3 io",
+        ),
+        ("sqlite3 db 'select 1' '.read README.md'", "sqlite3 io"),
+        ("sqlite3 -A -x db.sqlar", "sqlite3 io"),
+    ]);
+    assert_all_allow(&[
+        "sqlite3 -json db \"select 1\"",
+        "sqlite3 db.sqlite .tables",
+        "sqlite3 db '.schema t'",
+        "sqlite3 db \"select t.output, t.reader from t\"",
+        "sqlite3 db \"select * from t where action = 'edit'\"",
+        "sqlite3 db \"select '.shell x'\"",
+        "sqlite3 -cmd '.mode json' db 'select 1'",
+    ]);
+    let repl = tilth_reason_for("sqlite3");
+    assert!(repl.contains("plain SQL"), "{repl}");
+    assert!(!repl.contains("\"<sql>\""), "{repl}");
+}
+
+#[test]
+fn review9_make_eval_and_command_line_functions_deny() {
+    assert_rules(&[
+        ("make --eval='$(info $(file <README.md))'", "make --eval"),
+        ("make -E '$(info $(shell cat README.md))'", "make --eval"),
+        ("make --eval 'all: ; cat README.md' all", "make --eval"),
+        ("make --ev=x", "make --eval"),
+        ("make -kE x", "make --eval"),
+        ("gmake --eval=x", "make --eval"),
+        ("make 'X:=$(shell cat README.md)' test", "make --eval"),
+        ("make 'X!=cat README.md' test", "make --eval"),
+        ("make 'X:=${file <README.md}'", "make --eval"),
+    ]);
+    assert_all_allow(&[
+        "make -C sub test",
+        "make test CFLAGS=-O2",
+        "make -j4 build V=1",
+        "make -e test",
+        "make -C sub -f Makefile.ci test",
+    ]);
+}
+
+#[test]
+fn review_hints_name_the_fix_for_each_new_rule() {
+    for command in [
+        "gdb -batch -ex 'eval x'",
+        "sqlite3 db '.shell ls'",
+        "make --eval=x",
+    ] {
+        let reason = tilth_reason_for(command);
+        assert!(names_tilth_tool(&reason), "{command:?}: {reason}");
+        match verdict(command, Hint::Native) {
+            Verdict::Deny { reason, .. } => {
+                assert!(!reason.to_lowercase().contains("tilth"), "{reason}");
+            }
+            Verdict::Allow => panic!("allowed: {command:?}"),
+        }
+    }
+    let debugger = tilth_reason_for("gdb -batch -ex 'eval x'");
+    assert!(debugger.contains("--args"), "{debugger}");
+    let make = tilth_reason_for("make --eval=x");
+    assert!(make.contains("make -f <file>"), "{make}");
+}
+
+// Review fixes for PR #466, round 2. Each test failed before its fix.
+
+#[test]
+fn round2_gdb_resolves_unique_prefixes_and_denies_unknown_options() {
+    assert_rules(&[
+        ("gdb -batch -eval 'shell cat README.md'", "cat"),
+        ("gdb -batch --init-e 'shell cat README.md'", "cat"),
+        ("gdb -batch -ev 'shell cat README.md'", "cat"),
+        ("gdb -batch -eiex 'shell cat README.md'", "cat"),
+        ("gdb -batch -early-init-eval 'shell cat README.md'", "cat"),
+        ("gdb -batch -ex=shell\\ cat\\ README.md", "cat"),
+        ("gdb -batch -ex run -ar cat README.md", "cat"),
+        ("gdb -batch -ex run --arg cat README.md", "cat"),
+        ("gdb -batch-s -ex 'shell cat README.md'", "cat"),
+        ("gdb -batch -eix -", "stdin repl"),
+        ("gdb -batch -bogus", "unresolved"),
+        ("gdb -bat -ex bt ./a.out", "unresolved"),
+        ("gdb -batch -co core ./a.out", "unresolved"),
+        ("gdb --batch=1 -ex bt ./a.out", "unresolved"),
+        ("gdb -batch -cfoo ./a.out", "unresolved"),
+        (
+            "gdb -batch -tty README.md -ex run /bin/cat",
+            "debugger script",
+        ),
+        ("lldb -b -one-line 'platform shell cat README.md'", "cat"),
+        (
+            "lldb -b -one-line-before-file 'script print(1)'",
+            "debugger script",
+        ),
+        ("lldb -b -source -", "stdin repl"),
+        ("lldb -b --repl", "stdin repl"),
+        ("lldb -b -r=swift", "stdin repl"),
+    ]);
+    assert_all_allow(&[
+        "gdb -batch -ex bt ./core",
+        "gdb --batch --ex 'info threads' -p 1",
+        "gdb -q -batch -ex run --args ./a.out",
+        "gdb -nx -batch-silent -ex bt ./a.out core",
+        "gdb -batch -ex bt --core=core ./a.out",
+        "gdb -batch -ex bt -c core ./a.out",
+        "gdb -batch -iex 'set auto-load safe-path /' -ex bt ./a.out core",
+        "gdb -v",
+        "gdb -h",
+        "lldb -batch -o 'bt all' -p 1234",
+        "lldb -b -one-line bt ./a.out",
+        "lldb --batch --one-line bt --core core ./a.out",
+        "lldb -x -b -o bt ./a.out",
+        "lldb --repl-language=swift -b -o bt ./a.out",
+    ]);
+}
+
+#[test]
+fn round2_sqlite_denies_hidden_edit_and_sql_built_at_run_time() {
+    assert_rules(&[
+        (
+            "sqlite3 :memory: \"select edit/**/('x','cat README.md')\"",
+            "sqlite3 io",
+        ),
+        (
+            "sqlite3 :memory: \"select edit --\n('x','cat README.md')\"",
+            "sqlite3 io",
+        ),
+        ("sqlite3 :memory: 'select \"edit\"(1, 2)'", "sqlite3 io"),
+        ("sqlite3 :memory: 'select [EDIT](1, 2)'", "sqlite3 io"),
+        (
+            "sqlite3 :memory: \"select sha3_query('select ed'||'it(''x'',''cat README.md'')')\"",
+            "sqlite3 io",
+        ),
+        (
+            "sqlite3 :memory: \"select sha1_query('select 1')\"",
+            "sqlite3 io",
+        ),
+        ("sqlite3 :memory: 'pragma writable_schema=on'", "sqlite3 io"),
+        (
+            "sqlite3 :memory: 'select * from sqlite_dbpage'",
+            "sqlite3 io",
+        ),
+        ("sqlite3 :memory: '.selftest'", "sqlite3 io"),
+        ("sqlite3 :memory: '.dbconfig defensive off'", "sqlite3 io"),
+        ("sqlite3 :memory: '.www'", "sqlite3 io"),
+        (
+            "sqlite3 :memory: '.session s changeset out.bin'",
+            "sqlite3 io",
+        ),
+        (
+            "sqlite3 :memory: \".param set @a \\\"edit('x','cat README.md')\\\"\"",
+            "sqlite3 io",
+        ),
+        (
+            "sqlite3 :memory: 'select 1 as \"x'\\''\", edit(1, 2) as \"'\\''\"'",
+            "sqlite3 io",
+        ),
+    ]);
+    assert_all_allow(&[
+        "sqlite3 app.db \"select count(*) from t\"",
+        "sqlite3 app.db \"select * from t where action = 'edit'\"",
+        "sqlite3 app.db \"select 'sha3_query(x)' -- edit\"",
+        "sqlite3 app.db \"select edited_at from t\"",
+        "sqlite3 app.db \"select sha3(x) from t\"",
+        "sqlite3 app.db .tables",
+    ]);
+}
+
+#[test]
+fn round2_sqlite_reads_double_dash_options_and_denies_archives_and_init() {
+    assert_rules(&[
+        ("sqlite3 x.db --Ac README.md", "sqlite3 io"),
+        ("sqlite3 x.db --A -c README.md", "sqlite3 io"),
+        (
+            "sqlite3 x.db \"select sqlar_uncompress(data, sz) from sqlar\"",
+            "sqlite3 io",
+        ),
+        ("sqlite3 x.db \"select sqlar_compress(x)\"", "sqlite3 io"),
+        ("sqlite3 -init README.md :memory: 'select 1'", "sqlite3 io"),
+        ("sqlite3 --init README.md :memory: 'select 1'", "sqlite3 io"),
+        ("sqlite3 --interactive db 'select 1'", "stdin repl"),
+    ]);
+    assert_all_allow(&[
+        "sqlite3 -init /dev/null app.db .tables",
+        "sqlite3 --json app.db \"select 1\"",
+        "sqlite3 --version",
+        "sqlite3 app.db -- 'select 1'",
+    ]);
+}
+
+#[test]
+fn round2_bun_run_uv_tool_run_and_shell_subcommands() {
+    assert_rules(&[
+        ("bun run cat README.md", "cat"),
+        ("bun --cwd . run cat README.md", "cat"),
+        ("bun run --silent cat README.md", "cat"),
+        ("echo x | bun run -", "bun"),
+        (
+            "uv tool run python -c 'print(open(\"README.md\").read())'",
+            "python",
+        ),
+        ("uv tool run cat README.md", "cat"),
+        ("uv tool run --from x cat README.md", "cat"),
+        ("printf 'cat README.md' | mise en", "shell stdin"),
+        ("mise en -s bash", "shell stdin"),
+        ("poetry shell", "shell stdin"),
+    ]);
+    assert_all_allow(&[
+        "bun run test",
+        "bun run build",
+        "bun run dev",
+        "bun run src/index.ts",
+        "bun test",
+        "bun install",
+        "uv tool run ruff check .",
+        "uv tool install ruff",
+        "uv tool list",
+        "mise shell node@20",
+        "mise use node@20",
+        "mise run test",
+    ]);
+}
+
+#[test]
+fn round2_pnpm_shell_mode_spellings_and_command_fallback() {
+    assert_rules(&[
+        ("pnpm --shell-m exec 'cat README.md'", "cat"),
+        ("pnpm --shell-mode=true exec 'cat README.md'", "cat"),
+        ("pnpm --shell-mode true exec 'cat README.md'", "cat"),
+        ("pnpm -c true exec 'cat README.md'", "cat"),
+        ("pnpm --shell exec 'cat README.md'", "cat"),
+        ("pnpm -rc exec 'cat README.md'", "cat"),
+        ("pnpm exec --shell-m 'cat README.md'", "cat"),
+        ("pnpm cat README.md", "cat"),
+        ("pnpm --filter web cat README.md", "cat"),
+        ("pnpm --some-new-option val cat README.md", "cat"),
+        ("pnpm recursive exec cat README.md", "cat"),
+    ]);
+    assert_all_allow(&[
+        "pnpm build",
+        "pnpm lint --fix",
+        "pnpm -r build",
+        "pnpm --filter web test",
+        "pnpm install",
+        "pnpm view react version",
+        "pnpm patch foo@1.0.0",
+        "pnpm env use --global 20",
+        "pnpm --shell-mode=false exec vitest run",
+        "pnpm --shell-mode exec 'npm test'",
+        "pnpm tsc --noEmit",
+        "pnpm",
+    ]);
+}
+
+#[test]
+fn round2_thread_apply_skips_convenience_variable_ids() {
+    assert_rules(&[
+        (
+            "gdb -batch -ex starti -ex 'thread apply $_thread shell cat README.md' /bin/true",
+            "cat",
+        ),
+        (
+            "gdb -batch -ex 'thread apply $_gthread 2 py print(1)' -p 1",
+            "debugger script",
+        ),
+    ]);
+    assert_all_allow(&["gdb -batch -ex 'thread apply $_thread bt' -p 1"]);
+}
+
+#[test]
+fn round2_make_checks_environment_assignments() {
+    assert_rules(&[
+        ("CFLAGS='$(shell cat README.md)' make", "make --eval"),
+        (
+            "env 'CFLAGS=$(shell cat README.md)' make test",
+            "make --eval",
+        ),
+        ("X='${file <README.md}' gmake all", "make --eval"),
+    ]);
+    assert_all_allow(&[
+        "make CFLAGS=-O2 test",
+        "CFLAGS=-O2 make test",
+        "CC=clang make",
+        "env CFLAGS=-O2 make",
+    ]);
+}
+
+#[test]
+fn round2_more_runners_unwrap() {
+    assert_rules(&[
+        ("pipenv run cat README.md", "cat"),
+        ("pipenv --python 3.12 run cat README.md", "cat"),
+        ("pdm run cat README.md", "cat"),
+        ("pdm run -p . cat README.md", "cat"),
+        ("hatch run cat README.md", "cat"),
+        ("hatch run dev:cat README.md", "cat"),
+        ("hatch run +py=3.12 cat README.md", "cat"),
+        ("hatch -e dev run 'cat README.md'", "cat"),
+        ("rye run cat README.md", "cat"),
+        ("devbox run cat README.md", "cat"),
+        ("devbox run 'cat README.md'", "cat"),
+        ("pixi exec cat README.md", "cat"),
+        ("pixi run 'cat README.md'", "cat"),
+        ("pipenv shell", "shell stdin"),
+        ("hatch shell", "shell stdin"),
+        ("pixi shell", "shell stdin"),
+        ("devbox shell", "shell stdin"),
+    ]);
+    assert_all_allow(&[
+        "pipenv run pytest",
+        "pipenv install",
+        "pdm run pytest",
+        "pdm install",
+        "hatch run test",
+        "hatch run test:cov",
+        "hatch run +py=3.12 test",
+        "hatch env create",
+        "rye run pytest",
+        "devbox run test",
+        "devbox run -- make test",
+        "pixi run test",
+        "pixi run pytest -q",
+        "pixi exec ruff check .",
+        "pixi install",
+    ]);
+}
+
+#[test]
+fn round3_sqlite_skips_every_option_value() {
+    assert_rules(&[
+        ("sqlite3 -lookaside 64 8 app.db", "stdin repl"),
+        ("sqlite3 -pagecache 64 8 app.db", "stdin repl"),
+        ("sqlite3 -nonce x app.db", "stdin repl"),
+        ("sqlite3 --lookaside 64 8 app.db", "stdin repl"),
+        ("sqlite3 -screenwidth 80 app.db", "stdin repl"),
+        ("sqlite3 -threadsafe 1 app.db", "stdin repl"),
+        ("sqlite3 -cmdline-edit off app.db", "stdin repl"),
+        (
+            "sqlite3 -lookaside 64 8 app.db \"select readfile('README.md')\"",
+            "sqlite3 io",
+        ),
+    ]);
+    assert_all_allow(&[
+        "sqlite3 -lookaside 64 8 app.db \"select 1\"",
+        "sqlite3 -pagecache 64 8 app.db .tables",
+        "sqlite3 -nonce x app.db \"select 1\"",
+        "sqlite3 -cmd 'pragma foreign_keys=on' app.db \"select 1\"",
+        // The database operand is not SQL, so its name cannot deny.
+        "sqlite3 -lookaside 64 8 edit.db \"select 1\"",
+    ]);
+}
+
+#[test]
+fn round3_bun_repl_reads_stdin() {
+    assert_rules(&[
+        ("bun repl", "shell stdin"),
+        ("bun --cwd web repl", "shell stdin"),
+    ]);
+    assert_all_allow(&[
+        "bun test",
+        "bun run build",
+        "bun install",
+        "bun x prettier --check .",
+    ]);
+}
+
+#[test]
+fn round3_yarn_node_runs_node() {
+    assert_rules(&[
+        (
+            "yarn node -p \"require('fs').readFileSync('README.md','utf8')\"",
+            "node",
+        ),
+        ("yarn node -e 'console.log(1)'", "node"),
+        ("yarn --cwd web node -p 1", "node"),
+        ("yarn node", "node"),
+    ]);
+    assert_all_allow(&[
+        "yarn test",
+        "yarn build",
+        "yarn node scripts/build.js",
+        "yarn node --version",
+        "yarn add -D vitest",
+    ]);
+}
+
+#[test]
+fn round3_npm_explore_runs_shell_source() {
+    assert_rules(&[
+        ("npm explore foo -- cat README.md", "cat"),
+        ("npm explore foo cat README.md", "cat"),
+        ("npm explore -- foo cat README.md", "cat"),
+        ("npm explore foo -- 'cat README.md'", "cat"),
+        ("npm --prefix web explore foo -- cat README.md", "cat"),
+        ("npm explore foo", "shell stdin"),
+        ("npm explore foo --", "shell stdin"),
+        ("npm explore foo -- sh", "shell stdin"),
+    ]);
+    assert_all_allow(&[
+        "npm explore foo -- npm test",
+        "npm explore foo -- ls",
+        "npm test",
+        "npm run build",
+    ]);
+}
+
+#[test]
+fn round3_gdb_edit_runs_the_editor_through_a_shell() {
+    assert_rules(&[
+        ("gdb -batch -ex 'edit main' ./a.out", "debugger script"),
+        ("gdb -batch -ex 'ed main' ./a.out", "debugger script"),
+        (
+            "gdb -batch -ex 'thread apply all edit' -p 1",
+            "debugger script",
+        ),
+    ]);
+    assert_all_allow(&[
+        "gdb -batch -ex 'info frame' ./core",
+        "gdb -batch -ex 'echo hi' ./a.out",
+        "gdb -batch -ex 'enable 1' ./a.out",
+    ]);
+}
+
+#[test]
+fn round3_gdb_aliases_of_denied_commands_deny() {
+    assert_rules(&[
+        ("gdb -batch -ex guile-repl", "debugger script"),
+        ("gdb -batch -ex gr", "debugger script"),
+        ("gdb -batch -ex guile-r", "debugger script"),
+        ("gdb -batch -ex pi", "debugger script"),
+        ("gdb -batch -ex python-interactive", "debugger script"),
+        (
+            "gdb -batch -ex 'expression int x = 1;' -p 1",
+            "debugger script",
+        ),
+        ("gdb -batch -ex 'expr 1' -p 1", "debugger script"),
+    ]);
+    assert_all_allow(&[
+        "gdb -batch -ex 'info frame' ./core",
+        "gdb -batch -ex 'explore x' ./a.out",
+        "lldb -b -o 'expr x' ./a.out",
+        "lldb -b -o 'expression x' ./a.out",
+    ]);
+}
+
+#[test]
+fn round3_lldb_platform_file_and_process_commands() {
+    assert_rules(&[
+        (
+            "lldb -b -o 'platform file open README.md'",
+            "debugger script",
+        ),
+        (
+            "lldb -b -o 'platform file read -o 0 -c 100 0'",
+            "debugger script",
+        ),
+        (
+            "lldb -b -o 'platform get-file README.md out'",
+            "debugger script",
+        ),
+        (
+            "lldb -b -o 'platform put-file README.md out'",
+            "debugger script",
+        ),
+        (
+            "lldb -b -o 'platform process launch -- /bin/cat README.md'",
+            "debugger script",
+        ),
+        ("lldb -b -o 'platform shell cat README.md'", "cat"),
+    ]);
+    assert_all_allow(&[
+        "lldb -b -o 'platform status'",
+        "lldb -b -o 'platform list'",
+        "lldb -b -o 'platform process list'",
+        "lldb -b -o 'platform file-exists README.md'",
+    ]);
+}
+
+#[test]
+fn round3_hatch_env_run_unwraps() {
+    assert_rules(&[
+        ("hatch env run -- cat README.md", "cat"),
+        ("hatch env run -e test -- cat README.md", "cat"),
+        ("hatch env run -i py=3.12 -- cat README.md", "cat"),
+        ("hatch env run 'cat README.md'", "cat"),
+    ]);
+    assert_all_allow(&[
+        "hatch env run -- pytest",
+        "hatch env run -i py=3.12 -x version=9000 test:pytest",
+        "hatch env create",
+        "hatch env show",
+        "hatch env prune",
+        "hatch run test",
+    ]);
+}
+
+#[test]
+fn round3_nix_run_checks_the_program_of_the_installable() {
+    assert_rules(&[
+        ("nix run nixpkgs#bash", "shell stdin"),
+        ("nix run nixpkgs#bashInteractive", "shell stdin"),
+        ("nix run nixpkgs#bash -- -c 'cat README.md'", "cat"),
+        ("nix run nixpkgs#bat -- README.md", "bat"),
+        ("nix run nixpkgs#bat README.md", "bat"),
+        ("nix run nixpkgs#python3", "python"),
+        ("nix run -- nixpkgs#bash", "shell stdin"),
+        ("nix run --option sandbox false nixpkgs#bash", "shell stdin"),
+        (
+            "nix run --new-opt nixpkgs#hello nixpkgs#bash",
+            "shell stdin",
+        ),
+        ("nix run -f '<nixpkgs>' bash", "shell stdin"),
+        ("env GIT_PAGER='cat f' nix run nixpkgs#git -- log", "git -c"),
+        ("nix run", "unresolved"),
+        ("nix run .", "unresolved"),
+        ("nix run \"$X\"", "unresolved"),
+    ]);
+    assert_all_allow(&[
+        "nix run nixpkgs#hello",
+        "nix run nixpkgs#hello -- --greeting hi",
+        "nix run --impure nixpkgs#hello",
+        "nix run .#test",
+        "nix develop -c cargo test",
+        "nix build",
+        "nix flake check",
+    ]);
+}

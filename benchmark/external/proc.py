@@ -27,6 +27,10 @@ _KEPT_KEYS = frozenset({
 })
 
 
+# Cargo 1.100 runs test executables from target/debug/build/<pkg>/<hash>/out/, so ripgrep 13 cannot find `rg`.
+CARGO_OLD_BUILD_LAYOUT_KEY = "__CARGO_TEMPORARY_BUILD_DIR_NEW_LAYOUT_OPT_OUT"
+
+
 def _toolchain_dirs(source: Mapping[str, str]) -> dict[str, str]:
     """The host's toolchain and cache directories, so a throwaway HOME still finds its tools and caches."""
     home = Path(source.get("HOME") or Path.home())
@@ -57,6 +61,7 @@ def toolchain_env(home: Path, source: Mapping[str, str] | None = None) -> dict[s
     env = {key: value for key, value in source.items() if key in _KEPT_KEYS or key.startswith("LC_")}
     env.update(_toolchain_dirs(source))
     env["HOME"] = str(home)
+    env[CARGO_OLD_BUILD_LAYOUT_KEY] = "1"
     return env
 
 
