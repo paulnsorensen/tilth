@@ -2086,8 +2086,15 @@ def _run_single_cell(
             proc.kill()
             _reap_cell_processes(repo_path, cell_marker)
 
+        def _reap_when_runner_exits() -> None:
+            # A leftover that inherited the runner's stdout or stderr holds the pipe open, so the reads
+            # below would not end. Sweep when the runner exits, not only after end of file.
+            proc.wait()
+            _reap_cell_processes(repo_path, cell_marker)
+
         stderr_thread = threading.Thread(target=_drain_stderr)
         stderr_thread.start()
+        threading.Thread(target=_reap_when_runner_exits, daemon=True).start()
         timer = threading.Timer(timeout_s, _kill_on_timeout)
         timer.start()
         try:
@@ -2149,6 +2156,9 @@ def _run_single_cell(
                     seen.decode(errors="replace") if isinstance(seen, bytes) else seen or "", hook_binary, partial=True)
             raise
         finally:
+            # capture_output reads to end of file first, so a leftover that holds the runner's pipe
+            # delays this sweep until the timeout. Claude and Codex cells with a stream log use the
+            # Popen path above, which sweeps when the runner exits.
             _reap_cell_processes(repo_path, cell_marker)
         if runner == "claude":
             auth.check_captured(result.stdout)

@@ -2,11 +2,13 @@
 
 import io
 import os
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -152,6 +154,42 @@ def test_a_timed_out_cell_kills_its_leftover_process(
                                 stream_log_path=tmp_path / "streams" / "01_bat_task.jsonl")
 
     assert processes[0].wait(timeout=5) == -signal.SIGKILL
+
+
+@needs_proc
+@pytest.mark.usefixtures("bat_cell")
+def test_a_cell_ends_when_its_runner_exits_while_a_leftover_holds_the_pipe(
+        monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    stream, pidfile, stub = tmp_path / "stream.jsonl", tmp_path / "leftover.pid", tmp_path / "claude-stub"
+    stream.write_text(STREAM)
+    # A real runner: it prints the stream, leaves a sleep that inherits its stdout and stderr, and exits.
+    stub.write_text(f"#!/bin/sh\ncat {shlex.quote(str(stream))}\nsleep 300 &\n"
+                    f"echo $! > {shlex.quote(str(pidfile))}\nexit 0\n")
+    stub.chmod(0o755)
+    monkeypatch.setattr(run, "resolve_claude_binary", lambda: str(stub))
+    monkeypatch.setattr(run, "_task_timeout", lambda _task: 20)
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    try:
+        started = time.monotonic()
+        row = run._run_single_in_repo("bat_task", "baseline", "sonnet5", 0, workspace,
+                                      stream_log_path=tmp_path / "streams" / "01_bat_task.jsonl")
+
+        assert row["correct"] is True
+        assert time.monotonic() - started < 10
+        leftover = int(pidfile.read_text())
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and Path(f"/proc/{leftover}").exists():
+            time.sleep(0.05)
+        assert not Path(f"/proc/{leftover}").exists()
+    finally:
+        # Kill the leftover only while its PID still names this test's sleep.
+        try:
+            pid = int(pidfile.read_text())
+            if Path(f"/proc/{pid}/cmdline").read_bytes() == b"sleep\x00300\x00":
+                os.kill(pid, signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
 
 
 @needs_proc
