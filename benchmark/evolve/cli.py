@@ -32,7 +32,7 @@ import panels  # noqa: E402
 import run  # noqa: E402
 import tmp_aging  # noqa: E402
 from config import REPO_ROOT  # noqa: E402
-from evolve import benchlog, deepdiag, diagnosis, directives, failures, rust  # noqa: E402
+from evolve import benchlog, deepdiag, diagnosis, directives, failures, logpr, rust  # noqa: E402
 from evolve.candidate import SeedError, read_seed  # noqa: E402
 from evolve.finish import GitHubPRClient, PRClient  # noqa: E402
 from evolve.gitops import GitError, git  # noqa: E402
@@ -182,8 +182,9 @@ def _parser() -> argparse.ArgumentParser:
                              "a log that records another seed or no seed is refused")
     parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d-%H%M%S"))
     parser.add_argument("--benchmark-log", type=Path, default=None, metavar="PATH",
-                        help="the append-only benchmark log that gets this run's entry; its charts go next to it "
-                             f"(default {benchlog.COMMITTED_LOG})")
+                        help="append this run's entry to the log at PATH, draw its charts next to it, and open no "
+                             "PR; without it, the run opens its own PR that adds the entry to "
+                             "benchmark/log/evolve.jsonl on --base-branch")
     parser.add_argument("--repo", type=Path, default=REPO_ROOT, help=argparse.SUPPRESS)
     return parser
 
@@ -209,7 +210,8 @@ def build(argv: list[str] | None = None, *,
           pr_client: PRClient | None = None, just_check: Callable[[Path], tuple[bool, str]] | None = None,
           spawn: Callable | None = None, auth_spawn: Callable | None = None,
           deep_runner: deepdiag.Runner | None = None,
-          cargo: Callable[[Path, list[str]], tuple[bool, str]] | None = None) -> Evolution | int:
+          cargo: Callable[[Path, list[str]], tuple[bool, str]] | None = None,
+          log_client: logpr.LogClient | None = None) -> Evolution | int:
     """Validate the flags and build the run, or return an exit code; no model call happens here."""
     args = _parser().parse_args(argv)
     if args.max_usd is None:
@@ -309,12 +311,12 @@ def build(argv: list[str] | None = None, *,
         deep_diagnosis_max=args.deep_diagnosis_max, deep_diagnosis_timeout=args.deep_diagnosis_timeout,
         finish_reserve_usd=args.finish_reserve_usd, max_unselected=args.max_unselected,
         src_patch_by=args.src_patch_by, avoid_failures_from=tuple(args.avoid_failures_from),
-        benchmark_log=args.benchmark_log or benchlog.DEFAULT_LOG,
+        benchmark_log=args.benchmark_log,
     )
     return Evolution(settings, panel=panel, ledger=ledger, judge_=factory(ledger, args.cell_estimate_usd), seed=seed,
                      pr_client=pr_client or GitHubPRClient(repo), just_check=just_check or default_just_check,
                      spawn=spawn or subprocess.run, deep_runner=deep_runner,
-                     cargo=cargo)
+                     cargo=cargo, log_client=log_client or logpr.GitHubLogClient(repo))
 
 
 INTEGRITY_OFF = ("WARNING: the integrity stage is OFF: a custom just_check was injected without a cargo runner, so the "

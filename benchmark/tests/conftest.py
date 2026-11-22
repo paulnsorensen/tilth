@@ -1,5 +1,6 @@
 """Shared scaffolding for tests that drive ``run.main`` against a result store."""
 
+import hashlib
 import json
 import site
 import subprocess
@@ -159,12 +160,38 @@ def hermetic_claude_auth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Non
     )
 
 
+class OfflineLogClient:
+    """The default benchmark log client in tests: it refuses the first remote step, so no test fetches, pushes, or
+    opens a PR. A test that publishes passes its own client against a local bare ``origin``."""
+
+    def __init__(self, *_args, **_kwargs) -> None:
+        pass
+
+    def fetch(self, branch: str) -> str:
+        raise OSError("tests reach no remote")
+
+
 @pytest.fixture(autouse=True)
-def hermetic_benchmark_log(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Point an evolve run's default benchmark log at a temp path, so no test writes the committed benchmark/log/."""
+def hermetic_benchmark_log(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An evolve run in a test publishes through ``OfflineLogClient`` unless the test passes a client."""
+    from evolve import logpr
+
+    monkeypatch.setattr(logpr, "GitHubLogClient", OfflineLogClient)
+
+
+def _committed_log_hashes() -> dict[str, str]:
     from evolve import benchlog
 
-    monkeypatch.setattr(benchlog, "DEFAULT_LOG", tmp_path / "benchmark-log" / "evolve.jsonl")
+    paths = [benchlog.COMMITTED_LOG, *benchlog.chart_paths(benchlog.COMMITTED_LOG)]
+    return {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}
+
+
+@pytest.fixture(autouse=True, scope="session")
+def committed_log_unchanged():
+    """No test writes the committed benchmark/log/: its log and both charts hash the same at session end."""
+    before = _committed_log_hashes()
+    yield
+    assert _committed_log_hashes() == before, "a test changed the committed benchmark/log/"
 
 
 @pytest.fixture(autouse=True)

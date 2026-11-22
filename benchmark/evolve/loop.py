@@ -32,7 +32,7 @@ from judge import store as judge_store
 from spend import SpendLedger
 
 from . import attribution as cost_attribution
-from . import benchlog, deepdiag, diagnosis, directives, engine, hookgate, replay, rust
+from . import benchlog, deepdiag, diagnosis, directives, engine, hookgate, logpr, replay, rust
 from .calls import PaidCalls, StopState
 from .directives import Directive
 from .candidate import SRC_PATCH, content_id
@@ -116,7 +116,7 @@ class Settings:
     avoid_failures_from: tuple[Path, ...] = ()
     # Extra attempts for a cell that did not complete (crash, infra, timeout) in one plan; each one is charged.
     cell_retries: int = 2
-    # The append-only benchmark log that gets one entry per run past preflight; None writes no entry.
+    # A local benchmark log that gets this run's entry and opens no PR; None opens a PR against the committed log.
     benchmark_log: Path | None = None
 
 
@@ -368,8 +368,11 @@ class Evolution:
     def __init__(self, settings: Settings, *, panel: panels.Panel, ledger: SpendLedger, judge_: judge.Judge,
                  seed: dict[str, str], pr_client: PRClient, just_check: Callable[[Path], tuple[bool, str]],
                  spawn: Callable, deep_runner: deepdiag.Runner | None = None,
-                 cargo: Callable[[Path, list[str]], tuple[bool, str]] | None = None) -> None:
+                 cargo: Callable[[Path, list[str]], tuple[bool, str]] | None = None,
+                 log_client: logpr.LogClient | None = None) -> None:
         self.settings = settings
+        # Opens the run's benchmark log PR when ``settings.benchmark_log`` is None; None publishes nothing.
+        self.log_client = log_client
         self.panel = panel
         self.ledger = ledger
         self.judge = judge_
@@ -1410,22 +1413,34 @@ class Evolution:
         }
 
     def _record_benchmark(self) -> None:
-        """Write this run's entry to its run directory, then append it to the benchmark log and redraw the charts.
+        """Write this run's entry to its run directory, then publish it.
 
-        A failure writes one log line and changes nothing else: the exit code and the finish result stay.
+        With ``--benchmark-log PATH`` the entry goes to PATH and the charts next to it. Without it, the run opens its
+        own PR that adds the entry to the committed log of the base branch (``logpr.publish``). A failure writes one
+        log line and changes nothing else: the exit code, the finish result, and the entry file stay.
         """
         step = "entry"
         try:
             entry = self.benchmark_entry(datetime.now(timezone.utc))
             benchlog.write_entry(self.run_dir, entry)
             path = self.settings.benchmark_log
-            if path is None:
+            if path is not None:
+                step = "append"
+                benchlog.append(path, entry)
+                step = "redraw"
+                benchlog.redraw(path)
+                self.log(f"benchmark log: appended {self.settings.run_id} to {path}")
                 return
-            step = "append"
-            benchlog.append(path, entry)
-            step = "redraw"
-            benchlog.redraw(path)
+            if self.log_client is None:
+                self.log("benchmark log: publish skipped (no log client)")
+                return
+            step = "publish"
+            url = logpr.publish(self.run_dir, entry, repo=self.settings.repo, base=self.settings.base_branch,
+                                client=self.log_client)
+        except logpr.PublishError as error:
+            self.log(f"benchmark log: {error}")
+            return
         except Exception as error:  # noqa: BLE001 - no log or chart fault may change the run's result
             self.log(f"benchmark log: {step} failed ({type(error).__name__}: {error})")
             return
-        self.log(f"benchmark log: appended {self.settings.run_id} to {path}")
+        self.log(f"benchmark log: opened {url} from {logpr.BRANCH_PREFIX}{self.settings.run_id}")

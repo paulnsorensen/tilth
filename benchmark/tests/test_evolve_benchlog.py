@@ -292,16 +292,11 @@ def test_an_empty_log_renders_a_valid_no_runs_chart(tmp_path: Path, theme: str) 
 
 
 def test_the_committed_charts_match_the_committed_log(tmp_path: Path) -> None:
-    """A redraw of the committed log gives the committed charts, so the README never shows a stale graph."""
+    """A redraw of the committed log gives the committed charts, so the README never shows a stale chart."""
     light, dark = benchlog.chart_paths(benchlog.COMMITTED_LOG)
-    rows = benchlog.load(benchlog.COMMITTED_LOG)
+    rows = benchlog.latest(benchlog.load(benchlog.COMMITTED_LOG))
     assert light.read_text() == chart.render(rows, "light")
     assert dark.read_text() == chart.render(rows, "dark")
-
-
-def test_tests_never_write_the_committed_log() -> None:
-    assert benchlog.DEFAULT_LOG != benchlog.COMMITTED_LOG
-    assert "benchmark/log" not in str(benchlog.DEFAULT_LOG)
 
 
 def test_the_redraw_script_runs_without_the_harness(tmp_path: Path) -> None:
