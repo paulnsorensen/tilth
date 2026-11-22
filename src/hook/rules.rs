@@ -119,12 +119,10 @@ fn check_from(cmd: &Cmd, words: &[Arg], xargs: bool) -> Outcome {
         "find" => find(args),
         "fd" | "fdfind" => fd(args),
         "git" => {
-            let wrapped = &cmd.words[..cmd.words.len() - words.len()];
-            let env = cmd
-                .assigns
+            if env_assigns(cmd, words)
                 .iter()
-                .chain(wrapped.iter().filter(|a| is_assign_word(&a.text)));
-            if env.into_iter().any(|a| git_env_runs_command(&a.text)) {
+                .any(|a| git_env_runs_command(&a.text))
+            {
                 return Outcome::Deny(GIT_CONFIG);
             }
             git(args)
@@ -140,7 +138,7 @@ fn check_from(cmd: &Cmd, words: &[Arg], xargs: bool) -> Outcome {
         "source" | "." => source(args),
         _ => match interpreter_family(name) {
             Some(family) => interpreter(family, args, cmd),
-            None => stdin_reader(name, args),
+            None => stdin_reader(name, args, &env_assigns(cmd, words)),
         },
     }
 }
@@ -326,6 +324,16 @@ fn wrapper_opts(name: &str) -> WrapOpts {
 /// A `VAR=value` word in a wrapper's argument list.
 fn is_assign_word(t: &str) -> bool {
     t.contains('=') && !t.starts_with(['=', '-'])
+}
+
+/// The `NAME=value` words that set the environment of the command in `words`, a tail of
+/// `cmd.words`: the leading assignments, and those that wrappers such as `env` take.
+fn env_assigns<'a>(cmd: &Cmd<'a>, words: &[Arg]) -> Vec<&'a Arg> {
+    let wrapped = &cmd.words[..cmd.words.len() - words.len()];
+    cmd.assigns
+        .iter()
+        .chain(wrapped.iter().filter(|a| is_assign_word(&a.text)))
+        .collect()
 }
 
 /// Required positional words a wrapper takes before the wrapped command.
@@ -560,6 +568,13 @@ struct Runner {
     name: &'static str,
     /// Subcommands that run a command. Empty when the runner itself runs it.
     subs: &'static [&'static str],
+    /// Words before the subcommand that name a group of subcommands (`uv tool run`).
+    groups: &'static [&'static str],
+    /// Subcommands that start an interactive shell, which reads stdin (`mise en`).
+    shells: &'static [&'static str],
+    /// The runner's own commands. When this list is not empty, a first operand outside it and
+    /// outside `subs` is a command too: `pnpm cat f` runs `cat`.
+    builtins: &'static [&'static str],
     at: CommandAt,
     /// Operands before the command (`direnv exec DIR`).
     positionals: usize,
@@ -571,6 +586,11 @@ struct Runner {
     rest: &'static [&'static str],
     /// Flags that run the command words as shell source (`pnpm exec -c`).
     shell_mode: &'static [&'static str],
+    /// The runner always runs the command words as shell source (`devbox run`, `pixi run`).
+    shell_words: bool,
+    /// hatch: `+NAME=VALUES` words select matrix environments, and the command can start with
+    /// `ENV:` (`hatch run test:cov`).
+    env_select: bool,
     /// The runner runs Python: `-m MODULE` runs a module, and a `-` command reads stdin.
     python: bool,
     /// With no command, the runner starts a shell that reads stdin (`npx`, `npm exec`).
@@ -582,12 +602,17 @@ const fn runner(name: &'static str, subs: &'static [&'static str]) -> Runner {
     Runner {
         name,
         subs,
+        groups: &[],
+        shells: &[],
+        builtins: &[],
         at: CommandAt::Operand,
         positionals: 0,
         valued: &[],
         shell: &[],
         rest: &[],
         shell_mode: &[],
+        shell_words: false,
+        env_select: false,
         python: false,
         stdin_shell: false,
     }
@@ -696,7 +721,99 @@ const PNPM_VALUED: &[&str] = &[
     "--workspace-concurrency",
 ];
 const PNPM_SHELL_MODE: &[&str] = &["-c", "--shell-mode"];
-const BUN_VALUED: &[&str] = &["-p", "--package"];
+/// pnpm commands. pnpm runs any other first operand as a script, or else as a command.
+const PNPM_BUILTINS: &[&str] = &[
+    "add",
+    "approve-builds",
+    "audit",
+    "bin",
+    "c",
+    "cache",
+    "cat-file",
+    "cat-index",
+    "completion",
+    "config",
+    "create",
+    "dedupe",
+    "deploy",
+    "dist-tag",
+    "doctor",
+    "env",
+    "fetch",
+    "find-hash",
+    "get",
+    "help",
+    "i",
+    "ignored-builds",
+    "import",
+    "info",
+    "init",
+    "install",
+    "install-test",
+    "it",
+    "la",
+    "licenses",
+    "link",
+    "list",
+    "ll",
+    "ln",
+    "login",
+    "logout",
+    "ls",
+    "outdated",
+    "pack",
+    "patch",
+    "patch-commit",
+    "patch-remove",
+    "prune",
+    "publish",
+    "rb",
+    "rebuild",
+    "remove",
+    "restart",
+    "rm",
+    "root",
+    "run",
+    "run-script",
+    "sbom",
+    "search",
+    "self-update",
+    "server",
+    "set",
+    "setup",
+    "show",
+    "start",
+    "stop",
+    "store",
+    "t",
+    "test",
+    "tst",
+    "un",
+    "uninstall",
+    "unlink",
+    "up",
+    "update",
+    "upgrade",
+    "v",
+    "version",
+    "view",
+    "whoami",
+    "why",
+];
+const BUN_VALUED: &[&str] = &[
+    "-p",
+    "--package",
+    "--cwd",
+    "-r",
+    "--preload",
+    "-c",
+    "--config",
+    "--env-file",
+    "-F",
+    "--filter",
+    "--elide-lines",
+    "--shell",
+];
 const CONDA_VALUED: &[&str] = &[
     "-n",
     "--name",
@@ -729,6 +846,7 @@ const NIX_VALUED: &[&str] = &[
 const RUNNERS: &[Runner] = &[
     Runner {
         at: CommandAt::DashDash,
+        shells: &["en"],
         valued: &[
             "-C",
             "--cd",
@@ -743,6 +861,7 @@ const RUNNERS: &[Runner] = &[
         ..runner("mise", &["exec", "x"])
     },
     Runner {
+        groups: &["tool"],
         valued: UV_VALUED,
         python: true,
         ..runner("uv", &["run"])
@@ -764,6 +883,7 @@ const RUNNERS: &[Runner] = &[
         ..runner("npm", &["exec", "x"])
     },
     Runner {
+        shells: &["shell"],
         valued: &["-C", "--directory", "-P", "--project"],
         ..runner("poetry", &["run"])
     },
@@ -772,6 +892,8 @@ const RUNNERS: &[Runner] = &[
         ..runner("bundle", &["exec"])
     },
     Runner {
+        groups: &["recursive", "m", "multi"],
+        builtins: PNPM_BUILTINS,
         valued: PNPM_VALUED,
         shell_mode: PNPM_SHELL_MODE,
         ..runner("pnpm", &["exec", "dlx"])
@@ -791,7 +913,7 @@ const RUNNERS: &[Runner] = &[
     },
     Runner {
         valued: BUN_VALUED,
-        ..runner("bun", &["x"])
+        ..runner("bun", &["x", "run"])
     },
     Runner {
         positionals: 1,
@@ -810,8 +932,23 @@ const RUNNERS: &[Runner] = &[
     },
     runner("asdf", &["exec"]),
     Runner {
-        valued: &["-e", "--environment", "--manifest-path", "--color"],
-        ..runner("pixi", &["run"])
+        shells: &["shell"],
+        valued: &[
+            "-e",
+            "--environment",
+            "--manifest-path",
+            "--color",
+            "-s",
+            "--spec",
+            "-w",
+            "--with",
+            "-c",
+            "--channel",
+            "-p",
+            "--platform",
+        ],
+        shell_words: true,
+        ..runner("pixi", &["run", "exec"])
     },
     Runner {
         valued: CONDA_VALUED,
@@ -825,10 +962,52 @@ const RUNNERS: &[Runner] = &[
         valued: CONDA_VALUED,
         ..runner("micromamba", &["run"])
     },
+    Runner {
+        shells: &["shell"],
+        valued: &["--python", "--pypi-mirror"],
+        ..runner("pipenv", &["run"])
+    },
+    Runner {
+        valued: &["-p", "--project", "-c", "--config", "--venv", "--skip"],
+        ..runner("pdm", &["run"])
+    },
+    Runner {
+        shells: &["shell"],
+        valued: &[
+            "-e",
+            "--env",
+            "-p",
+            "--project",
+            "--data-dir",
+            "--cache-dir",
+            "--config",
+        ],
+        shell_words: true,
+        env_select: true,
+        ..runner("hatch", &["run"])
+    },
+    Runner {
+        shells: &["shell"],
+        valued: &["--pyproject"],
+        ..runner("rye", &["run"])
+    },
+    Runner {
+        shells: &["shell"],
+        valued: &[
+            "-c",
+            "--config",
+            "-e",
+            "--env",
+            "--env-file",
+            "--environment",
+        ],
+        shell_words: true,
+        ..runner("devbox", &["run"])
+    },
 ];
 
 enum Run {
-    /// Not a runner invocation (`mise install`, `bun run`).
+    /// Not a runner invocation (`mise install`, `bun test`).
     No,
     /// The command starts at this index of the runner's arguments.
     At(usize),
@@ -843,9 +1022,39 @@ fn is_runner_opt(t: &str) -> bool {
     t.len() > 1 && t.starts_with('-') && t != "--"
 }
 
-/// The number of words an option uses: two when `valued` lists it and its value is the next word.
-fn opt_words(spec: &Runner, t: &str) -> usize {
-    1 + usize::from(match_opt(t, spec.valued) == Some(OptValue::Next))
+/// The word turns on shell mode. pnpm reads options with nopt: a long name can be a prefix of
+/// the name (`--shell-m`), `--name=VALUE` sets it unless VALUE is `false`, and one-letter flags
+/// combine (`-rc`).
+fn turns_on_shell_mode(spec: &Runner, t: &str) -> bool {
+    spec.shell_mode
+        .iter()
+        .any(|&flag| match flag.strip_prefix("--") {
+            Some(full) => t.strip_prefix("--").is_some_and(|long| {
+                let (name, value) = long.split_once('=').unwrap_or((long, "true"));
+                !name.is_empty() && full.starts_with(name) && value != "false"
+            }),
+            None => {
+                t == flag
+                    || t.strip_prefix('-').is_some_and(|cluster| {
+                        cluster.len() > 1
+                            && cluster.chars().all(|c| c.is_ascii_alphabetic())
+                            && cluster.contains(&flag[1..])
+                    })
+            }
+        })
+}
+
+/// The number of words an option uses: two when `valued` lists it and its value is the next
+/// word, or when a `true` or `false` follows a shell-mode flag (nopt reads `--shell-mode true`).
+fn opt_words(spec: &Runner, args: &[Arg], i: usize) -> usize {
+    let t = args[i].text.as_str();
+    let valued = match_opt(t, spec.valued) == Some(OptValue::Next);
+    let boolean = !t.contains('=')
+        && turns_on_shell_mode(spec, t)
+        && args
+            .get(i + 1)
+            .is_some_and(|n| matches!(n.text.as_str(), "true" | "false"));
+    1 + usize::from(valued || boolean)
 }
 
 /// A `--name` option that the runner table does not list. It can take the next word as its value.
@@ -853,7 +1062,7 @@ fn unlisted_long(spec: &Runner, t: &str) -> bool {
     t.starts_with("--")
         && !t.contains('=')
         && match_opt(t, spec.valued).is_none()
-        && !spec.shell_mode.contains(&t)
+        && !turns_on_shell_mode(spec, t)
 }
 
 /// The outcome of a shell-string option at `args[i]` (`npx -c 'cmd'`), or `None`.
@@ -874,33 +1083,54 @@ fn shell_option(spec: &Runner, args: &[Arg], i: usize) -> Option<Outcome> {
 /// Finds the command that a runner invocation runs. Options before the subcommand count too:
 /// npm reads `npm -c CMD exec`, and pnpm reads `pnpm -c exec CMD`.
 fn run_target(spec: &Runner, args: &[Arg]) -> Run {
-    let mut i = 0;
-    let mut shell_mode = false;
-    if !spec.subs.is_empty() {
-        let mut maybe_value = false;
-        loop {
-            let Some(t) = args.get(i).map(|a| a.text.as_str()) else {
-                return Run::No;
-            };
-            if let Some(outcome) = shell_option(spec, args, i) {
-                return Run::Done(outcome);
-            }
-            if is_runner_opt(t) {
-                shell_mode |= spec.shell_mode.contains(&t);
-                maybe_value = unlisted_long(spec, t);
-                i += opt_words(spec, t);
-            } else if spec.subs.contains(&t) {
-                i += 1;
-                break;
-            } else if std::mem::take(&mut maybe_value) {
-                // The value of an unlisted option; the subcommand can follow it.
-                i += 1;
-            } else {
-                return Run::No;
-            }
-        }
+    if spec.subs.is_empty() {
+        return scan(spec, args, 0, spec.positionals, spec.shell_words, true);
     }
-    scan(spec, args, i, spec.positionals, shell_mode, true)
+    find_sub(spec, args, 0, spec.shell_words)
+}
+
+/// Finds the subcommand from `args[i]`, past options and group words. A runner with `builtins`
+/// also runs a first operand that is not one of its commands, so the word after an unlisted
+/// option has two readings: the command, or the option's value.
+fn find_sub(spec: &Runner, args: &[Arg], mut i: usize, mut shell_mode: bool) -> Run {
+    let mut maybe_value = false;
+    while let Some(t) = args.get(i).map(|a| a.text.as_str()) {
+        if let Some(outcome) = shell_option(spec, args, i) {
+            return Run::Done(outcome);
+        }
+        if is_runner_opt(t) {
+            shell_mode |= turns_on_shell_mode(spec, t);
+            maybe_value = unlisted_long(spec, t);
+            i += opt_words(spec, args, i);
+            continue;
+        }
+        if spec.subs.contains(&t) {
+            return scan(spec, args, i + 1, spec.positionals, shell_mode, true);
+        }
+        if spec.shells.contains(&t) {
+            return Run::Done(Outcome::Deny(SHELL_STDIN));
+        }
+        let value = std::mem::take(&mut maybe_value);
+        if spec.groups.contains(&t) {
+            i += 1;
+            continue;
+        }
+        if spec.builtins.is_empty() || spec.builtins.contains(&t) {
+            if !value {
+                return Run::No;
+            }
+            // The value of an unlisted option; the subcommand can follow it.
+            i += 1;
+            continue;
+        }
+        let command = scan(spec, args, i, 0, shell_mode, true);
+        if !value {
+            return command;
+        }
+        let after = find_sub(spec, args, i + 1, shell_mode);
+        return Run::Either(Box::new(command), Box::new(after));
+    }
+    Run::No
 }
 
 /// Scans runner arguments from `i` for the command. The `primary` reading forks at a word right
@@ -932,12 +1162,13 @@ fn scan(
             return Run::Done(module.map_or(Outcome::Allow, |m| python_module(m, leftover)));
         }
         if is_runner_opt(t) {
-            shell_mode |= spec.shell_mode.contains(&t);
+            shell_mode |= turns_on_shell_mode(spec, t);
             maybe_value = primary && unlisted_long(spec, t);
-            i += opt_words(spec, t);
+            i += opt_words(spec, args, i);
             continue;
         }
-        if spec.at == CommandAt::Option {
+        // A hatch matrix word, or a word before a command option (`nix develop .#x -c`).
+        if (spec.env_select && t.starts_with('+')) || spec.at == CommandAt::Option {
             i += 1;
         } else if positionals > 0 {
             positionals -= 1;
@@ -965,20 +1196,33 @@ fn scan(
     }
 }
 
-/// The runner's command starts at `k`. Shell mode runs the words as shell source, a Python
-/// runner reads a `-` script from stdin, and a runner with no command can start a shell.
+/// The runner's command starts at `k`. A `-` command reads a script from stdin, shell mode runs
+/// the words as shell source, and a runner with no command can start a shell.
 fn command_at(spec: &Runner, args: &[Arg], k: usize, shell_mode: bool) -> Run {
     let words = args.get(k..).unwrap_or(&[]);
-    if words.is_empty() && spec.stdin_shell {
-        return Run::Done(Outcome::Deny(SHELL_STDIN));
+    let Some(first) = words.first() else {
+        return if spec.stdin_shell {
+            Run::Done(Outcome::Deny(SHELL_STDIN))
+        } else {
+            Run::At(args.len())
+        };
+    };
+    if first.text == "-" || reads_stdin(first) {
+        let rule = if spec.python {
+            "python"
+        } else {
+            interpreter_family(spec.name).unwrap_or(SHELL_STDIN)
+        };
+        return Run::Done(Outcome::Deny(rule));
     }
-    if shell_mode && !words.is_empty() {
-        return Run::Done(reparse(words));
+    if !shell_mode {
+        return Run::At(k);
     }
-    if spec.python && words.first().is_some_and(|w| w.text == "-") {
-        return Run::Done(Outcome::Deny("python"));
+    let mut words = words.to_vec();
+    if let Some((_, command)) = first.text.split_once(':').filter(|_| spec.env_select) {
+        words[0].text = command.to_string();
     }
-    Run::At(k.min(args.len()))
+    Run::Done(reparse(&words))
 }
 
 // ---------------------------------------------------------------------------
@@ -2316,100 +2560,234 @@ const INFO_FLAGS: &[&str] = &[
 ];
 
 /// Routes a command that is not an inline interpreter to the debugger, make, sqlite3, or stdin
-/// REPL rules.
-fn stdin_reader(name: &str, args: &[Arg]) -> Outcome {
+/// REPL rules. `env` holds the `NAME=value` words that set the command's environment.
+fn stdin_reader(name: &str, args: &[Arg], env: &[&Arg]) -> Outcome {
     let stem = name.trim_end_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | '-'));
     match stem {
         "gdb" | "rust-gdb" | "gdb-multiarch" => debugger(&GDB, args),
         "lldb" | "rust-lldb" => debugger(&LLDB, args),
-        "make" | "gmake" if make_evals(args) => Outcome::Deny(MAKE_EVAL),
-        "sqlite" if sqlite_io(args) => Outcome::Deny(SQLITE_IO),
-        _ => REPLS
-            .iter()
-            .find(|r| r.name == stem)
-            .map_or(Outcome::Allow, |spec| repl_program(spec, args)),
+        "make" | "gmake" if make_evals(args) || env.iter().any(|a| make_runs_code(&a.text)) => {
+            Outcome::Deny(MAKE_EVAL)
+        }
+        "sqlite" => {
+            let args = sqlite_args(args);
+            if sqlite_io(&args) {
+                Outcome::Deny(SQLITE_IO)
+            } else {
+                stdin_repl(stem, &args)
+            }
+        }
+        _ => stdin_repl(stem, args),
+    }
+}
+
+/// Checks a program from `REPLS`. Any other program is allowed.
+fn stdin_repl(stem: &str, args: &[Arg]) -> Outcome {
+    REPLS
+        .iter()
+        .find(|r| r.name == stem)
+        .map_or(Outcome::Allow, |spec| repl_program(spec, args))
+}
+
+/// What a gdb or lldb option does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DebugOpt {
+    /// A flag that does not change what the rules check.
+    Flag,
+    /// Quit after the command options run, instead of reading commands from stdin.
+    Batch,
+    /// Print version or help text and exit.
+    Info,
+    /// gdb `--args`: the remaining words are the program and its arguments.
+    Args,
+    /// The value is one debugger command.
+    Command,
+    /// The value is a file of debugger commands.
+    File,
+    /// The value is the program to debug.
+    Program,
+    /// gdb `-tty`: the value is the terminal that the program reads and writes.
+    Tty,
+    /// Another option that takes a value.
+    Valued,
+    /// lldb `--repl`: a language REPL that reads stdin.
+    Repl,
+}
+
+impl DebugOpt {
+    /// The option takes a value: the text after `=`, or the next word.
+    fn takes_value(self) -> bool {
+        matches!(
+            self,
+            Self::Command | Self::File | Self::Program | Self::Tty | Self::Valued
+        )
     }
 }
 
 /// The command-line options of gdb or lldb.
 struct Debugger {
-    /// Options whose value is one debugger command.
-    commands: &'static [&'static str],
-    /// Options whose value is a command file.
-    files: &'static [&'static str],
-    batch: &'static [&'static str],
-    /// Options whose value is the program to debug. A longer name comes before its prefix.
-    program: &'static [&'static str],
-    /// Other options that take a value. A longer name comes before its prefix.
-    valued: &'static [&'static str],
+    /// Every option name without its dashes, and what the option does.
+    options: &'static [(&'static str, DebugOpt)],
     /// gdb: the words after `--args` are the program and its arguments, and the first operand
     /// is the program. lldb: the operands and the words after `--` are.
     gdb: bool,
 }
 
+/// The `long_options` table of gdb 17 (`gdb/main.c`), and `-dbx` from older releases. The
+/// rules resolve a unique prefix against this whole table, so it must list every option.
 const GDB: Debugger = Debugger {
-    commands: &["-ex", "-eval-command", "-iex", "-init-eval-command"],
-    files: &["-x", "-command", "-ix", "-init-command"],
-    batch: &["-batch", "-batch-silent"],
-    program: &["-exec", "-se", "-e"],
-    valued: &[
-        "-pid",
-        "-p",
-        "-core",
-        "-cd",
-        "-c",
-        "-symbols",
-        "-s",
-        "-directory",
-        "-data-directory",
-        "-d",
-        "-D",
-        "-interpreter",
-        "-i",
-        "-tty",
-        "-t",
-        "-annotate",
-        "-b",
-        "-l",
+    options: &[
+        ("annotate", DebugOpt::Valued),
+        ("args", DebugOpt::Args),
+        ("b", DebugOpt::Valued),
+        ("batch", DebugOpt::Batch),
+        ("batch-silent", DebugOpt::Batch),
+        ("baud", DebugOpt::Valued),
+        ("c", DebugOpt::Valued),
+        ("cd", DebugOpt::Valued),
+        ("command", DebugOpt::File),
+        ("configuration", DebugOpt::Info),
+        ("core", DebugOpt::Valued),
+        ("D", DebugOpt::Valued),
+        ("d", DebugOpt::Valued),
+        ("data-directory", DebugOpt::Valued),
+        ("dbx", DebugOpt::Flag),
+        ("directory", DebugOpt::Valued),
+        ("e", DebugOpt::Program),
+        ("early-init-command", DebugOpt::File),
+        ("early-init-eval-command", DebugOpt::Command),
+        ("eiex", DebugOpt::Command),
+        ("eix", DebugOpt::File),
+        ("eval-command", DebugOpt::Command),
+        ("ex", DebugOpt::Command),
+        ("exec", DebugOpt::Program),
+        ("f", DebugOpt::Flag),
+        ("fullname", DebugOpt::Flag),
+        ("help", DebugOpt::Info),
+        ("i", DebugOpt::Valued),
+        ("iex", DebugOpt::Command),
+        ("init-command", DebugOpt::File),
+        ("init-eval-command", DebugOpt::Command),
+        ("interpreter", DebugOpt::Valued),
+        ("ix", DebugOpt::File),
+        ("l", DebugOpt::Valued),
+        ("n", DebugOpt::Flag),
+        ("nh", DebugOpt::Flag),
+        ("nowindows", DebugOpt::Flag),
+        ("nw", DebugOpt::Flag),
+        ("nx", DebugOpt::Flag),
+        ("p", DebugOpt::Valued),
+        ("pid", DebugOpt::Valued),
+        ("q", DebugOpt::Flag),
+        ("quiet", DebugOpt::Flag),
+        ("r", DebugOpt::Flag),
+        ("readnever", DebugOpt::Flag),
+        ("readnow", DebugOpt::Flag),
+        ("return-child-result", DebugOpt::Flag),
+        ("s", DebugOpt::Valued),
+        ("se", DebugOpt::Program),
+        ("silent", DebugOpt::Flag),
+        ("statistics", DebugOpt::Flag),
+        ("symbols", DebugOpt::Valued),
+        ("tty", DebugOpt::Tty),
+        ("tui", DebugOpt::Flag),
+        ("ui", DebugOpt::Valued),
+        ("version", DebugOpt::Info),
+        ("w", DebugOpt::Flag),
+        ("windows", DebugOpt::Flag),
+        ("write", DebugOpt::Flag),
+        ("x", DebugOpt::File),
     ],
     gdb: true,
 };
 
+/// The lldb options that change what the rules check (`lldb/tools/driver/Options.td`). lldb
+/// ignores other options.
 const LLDB: Debugger = Debugger {
-    commands: &[
-        "-o",
-        "--one-line",
-        "-O",
-        "--one-line-before-file",
-        "-k",
-        "--one-line-on-crash",
-    ],
-    files: &[
-        "-s",
-        "--source",
-        "-S",
-        "--source-before-file",
-        "-K",
-        "--source-on-crash",
-    ],
-    batch: &["-b", "-batch"],
-    program: &["-f", "--file"],
-    valued: &[
-        "-c",
-        "--core",
-        "-p",
-        "--attach-pid",
-        "-n",
-        "--attach-name",
-        "-a",
-        "--arch",
-        "-l",
-        "--script-language",
-        "-R",
-        "--repl-language",
+    options: &[
+        ("o", DebugOpt::Command),
+        ("one-line", DebugOpt::Command),
+        ("O", DebugOpt::Command),
+        ("one-line-before-file", DebugOpt::Command),
+        ("k", DebugOpt::Command),
+        ("one-line-on-crash", DebugOpt::Command),
+        ("s", DebugOpt::File),
+        ("source", DebugOpt::File),
+        ("S", DebugOpt::File),
+        ("source-before-file", DebugOpt::File),
+        ("K", DebugOpt::File),
+        ("source-on-crash", DebugOpt::File),
+        ("b", DebugOpt::Batch),
+        ("batch", DebugOpt::Batch),
+        ("f", DebugOpt::Program),
+        ("file", DebugOpt::Program),
+        ("c", DebugOpt::Valued),
+        ("core", DebugOpt::Valued),
+        ("p", DebugOpt::Valued),
+        ("attach-pid", DebugOpt::Valued),
+        ("n", DebugOpt::Valued),
+        ("attach-name", DebugOpt::Valued),
+        ("a", DebugOpt::Valued),
+        ("arch", DebugOpt::Valued),
+        ("l", DebugOpt::Valued),
+        ("script-language", DebugOpt::Valued),
+        ("R", DebugOpt::Valued),
+        ("repl-language", DebugOpt::Valued),
+        ("v", DebugOpt::Info),
+        ("version", DebugOpt::Info),
+        ("h", DebugOpt::Info),
+        ("help", DebugOpt::Info),
+        ("r", DebugOpt::Repl),
+        ("repl", DebugOpt::Repl),
     ],
     gdb: false,
 };
+
+/// Resolves a debugger option word to what it does and its inline value. `None` is an option
+/// that gdb rejects (unknown, ambiguous, or a flag with a value) or that lldb ignores.
+///
+/// gdb reads options with `getopt_long_only`: one or two dashes, an exact name or a unique
+/// prefix of one, and `NAME=VALUE`. lldb reads exact names: a long name takes one or two
+/// dashes, and a one-letter name takes one dash. lldb does not read `--NAME=VALUE` or
+/// `-xVALUE`, but the rules read them for an option with a value, so they check more.
+fn debugger_option<'t>(spec: &Debugger, t: &'t str) -> Option<(DebugOpt, Option<&'t str>)> {
+    let (double, word) = match t.strip_prefix("--") {
+        Some(word) => (true, word),
+        None => (false, &t[1..]),
+    };
+    if spec.gdb {
+        let (name, value) = match word.split_once('=') {
+            Some((name, value)) => (name, Some(value)),
+            None => (word, None),
+        };
+        let mut prefixed = spec.options.iter().filter(|(n, _)| n.starts_with(name));
+        let found = spec.options.iter().find(|(n, _)| *n == name).or_else(|| {
+            let only = prefixed.next()?;
+            prefixed.next().is_none().then_some(only)
+        });
+        return found
+            .filter(|(_, kind)| value.is_none() || kind.takes_value())
+            .map(|&(_, kind)| (kind, value));
+    }
+    let exact = spec
+        .options
+        .iter()
+        .find(|(n, _)| *n == word && (n.len() > 1 || !double));
+    if let Some(&(_, kind)) = exact {
+        return Some((kind, None));
+    }
+    let (long, short): (Vec<_>, Vec<_>) = spec.options.iter().partition(|(n, _)| n.len() > 1);
+    long.into_iter().chain(short).find_map(|&(n, kind)| {
+        let value = if n.len() > 1 {
+            word.strip_prefix(n)?.strip_prefix('=')?
+        } else if double {
+            return None;
+        } else {
+            word.strip_prefix(n)?
+        };
+        (kind.takes_value() || kind == DebugOpt::Repl).then_some((kind, Some(value)))
+    })
+}
 
 /// gdb and lldb read commands from stdin unless `-batch` stops them. A command option can run a
 /// shell command, which the rules reparse, or a script or meta command, which denies. The rules
@@ -2422,10 +2800,6 @@ fn debugger(spec: &Debugger, args: &[Arg]) -> Outcome {
     while let Some(a) = args.get(i) {
         let t = a.text.as_str();
         i += 1;
-        if spec.gdb && matches!(t, "--args" | "-args") {
-            program = args[i..].to_vec();
-            break;
-        }
         if t == "--" {
             let rest = &args[i..];
             let take = if spec.gdb && program.is_empty() {
@@ -2445,48 +2819,54 @@ fn debugger(spec: &Debugger, args: &[Arg]) -> Outcome {
             }
             continue;
         }
-        let file = match_opt(t, spec.files);
-        if let Some(given) = match_opt(t, spec.commands).or(file) {
-            let (value, opaque) = if let OptValue::Inline(v) = given {
-                (v, a.opaque)
-            } else {
-                let Some(next) = args.get(i) else { break };
-                i += 1;
-                (next.text.as_str(), next.opaque)
-            };
-            if file.is_some() {
-                if value == "-" {
-                    return Outcome::Deny(STDIN_REPL);
-                }
-                continue;
-            }
-            if opaque {
+        let Some((kind, inline)) = debugger_option(spec, t) else {
+            if spec.gdb {
+                // gdb exits on this option, but the rules cannot tell which one the word is.
                 return Outcome::Deny(UNRESOLVED);
             }
-            match debugger_command(value) {
-                Ok(Some(source)) => scripts.push(source),
-                Ok(None) => {}
-                Err(rule) => return Outcome::Deny(rule),
+            continue;
+        };
+        let value = match inline {
+            Some(v) => Some(Arg {
+                text: v.to_string(),
+                literal: a.literal,
+                opaque: a.opaque,
+            }),
+            None if kind.takes_value() => {
+                i += 1;
+                args.get(i - 1).cloned()
             }
-        } else if match_opt(t, spec.batch) == Some(OptValue::Next) {
-            batched = true;
-        } else if INFO_FLAGS.contains(&t) {
-            info = true;
-        } else if let Some(given) = match_opt(t, spec.program) {
-            let value = match given {
-                OptValue::Inline(v) => Some(Arg {
-                    text: v.to_string(),
-                    literal: a.literal,
-                    opaque: a.opaque,
-                }),
-                OptValue::Next => {
-                    i += 1;
-                    args.get(i - 1).cloned()
+            None => None,
+        };
+        match kind {
+            DebugOpt::Flag | DebugOpt::Valued => {}
+            DebugOpt::Batch => batched = true,
+            DebugOpt::Info => info = true,
+            DebugOpt::Repl => return Outcome::Deny(STDIN_REPL),
+            DebugOpt::Tty => return Outcome::Deny(DEBUGGER_SCRIPT),
+            DebugOpt::Args => {
+                program = args[i..].to_vec();
+                break;
+            }
+            DebugOpt::Program => {
+                program.splice(0..0, value);
+            }
+            DebugOpt::File => {
+                if value.is_some_and(|v| v.text == "-") {
+                    return Outcome::Deny(STDIN_REPL);
                 }
-            };
-            program.splice(0..0, value);
-        } else if match_opt(t, spec.valued) == Some(OptValue::Next) {
-            i += 1;
+            }
+            DebugOpt::Command => {
+                let Some(value) = value else { break };
+                if value.opaque {
+                    return Outcome::Deny(UNRESOLVED);
+                }
+                match debugger_command(&value.text) {
+                    Ok(Some(source)) => scripts.push(source),
+                    Ok(None) => {}
+                    Err(rule) => return Outcome::Deny(rule),
+                }
+            }
         }
     }
     if !batched && !info {
@@ -2587,14 +2967,15 @@ fn debugger_command(text: &str) -> Result<Option<String>, Rule> {
     }
 }
 
-/// The command after a thread or frame list: `all`, `level`, IDs, ranges, and flags.
+/// The command after a thread or frame list: `all`, `level`, IDs, ranges, `$var` IDs, and
+/// flags.
 fn apply_body(text: &str) -> &str {
     let mut rest = text;
     loop {
         let (word, after) = first_word(rest);
         let list = abbrev(word, "all", 1)
             || word == "level"
-            || word.starts_with(|c: char| c == '-' || c.is_ascii_digit());
+            || word.starts_with(|c: char| c == '-' || c == '$' || c.is_ascii_digit());
         if !list {
             return rest;
         }
@@ -2799,6 +3180,12 @@ const MAKE_CALLS: &[&str] = &[
     "$(shell", "${shell", "$(file", "${file", "$(eval", "${eval", "$(guile", "${guile",
 ];
 
+/// A make variable value calls a `MAKE_CALLS` function. make reads its environment as variables
+/// too, so `CFLAGS='$(shell CMD)' make` runs CMD when a recipe expands `$(CFLAGS)`.
+fn make_runs_code(text: &str) -> bool {
+    MAKE_CALLS.iter().any(|call| text.contains(call))
+}
+
 /// make runs `--eval` text as makefile source. A command-line variable runs a shell with `!=`,
 /// and a `MAKE_CALLS` function in its value runs code. The hook cannot see what either one does.
 fn make_evals(args: &[Arg]) -> bool {
@@ -2823,7 +3210,7 @@ fn make_evals(args: &[Arg]) -> bool {
                 }
             }
         } else if let Some((name, _)) = t.split_once('=') {
-            if name.ends_with('!') || MAKE_CALLS.iter().any(|call| t.contains(call)) {
+            if name.ends_with('!') || make_runs_code(t) {
                 return true;
             }
         }
@@ -2831,8 +3218,9 @@ fn make_evals(args: &[Arg]) -> bool {
     false
 }
 
-/// sqlite3 dot-commands that read or write files, load an extension, or run a shell. Each entry
-/// is a name and the shortest abbreviation that the rules match.
+/// sqlite3 dot-commands that read or write files, load an extension, run a shell or a program,
+/// run SQL from a table (`.selftest`), or change safety settings (`.dbconfig`). Each entry is a
+/// name and the shortest abbreviation that sqlite3 3.54 accepts or the rules match.
 const SQLITE_DOT_IO: &[(&str, usize)] = &[
     ("shell", 2),
     ("system", 2),
@@ -2847,23 +3235,52 @@ const SQLITE_DOT_IO: &[(&str, usize)] = &[
     ("restore", 3),
     ("open", 2),
     ("excel", 3),
+    ("www", 3),
     ("clone", 3),
     ("archive", 2),
     ("iotrace", 2),
     ("trace", 2),
+    ("selftest", 4),
+    ("session", 3),
+    ("dbconfig", 3),
 ];
 
-/// sqlite3 functions that read or write files or load an extension.
-const SQLITE_FILE_FUNCTIONS: &[&str] = &[
+/// sqlite3 names that read or write files, load an extension, run a shell (`edit`), or run SQL
+/// text built at run time: `sha1_query` and `sha3_query` run their argument, and
+/// `writable_schema` and `sqlite_dbpage` can rewrite the schema.
+const SQLITE_DENIED: &[&str] = &[
     "readfile",
     "writefile",
     "fsdir",
     "zipfile",
     "load_extension",
+    "edit",
+    "sqlar_compress",
+    "sqlar_uncompress",
+    "sha1_query",
+    "sha3_query",
+    "sqlite_dbpage",
+    "writable_schema",
 ];
 
+/// sqlite3 reads `--name` as `-name` before a `--` that ends its options.
+fn sqlite_args(args: &[Arg]) -> Vec<Arg> {
+    let mut ended = false;
+    args.iter()
+        .map(|a| {
+            let mut a = a.clone();
+            ended |= a.text == "--";
+            if !ended && a.text.starts_with("--") {
+                a.text.remove(0);
+            }
+            a
+        })
+        .collect()
+}
+
 /// sqlite3 runs each operand after the database, and each `-cmd` value, as SQL or a
-/// dot-command. `-A` runs `.archive`, which reads and writes files.
+/// dot-command. `-A` runs `.archive`, which reads and writes files, and `-init FILE` runs FILE,
+/// so a parse error prints its text.
 fn sqlite_io(args: &[Arg]) -> bool {
     let (mut operands, mut ended, mut i) = (0, false, 0);
     while let Some(a) = args.get(i) {
@@ -2871,60 +3288,123 @@ fn sqlite_io(args: &[Arg]) -> bool {
         i += 1;
         if !ended && t == "--" {
             ended = true;
-        } else if ended || t == "-" || !t.starts_with('-') {
+            continue;
+        }
+        if ended || t == "-" || !t.starts_with('-') {
             operands += 1;
             if operands > 1 && sql_io(t) {
                 return true;
             }
-        } else if let Some(given) = match_opt(t, &["-cmd"]) {
-            let value = match given {
-                OptValue::Inline(v) => v,
-                OptValue::Next => {
-                    i += 1;
-                    args.get(i - 1).map_or("", |n| n.text.as_str())
-                }
-            };
-            if sql_io(value) {
-                return true;
-            }
-        } else if t.starts_with("-A") || match_opt(t, &["-archive"]).is_some() {
+            continue;
+        }
+        if t.starts_with("-A") || match_opt(t, &["-archive"]).is_some() {
             return true;
-        } else if match_opt(t, SQLITE_VALUED) == Some(OptValue::Next) {
-            i += 1;
+        }
+        let Some((name, given)) = ["-cmd", "-init"]
+            .into_iter()
+            .find_map(|n| Some((n, match_opt(t, &[n])?)))
+        else {
+            if match_opt(t, SQLITE_VALUED) == Some(OptValue::Next) {
+                i += 1;
+            }
+            continue;
+        };
+        let value = match given {
+            OptValue::Inline(v) => v,
+            OptValue::Next => {
+                i += 1;
+                args.get(i - 1).map_or("", |n| n.text.as_str())
+            }
+        };
+        let io = if name == "-init" {
+            value != "/dev/null"
+        } else {
+            sql_io(value)
+        };
+        if io {
+            return true;
         }
     }
     false
 }
 
-/// SQL or a dot-command that reads or writes a file, loads an extension, or runs a shell. The
-/// `edit(TEXT, EDITOR)` function runs EDITOR through a shell.
+/// SQL or a dot-command that `SQLITE_DOT_IO` or `SQLITE_DENIED` names. A dot-command quotes its
+/// arguments like a shell, and `.parameter set` runs a value as SQL, so in text with a
+/// dot-command any whole word counts. In SQL only identifiers count. A name in a string literal
+/// does not run, because `SQLITE_DENIED` holds every way to run SQL text built at run time.
 fn sql_io(text: &str) -> bool {
     let lower = text.to_ascii_lowercase();
-    let dot = lower.lines().any(|line| {
-        line.trim_start().strip_prefix('.').is_some_and(|command| {
-            let (word, _) = first_word(command);
-            SQLITE_DOT_IO
-                .iter()
-                .any(|&(full, min)| abbrev(word, full, min))
-        })
-    });
-    dot || SQLITE_FILE_FUNCTIONS
+    let mut dot = false;
+    for line in lower.lines() {
+        let Some(command) = line.trim_start().strip_prefix('.') else {
+            continue;
+        };
+        dot = true;
+        let (word, _) = first_word(command);
+        if SQLITE_DOT_IO
+            .iter()
+            .any(|&(full, min)| abbrev(word, full, min))
+        {
+            return true;
+        }
+    }
+    if dot {
+        return SQLITE_DENIED.iter().any(|name| sql_word(&lower, name));
+    }
+    sql_identifiers(&lower)
         .iter()
-        .any(|f| sql_identifier(&lower, f, false))
-        || sql_identifier(&lower, "edit", true)
+        .any(|word| SQLITE_DENIED.contains(word))
 }
 
-/// The text holds `name` as a whole SQL identifier. With `call`, a `(` follows it, after optional
-/// quotes and spaces.
-fn sql_identifier(text: &str, name: &str, call: bool) -> bool {
+/// The text holds `name` as a whole word.
+fn sql_word(text: &str, name: &str) -> bool {
     let ident = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '$';
-    text.match_indices(name).any(|(i, _)| {
-        let after = &text[i + name.len()..];
-        !text[..i].ends_with(ident)
-            && !after.starts_with(ident)
-            && (!call
-                || after
-                    .trim_start_matches(['"', '`', ']', ' ', '\t', '\n'])
-                    .starts_with('('))
-    })
+    text.match_indices(name)
+        .any(|(i, _)| !text[..i].ends_with(ident) && !text[i + name.len()..].starts_with(ident))
+}
+
+/// The identifiers in SQL text: bare words, and names in `"double quotes"`, `[brackets]`, or
+/// backticks. String literals and comments are skipped, as the SQLite tokenizer skips them.
+fn sql_identifiers(sql: &str) -> Vec<&str> {
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$' || c >= 0x80;
+    let b = sql.as_bytes();
+    let mut words = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        let close = match b[i] {
+            b'[' => Some(b']'),
+            q @ (b'\'' | b'"' | b'`') => Some(q),
+            _ => None,
+        };
+        if let Some(close) = close {
+            // A doubled quote is a literal quote; a bracket has no escape.
+            let mut end = i + 1;
+            while end < b.len() && b[end] != close {
+                end += 1;
+            }
+            while close != b']' && b.get(end + 1) == Some(&close) {
+                end += 2;
+                while end < b.len() && b[end] != close {
+                    end += 1;
+                }
+            }
+            if b[i] != b'\'' {
+                words.push(&sql[i + 1..end.min(b.len())]);
+            }
+            i = end + 1;
+        } else if sql[i..].starts_with("--") {
+            i = sql[i..].find('\n').map_or(b.len(), |n| i + n);
+        } else if sql[i..].starts_with("/*") {
+            i = sql[i + 2..].find("*/").map_or(b.len(), |n| i + n + 4);
+        } else if ident(b[i]) {
+            let start = i;
+            while i < b.len() && ident(b[i]) {
+                i += 1;
+            }
+            words.push(&sql[start..i]);
+        } else {
+            i += 1;
+        }
+    }
+    words
 }

@@ -1825,3 +1825,265 @@ fn review_hints_name_the_fix_for_each_new_rule() {
     let make = tilth_reason_for("make --eval=x");
     assert!(make.contains("make -f <file>"), "{make}");
 }
+
+// Review fixes for PR #466, round 2. Each test failed before its fix.
+
+#[test]
+fn round2_gdb_resolves_unique_prefixes_and_denies_unknown_options() {
+    assert_rules(&[
+        ("gdb -batch -eval 'shell cat README.md'", "cat"),
+        ("gdb -batch --init-e 'shell cat README.md'", "cat"),
+        ("gdb -batch -ev 'shell cat README.md'", "cat"),
+        ("gdb -batch -eiex 'shell cat README.md'", "cat"),
+        ("gdb -batch -early-init-eval 'shell cat README.md'", "cat"),
+        ("gdb -batch -ex=shell\\ cat\\ README.md", "cat"),
+        ("gdb -batch -ex run -ar cat README.md", "cat"),
+        ("gdb -batch -ex run --arg cat README.md", "cat"),
+        ("gdb -batch-s -ex 'shell cat README.md'", "cat"),
+        ("gdb -batch -eix -", "stdin repl"),
+        ("gdb -batch -bogus", "unresolved"),
+        ("gdb -bat -ex bt ./a.out", "unresolved"),
+        ("gdb -batch -co core ./a.out", "unresolved"),
+        ("gdb --batch=1 -ex bt ./a.out", "unresolved"),
+        ("gdb -batch -cfoo ./a.out", "unresolved"),
+        (
+            "gdb -batch -tty README.md -ex run /bin/cat",
+            "debugger script",
+        ),
+        ("lldb -b -one-line 'platform shell cat README.md'", "cat"),
+        (
+            "lldb -b -one-line-before-file 'script print(1)'",
+            "debugger script",
+        ),
+        ("lldb -b -source -", "stdin repl"),
+        ("lldb -b --repl", "stdin repl"),
+        ("lldb -b -r=swift", "stdin repl"),
+    ]);
+    assert_all_allow(&[
+        "gdb -batch -ex bt ./core",
+        "gdb --batch --ex 'info threads' -p 1",
+        "gdb -q -batch -ex run --args ./a.out",
+        "gdb -nx -batch-silent -ex bt ./a.out core",
+        "gdb -batch -ex bt --core=core ./a.out",
+        "gdb -batch -ex bt -c core ./a.out",
+        "gdb -batch -iex 'set auto-load safe-path /' -ex bt ./a.out core",
+        "gdb -v",
+        "gdb -h",
+        "lldb -batch -o 'bt all' -p 1234",
+        "lldb -b -one-line bt ./a.out",
+        "lldb --batch --one-line bt --core core ./a.out",
+        "lldb -x -b -o bt ./a.out",
+        "lldb --repl-language=swift -b -o bt ./a.out",
+    ]);
+}
+
+#[test]
+fn round2_sqlite_denies_hidden_edit_and_sql_built_at_run_time() {
+    assert_rules(&[
+        (
+            "sqlite3 :memory: \"select edit/**/('x','cat README.md')\"",
+            "sqlite3 io",
+        ),
+        (
+            "sqlite3 :memory: \"select edit --\n('x','cat README.md')\"",
+            "sqlite3 io",
+        ),
+        ("sqlite3 :memory: 'select \"edit\"(1, 2)'", "sqlite3 io"),
+        ("sqlite3 :memory: 'select [EDIT](1, 2)'", "sqlite3 io"),
+        (
+            "sqlite3 :memory: \"select sha3_query('select ed'||'it(''x'',''cat README.md'')')\"",
+            "sqlite3 io",
+        ),
+        (
+            "sqlite3 :memory: \"select sha1_query('select 1')\"",
+            "sqlite3 io",
+        ),
+        ("sqlite3 :memory: 'pragma writable_schema=on'", "sqlite3 io"),
+        (
+            "sqlite3 :memory: 'select * from sqlite_dbpage'",
+            "sqlite3 io",
+        ),
+        ("sqlite3 :memory: '.selftest'", "sqlite3 io"),
+        ("sqlite3 :memory: '.dbconfig defensive off'", "sqlite3 io"),
+        ("sqlite3 :memory: '.www'", "sqlite3 io"),
+        (
+            "sqlite3 :memory: '.session s changeset out.bin'",
+            "sqlite3 io",
+        ),
+        (
+            "sqlite3 :memory: \".param set @a \\\"edit('x','cat README.md')\\\"\"",
+            "sqlite3 io",
+        ),
+        (
+            "sqlite3 :memory: 'select 1 as \"x'\\''\", edit(1, 2) as \"'\\''\"'",
+            "sqlite3 io",
+        ),
+    ]);
+    assert_all_allow(&[
+        "sqlite3 app.db \"select count(*) from t\"",
+        "sqlite3 app.db \"select * from t where action = 'edit'\"",
+        "sqlite3 app.db \"select 'sha3_query(x)' -- edit\"",
+        "sqlite3 app.db \"select edited_at from t\"",
+        "sqlite3 app.db \"select sha3(x) from t\"",
+        "sqlite3 app.db .tables",
+    ]);
+}
+
+#[test]
+fn round2_sqlite_reads_double_dash_options_and_denies_archives_and_init() {
+    assert_rules(&[
+        ("sqlite3 x.db --Ac README.md", "sqlite3 io"),
+        ("sqlite3 x.db --A -c README.md", "sqlite3 io"),
+        (
+            "sqlite3 x.db \"select sqlar_uncompress(data, sz) from sqlar\"",
+            "sqlite3 io",
+        ),
+        ("sqlite3 x.db \"select sqlar_compress(x)\"", "sqlite3 io"),
+        ("sqlite3 -init README.md :memory: 'select 1'", "sqlite3 io"),
+        ("sqlite3 --init README.md :memory: 'select 1'", "sqlite3 io"),
+        ("sqlite3 --interactive db 'select 1'", "stdin repl"),
+    ]);
+    assert_all_allow(&[
+        "sqlite3 -init /dev/null app.db .tables",
+        "sqlite3 --json app.db \"select 1\"",
+        "sqlite3 --version",
+        "sqlite3 app.db -- 'select 1'",
+    ]);
+}
+
+#[test]
+fn round2_bun_run_uv_tool_run_and_shell_subcommands() {
+    assert_rules(&[
+        ("bun run cat README.md", "cat"),
+        ("bun --cwd . run cat README.md", "cat"),
+        ("bun run --silent cat README.md", "cat"),
+        ("echo x | bun run -", "bun"),
+        (
+            "uv tool run python -c 'print(open(\"README.md\").read())'",
+            "python",
+        ),
+        ("uv tool run cat README.md", "cat"),
+        ("uv tool run --from x cat README.md", "cat"),
+        ("printf 'cat README.md' | mise en", "shell stdin"),
+        ("mise en -s bash", "shell stdin"),
+        ("poetry shell", "shell stdin"),
+    ]);
+    assert_all_allow(&[
+        "bun run test",
+        "bun run build",
+        "bun run dev",
+        "bun run src/index.ts",
+        "bun test",
+        "bun install",
+        "uv tool run ruff check .",
+        "uv tool install ruff",
+        "uv tool list",
+        "mise shell node@20",
+        "mise use node@20",
+        "mise run test",
+    ]);
+}
+
+#[test]
+fn round2_pnpm_shell_mode_spellings_and_command_fallback() {
+    assert_rules(&[
+        ("pnpm --shell-m exec 'cat README.md'", "cat"),
+        ("pnpm --shell-mode=true exec 'cat README.md'", "cat"),
+        ("pnpm --shell-mode true exec 'cat README.md'", "cat"),
+        ("pnpm -c true exec 'cat README.md'", "cat"),
+        ("pnpm --shell exec 'cat README.md'", "cat"),
+        ("pnpm -rc exec 'cat README.md'", "cat"),
+        ("pnpm exec --shell-m 'cat README.md'", "cat"),
+        ("pnpm cat README.md", "cat"),
+        ("pnpm --filter web cat README.md", "cat"),
+        ("pnpm --some-new-option val cat README.md", "cat"),
+        ("pnpm recursive exec cat README.md", "cat"),
+    ]);
+    assert_all_allow(&[
+        "pnpm build",
+        "pnpm lint --fix",
+        "pnpm -r build",
+        "pnpm --filter web test",
+        "pnpm install",
+        "pnpm view react version",
+        "pnpm patch foo@1.0.0",
+        "pnpm env use --global 20",
+        "pnpm --shell-mode=false exec vitest run",
+        "pnpm --shell-mode exec 'npm test'",
+        "pnpm tsc --noEmit",
+        "pnpm",
+    ]);
+}
+
+#[test]
+fn round2_thread_apply_skips_convenience_variable_ids() {
+    assert_rules(&[
+        (
+            "gdb -batch -ex starti -ex 'thread apply $_thread shell cat README.md' /bin/true",
+            "cat",
+        ),
+        (
+            "gdb -batch -ex 'thread apply $_gthread 2 py print(1)' -p 1",
+            "debugger script",
+        ),
+    ]);
+    assert_all_allow(&["gdb -batch -ex 'thread apply $_thread bt' -p 1"]);
+}
+
+#[test]
+fn round2_make_checks_environment_assignments() {
+    assert_rules(&[
+        ("CFLAGS='$(shell cat README.md)' make", "make --eval"),
+        (
+            "env 'CFLAGS=$(shell cat README.md)' make test",
+            "make --eval",
+        ),
+        ("X='${file <README.md}' gmake all", "make --eval"),
+    ]);
+    assert_all_allow(&[
+        "make CFLAGS=-O2 test",
+        "CFLAGS=-O2 make test",
+        "CC=clang make",
+        "env CFLAGS=-O2 make",
+    ]);
+}
+
+#[test]
+fn round2_more_runners_unwrap() {
+    assert_rules(&[
+        ("pipenv run cat README.md", "cat"),
+        ("pipenv --python 3.12 run cat README.md", "cat"),
+        ("pdm run cat README.md", "cat"),
+        ("pdm run -p . cat README.md", "cat"),
+        ("hatch run cat README.md", "cat"),
+        ("hatch run dev:cat README.md", "cat"),
+        ("hatch run +py=3.12 cat README.md", "cat"),
+        ("hatch -e dev run 'cat README.md'", "cat"),
+        ("rye run cat README.md", "cat"),
+        ("devbox run cat README.md", "cat"),
+        ("devbox run 'cat README.md'", "cat"),
+        ("pixi exec cat README.md", "cat"),
+        ("pixi run 'cat README.md'", "cat"),
+        ("pipenv shell", "shell stdin"),
+        ("hatch shell", "shell stdin"),
+        ("pixi shell", "shell stdin"),
+        ("devbox shell", "shell stdin"),
+    ]);
+    assert_all_allow(&[
+        "pipenv run pytest",
+        "pipenv install",
+        "pdm run pytest",
+        "pdm install",
+        "hatch run test",
+        "hatch run test:cov",
+        "hatch run +py=3.12 test",
+        "hatch env create",
+        "rye run pytest",
+        "devbox run test",
+        "devbox run -- make test",
+        "pixi run test",
+        "pixi run pytest -q",
+        "pixi exec ruff check .",
+        "pixi install",
+    ]);
+}

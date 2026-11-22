@@ -78,7 +78,31 @@ An independent review of PR #466 found nine bypasses. The fixes:
 - sqlite3 SQL operands and `-cmd` values deny (rule `sqlite3 io`) when they call `readfile`, `writefile`, `fsdir`, `zipfile`, `load_extension`, or `edit(`, or when a line starts with a file or shell dot-command (`.shell`, `.system`, `.read`, `.import`, `.output`, `.once`, `.load`, `.log`, `.save`, `.backup`, `.restore`, `.open`, `.excel`, `.clone`, `.archive`, `.iotrace`, `.trace`, and their abbreviations). `-A` denies too. The `stdin repl` hint now says to pass plain SQL.
 - make `--eval`/`-E` (and `--ev` abbreviations) deny outright (rule `make --eval`), because a recipe in the text (`all: ; cat f`) also runs. A command-line variable with `!=`, or with `$(shell`, `$(file`, `$(eval`, or `$(guile` in it, denies too.
 
-Open gaps after this change: `python -i`, `node -i`, `perl -d`, `php -a`; `docker run`; `cabal repl`, `stack ghci`, `ghc --interactive`; debugger expression calls into a live inferior (`call system()`, `print func()`, lldb `expr`); gdb `list` and lldb `source list` print source lines; `MAKEFLAGS=--eval=...` in the environment; a make variable that the Makefile itself passes to a shell (`make test PYTEST='cat f #'`); `npm --script-shell` with a non-shell program; SQL text hidden in a variable (`sqlite3 db "$Q"`).
+Open gaps after this change: `python -i`, `node -i`, `perl -d`, `php -a`; `docker run`; `cabal repl`, `stack ghci`, `ghc --interactive`; debugger expression calls into a live inferior (`call system()`, `print func()`, lldb `expr`); gdb `list` prints source lines (lldb `source list` denies, because `source` is on the debugger deny list); `MAKEFLAGS=--eval=...` in the environment; a make variable that the Makefile itself passes to a shell (`make test PYTEST='cat f #'`); `npm --script-shell` with a non-shell program; SQL text hidden in a variable (`sqlite3 db "$Q"`).
+
+### Review fixes, round 2 (PR #466, 2026-11-22, user-approved guard change)
+
+A second independent review of PR #466 found eleven issues. Real gdb 17.1, sqlite3 3.54.1, bun 1.3.14, uv 0.13.9, mise, and pnpm 10.13.1 confirmed each bypass and each fix. The fixes:
+
+- gdb reads options with `getopt_long_only`. A unique prefix of a long name works (`-eval`, `--init-e`, `-ar` for `--args`), and `NAME=VALUE` works. `GDB` in `src/hook/rules.rs` lists the whole gdb 17 `long_options` table, so the rules resolve a prefix as gdb does. An unknown option, an ambiguous prefix (`-bat`), or a flag with a value denies as `unresolved`, because gdb exits on it. `-early-init-eval-command`/`-eiex` and `-early-init-command`/`-eix` count as command options. `-tty FILE` gives the program its input, so it denies as `debugger script`.
+- lldb reads exact names: a long name takes one or two dashes (`-one-line`), and a one-letter name takes one dash. lldb ignores other options. `--repl` and `-r` start a REPL that reads stdin and deny as `stdin repl`. `lldb -batch` now counts as batch mode; before, the rules read it as `-b` with the value `atch`.
+- `thread apply` skips `$var` thread IDs (`thread apply $_thread shell cat f`).
+- sqlite3 SQL denies when an identifier names `edit`, `readfile`, `writefile`, `fsdir`, `zipfile`, `load_extension`, `sqlar_compress`, `sqlar_uncompress`, `sha1_query`, `sha3_query`, `sqlite_dbpage`, or `writable_schema`. A small SQL tokenizer finds the identifiers. It skips string literals and comments, and it reads `"quoted"`, `[bracketed]`, and backtick names. Thus `edit/**/(` denies and `where action = 'edit'` stays allowed.
+  - The rule does not try to follow strings that SQL joins at run time (`'ed'||'it'`). Instead it denies every way that the CLI can run SQL text built at run time: `sha1_query`, `sha3_query`, the `.selftest` dot-command, and schema rewrites through `writable_schema`, `sqlite_dbpage`, or `.dbconfig`. A name in a string then never runs.
+  - In text with a dot-command, any whole word counts, because a dot-command quotes its arguments like a shell and `.parameter set` runs a value as SQL.
+  - The dot-commands `.www`, `.session`, `.selftest`, and `.dbconfig` deny too.
+  - The cost: a column or parameter named `edit` denies.
+- sqlite3 reads `--name` as `-name`, so the rules strip one dash before they check options. `--Ac` and `--interactive` now deny. `-init FILE` denies unless FILE is `/dev/null`, because sqlite3 runs FILE and a parse error prints its text.
+- make: a `MAKE_CALLS` function in an environment assignment denies (`CFLAGS='$(shell cat f)' make`), because make reads its environment as variables.
+- Runners:
+  - `bun run`, `uv tool run`, `pipenv run`, `pdm run`, `hatch run`, `rye run`, `devbox run`, and `pixi exec` unwrap to the command they run.
+  - `pixi run`, `devbox run`, and `hatch run` run the command words as shell source, so the rules rejoin the words and reparse them. hatch also skips `+NAME=VALUES` matrix words and strips an `ENV:` prefix from the command (`hatch run dev:cat f`).
+  - `mise en`, and `shell` for poetry, pipenv, hatch, rye, devbox, and pixi, start a shell that reads stdin and deny as `shell stdin`.
+  - A runner command of `-` reads a script from stdin and denies.
+- pnpm reads options with nopt. A prefix of `--shell-mode` (`--shell-m`, `--shell`), `--shell-mode=VALUE` other than `false`, a `true` or `false` word after the flag, and a one-letter cluster with `c` (`-rc`) all turn on shell mode. pnpm also runs a first operand that is not a pnpm command as a script, or else as a command (`pnpm cat f`), so the rules check that operand as a command. `PNPM_BUILTINS` lists the pnpm commands, and `recursive`, `m`, and `multi` are group words before `exec`.
+- The ADR no longer lists lldb `source list` as an open gap.
+
+Open gaps added by this round: `sqlite3 -append FILE` writes a database into an existing file; `ATTACH` and `VACUUM INTO` create database files; the rejoined words of `pixi run`, `devbox run`, and `hatch run` lose their quotes, so a quoted argument with a shell operator can deny.
 
 ## Deferred
 
