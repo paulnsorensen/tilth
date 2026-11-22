@@ -12,6 +12,7 @@ values the run logged or stored; a value the run did not reach is ``null``. The 
 import argparse
 import json
 import re
+import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -139,25 +140,74 @@ def _frontier(lines: list[str]) -> dict:
             "seed_dev_mean": float(finalists.group(4))}
 
 
-def _stored_arms(lines: list[str], rows: list[dict]) -> dict:
-    """The arms of a log from before the ``arms:`` line: the baseline arm per split from the stored rows only.
+def _ref(run_dir: Path, ref: str) -> str | None:
+    """The commit that ``ref`` names in the repository that holds ``run_dir``; None when it names none."""
+    done = subprocess.run(["git", "-C", str(run_dir), "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}"],
+                          capture_output=True, text=True, check=False)
+    return (done.stdout.strip() or None) if done.returncode == 0 else None
 
-    The rows do not name the candidate of a tilth row, so the seed and best arms are None. A retried or reused cell
-    is in the rows more than once; its last row is the one the run used. The test arms exist only when finish
-    compared the finalists.
+
+def _stored_finalists(run_dir: Path, lines: list[str], rows: list[dict]) -> tuple[str | None, str | None]:
+    """The seed and best commits of a log from before the ``arms:`` line, from exact evidence only.
+
+    The seed is the ``run seed:`` commit, else the commit of the seed finalist's ``refs/evolve/<run-id>/<cid>``.
+    The best is the commit of the winner finalist's ref, else the one non-seed commit with test-split rows (only
+    finalists get test rows), else the pushed ``origin/evolve/<run-id>-winner`` when it is one of the two commits
+    with test-split rows. Two sources that do not agree, or no source, give None.
+    """
+    tested = {row.get("git_sha") for row in rows
+              if row.get("mode") == "tilth_forced" and row.get("panel_split") == "test"} - {None}
+    finalists = _last(lines, _FINALISTS)
+    refs = f"refs/evolve/{run_dir.name}/"
+    seed_line = _last(lines, _SEED)
+    seed = seed_line.group(1) if seed_line else None
+    if finalists:
+        seed_ref = _ref(run_dir, refs + finalists.group(3))
+        seed = seed or seed_ref
+        if seed_ref and seed_ref != seed:
+            seed = None
+    best = _ref(run_dir, refs + finalists.group(1)) if finalists else None
+    if best is None and seed is not None and len(tested - {seed}) == 1:
+        best = next(iter(tested - {seed}))
+    pushed = _ref(run_dir, f"refs/remotes/origin/evolve/{run_dir.name}-winner")
+    if pushed in tested and len(tested) == 2:
+        other = next(iter(tested - {pushed}))
+        if (best or pushed) != pushed or (seed or other) != other:
+            return None, None
+        best, seed = pushed, other
+    if seed is not None and seed == best:
+        return None, None
+    return seed, best
+
+
+def _stored_arms(run_dir: Path, lines: list[str], rows: list[dict]) -> dict:
+    """The arms of a log from before the ``arms:`` line, from the stored rows only.
+
+    The baseline arm takes the baseline rows of each split. The seed and best arms take the ``tilth_forced`` rows
+    whose ``git_sha`` is the commit that ``_stored_finalists`` names; without that commit the arm is None. A retried
+    or reused cell is in the rows more than once; its last row is the one the run used. The test arms exist only
+    when finish compared the finalists.
     """
     from evolve.loop import EvolveError, arm_stats  # The harness loads only here, so ``redraw`` runs without it.
 
-    def baseline(split: str) -> dict | None:
+    def arm(split: str, mode: str, sha: str | None = None) -> dict | None:
+        if mode != "baseline" and sha is None:
+            return None
         cells = {(row.get("task"), row.get("repetition")): row for row in rows
-                 if row.get("mode") == "baseline" and row.get("panel_split") == split}
+                 if row.get("mode") == mode and row.get("panel_split") == split
+                 and (sha is None or row.get("git_sha") == sha)}
         try:
             return arm_stats(cells.values())
         except (EvolveError, KeyError, TypeError):
             return None
 
-    test = dict.fromkeys(ARM_NAMES) | {"baseline": baseline("test")} if _last(lines, _MEANS) else None
-    return {"dev": dict.fromkeys(ARM_NAMES) | {"baseline": baseline("dev")}, "test": test}
+    seed, best = _stored_finalists(run_dir, lines, rows)
+
+    def split_arms(split: str) -> dict:
+        return {"baseline": arm(split, "baseline"), "seed": arm(split, "tilth_forced", seed),
+                "best": arm(split, "tilth_forced", best)}
+
+    return {"dev": split_arms("dev"), "test": split_arms("test") if _last(lines, _MEANS) else None}
 
 
 def entry_from_run_dir(run_dir: Path, *, recorded_at: datetime) -> dict:
@@ -204,7 +254,7 @@ def entry_from_run_dir(run_dir: Path, *, recorded_at: datetime) -> dict:
                               if paired else None),
         "pass_rate_delta": float(passed.group(1)) if passed else None,
         "arms": (_json_after(lines, ARMS_PREFIX) if any(line.startswith(ARMS_PREFIX) for line in lines)
-                 else _stored_arms(lines, rows)),
+                 else _stored_arms(run_dir, lines, rows)),
         "spend": _spend(lines),
         "pr_url": url.group(0) if url else None,
     }

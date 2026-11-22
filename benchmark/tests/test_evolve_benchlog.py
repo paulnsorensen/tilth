@@ -438,6 +438,64 @@ def test_an_old_run_takes_its_baseline_arms_and_model_id_from_the_stored_rows(tm
     assert dev["seed"] is dev["best"] is test["seed"] is test["best"] is None
 
 
+def test_an_old_run_takes_its_seed_and_best_arms_from_rows_of_exact_commits(tmp_path: Path) -> None:
+    seed, best, other = "a" * 40, "b" * 40, "c" * 40
+    rows = [stored_row("baseline", "dev", "d1", 0, True, 0.2),
+            stored_row("tilth_forced", "dev", "d1", 0, False, 0.3, git_sha=seed),
+            stored_row("tilth_forced", "dev", "d1", 0, True, 0.3, git_sha=seed),  # a retry: the later row wins
+            stored_row("tilth_forced", "dev", "d1", 0, True, 0.1, git_sha=best),
+            stored_row("tilth_forced", "dev", "d1", 0, False, 0.9, git_sha=other),  # not a finalist
+            stored_row("tilth_forced", "test", "t1", 0, False, 0.4, git_sha=seed),
+            stored_row("tilth_forced", "test", "t1", 0, True, 0.2, git_sha=best)]
+    with_seed = old_run_dir(tmp_path, "seeded-run", rows)
+    (with_seed / "log.txt").write_text(f"run seed: {seed}\n" + OLD_LOG)
+    unseeded = old_run_dir(tmp_path, "unseeded-run", rows)
+    log = tmp_path / "evolve.jsonl"
+
+    assert benchlog.main(["import", str(with_seed), str(unseeded), "--log", str(log)]) == 0
+
+    found = {entry["run_id"]: entry["arms"] for entry in entries(log)}
+    arms = found["seeded-run"]
+    assert arms["dev"]["seed"] == {"pass_rate": 1.0, "mean_cost_usd": 0.3, "cost_per_correct_usd": 0.3, "cells": 1}
+    assert arms["dev"]["best"] == {"pass_rate": 1.0, "mean_cost_usd": 0.1, "cost_per_correct_usd": 0.1, "cells": 1}
+    assert arms["test"]["seed"]["pass_rate"] == 0.0 and arms["test"]["best"]["pass_rate"] == 1.0
+    # Without a seed line or a ref, the two commits with test rows do not say which one is the seed.
+    assert all(found["unseeded-run"][split][name] is None for split in ("dev", "test") for name in ("seed", "best"))
+
+
+def test_an_old_run_resolves_its_finalists_through_their_refs(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    git_env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t", "GIT_COMMITTER_NAME": "t",
+               "GIT_COMMITTER_EMAIL": "t@t"}
+
+    def git(*args: str) -> str:
+        return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True,
+                              env=git_env).stdout.strip()
+
+    git("init", "-q")
+    shas = []
+    for name in ("seed", "winner"):
+        git("commit", "-q", "--allow-empty", "-m", name)
+        shas.append(git("rev-parse", "HEAD"))
+    seed, best = shas
+    # OLD_LOG names fcb7eb780569 as the winner finalist and 9708a2d9ca75 as the seed finalist.
+    git("update-ref", "refs/evolve/old-run/fcb7eb780569", best)
+    git("update-ref", "refs/evolve/old-run/9708a2d9ca75", seed)
+    rows = [stored_row("tilth_forced", "dev", "d1", 0, True, 0.3, git_sha=seed),
+            stored_row("tilth_forced", "dev", "d1", 0, False, 0.1, git_sha=best)]
+    run_dir = repo / "old-run"
+    run_dir.mkdir()
+    (run_dir / "log.txt").write_text(OLD_LOG)
+    (run_dir / "rows.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    log = tmp_path / "evolve.jsonl"
+
+    assert benchlog.main(["import", str(run_dir), "--log", str(log)]) == 0
+
+    [entry] = entries(log)
+    assert entry["arms"]["dev"]["seed"]["pass_rate"] == 1.0 and entry["arms"]["dev"]["best"]["pass_rate"] == 0.0
+
+
 def test_import_skips_a_run_that_is_not_sonnet(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     haiku = old_run_dir(tmp_path, "haiku-run", [stored_row("baseline", "dev", "d1", 0, True, 0.2,
                                                            model_alias="haiku")])
