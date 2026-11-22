@@ -65,7 +65,20 @@ A review of PR #459 found two gaps. `mise exec -- cat f` and `gdb -batch -ex "sh
 - The rules only close the stdin vector. Inline code that does not read stdin (`lua -e`, `R -e`, `ghci -e`, `guile -c`) stays allowed, like `Rscript -e`.
 - Each new rule has a `must_deny` row in `benchmark/hook_corpus.json`, because `ac1_every_rule_entry_has_a_must_deny_row` requires one.
 
-Open gaps after this change: `python -i`, `node -i`, `perl -d`, `php -a`; `sqlite3` dot-commands (`.shell`, `.read`) and `readfile()`; `make --eval`; `docker run`; `cabal repl`, `stack ghci`, `ghc --interactive`; gdb `compile`/`call system()` in a live inferior.
+### Review fixes (PR #466, 2026-11-22, user-approved guard change)
+
+An independent review of PR #466 found nine bypasses. The fixes:
+
+- A short option with `=` drops the `=` from its value (`npx -c='cmd'`, `mise exec -c='cmd'`, `gdb -x=-`), because clap, nopt, and gdb do the same.
+- An unlisted `--long` runner option gives the next word two readings: the command, or the option's value. The rules check both, and a deny in either one denies. Only the first reading denies a missing command, so `npx --yes prettier` stays allowed. Before the subcommand, the word after an unlisted option can be its value, so `uv --new-opt v run cat f` finds `run`. `UV_VALUED` follows `uv run --help` and `uvx --help` (uv 0.13.9). `NPM_VALUED` lists common npm config keys, and `-C` is `--prefix`.
+- Options before the runner subcommand count: `pnpm -c exec CMD` and `npm -c CMD exec` reparse CMD.
+- `npx`, `npm exec`, and `npm x` with no command and no `-c` start a shell that reads stdin (`stdin_shell`), so they deny as `shell stdin`.
+- gdb and lldb: the rules check the program and its arguments like any other command. gdb uses the words after `--args`, or else the first operand (or `-e`/`-exec`). lldb uses `-f`, every operand, and the words after `--`. `run ARGS`, `start ARGS`, `set args`, `set inferior-tty`, `tty`, `process launch ARGS`, and the lldb `target.run-args` and `target.input-path` settings deny, because gdb passes `run` arguments through a shell. Pass arguments with `--args` or after `--` instead.
+- Debugger meta commands deny: `eval`, `alias`, `with`, `make`, `define`, `define-prefix`, `document`, `source`, `if`, `while`, `commands`, `compile`, `interpreter-exec`, lldb `command`, and any `$_shell(...)` call. This is a deny list, not an allow list: the deny list is simpler and keeps every plain inspection command (`bt`, `info`, `frame`, `print`) allowed. `thread apply`, `frame apply`, `taas`, `faas`, and `tfaas` check the command they run, so `thread apply all bt` stays allowed.
+- sqlite3 SQL operands and `-cmd` values deny (rule `sqlite3 io`) when they call `readfile`, `writefile`, `fsdir`, `zipfile`, `load_extension`, or `edit(`, or when a line starts with a file or shell dot-command (`.shell`, `.system`, `.read`, `.import`, `.output`, `.once`, `.load`, `.log`, `.save`, `.backup`, `.restore`, `.open`, `.excel`, `.clone`, `.archive`, `.iotrace`, `.trace`, and their abbreviations). `-A` denies too. The `stdin repl` hint now says to pass plain SQL.
+- make `--eval`/`-E` (and `--ev` abbreviations) deny outright (rule `make --eval`), because a recipe in the text (`all: ; cat f`) also runs. A command-line variable with `!=`, or with `$(shell`, `$(file`, `$(eval`, or `$(guile` in it, denies too.
+
+Open gaps after this change: `python -i`, `node -i`, `perl -d`, `php -a`; `docker run`; `cabal repl`, `stack ghci`, `ghc --interactive`; debugger expression calls into a live inferior (`call system()`, `print func()`, lldb `expr`); gdb `list` and lldb `source list` print source lines; `MAKEFLAGS=--eval=...` in the environment; a make variable that the Makefile itself passes to a shell (`make test PYTEST='cat f #'`); `npm --script-shell` with a non-shell program; SQL text hidden in a variable (`sqlite3 db "$Q"`).
 
 ## Deferred
 

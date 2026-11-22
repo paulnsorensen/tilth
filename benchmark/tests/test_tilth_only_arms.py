@@ -869,6 +869,9 @@ def test_run_plan_turns_a_probe_crash_into_an_invalid_cell_before_any_cell(
     "bash", "sh", "python3", "/usr/bin/zsh -lc bash", "cat src/main.rs",
     "mise exec -- cat src/lib.rs", "mise exec -- sh", "irb", "make -f -",
     'gdb -batch -ex "shell cat src/main.rs"',
+    "npx", "gdb -batch -ex run --args cat src/main.rs", "npx -c='cat src/main.rs'",
+    "uv run --fork-strategy fewest cat src/main.rs", "sqlite3 db \"select readfile('src/main.rs')\"",
+    "make --eval='$(info $(file <src/main.rs))'",
 ])
 def test_the_codex_hook_denies_bare_shells_and_file_reads(command: str) -> None:
     binary = str(config.REPO_ROOT / "target" / "debug" / "tilth")
@@ -876,6 +879,7 @@ def test_the_codex_hook_denies_bare_shells_and_file_reads(command: str) -> None:
     assert run._hook_replay(binary, command, hint="tilth", host="codex") is True
     assert run._hook_replay(binary, "/usr/bin/zsh -lc ls", hint="tilth", host="codex") is False
     assert run._hook_replay(binary, "mise exec -- cargo test", hint="tilth", host="codex") is False
+    assert run._hook_replay(binary, "npx --yes prettier --check .", hint="tilth", host="codex") is False
 
 
 # --- reporting: a missing experiment mode and an unknown legacy mode stay visible ---
