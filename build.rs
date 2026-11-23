@@ -10,30 +10,42 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=GIT_DIR");
-    let package = env!("CARGO_PKG_VERSION");
-    let version = match short_head() {
+    // Read Cargo's values at run time, not with `env!`. Checkouts that share one target
+    // directory (evolve candidates, the benchmark tests) also share this compiled script, so
+    // a compile-time value would keep the path of the checkout that compiled it.
+    let package = cargo_value("CARGO_PKG_VERSION");
+    let manifest_dir = cargo_value("CARGO_MANIFEST_DIR");
+    let version = match short_head(Path::new(&manifest_dir)) {
         Ok(sha) => format!("{package}+{sha}"),
         Err(reason) => {
-            retry_on_next_build(&reason);
-            package.to_owned()
+            retry_on_next_build(Path::new(&manifest_dir), &reason);
+            package
         }
     };
     println!("cargo:rustc-env=TILTH_VERSION={version}");
 }
 
+fn cargo_value(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("Cargo sets {name} for a build script"))
+}
+
 /// The short commit of this package's repository, or the reason git gave none.
-fn short_head() -> Result<String, String> {
+fn short_head(manifest_dir: &Path) -> Result<String, String> {
     // `git rev-parse` walks up to any enclosing repository and obeys `GIT_DIR`, so an
     // unrelated repository would give its commit. Use the commit only when the git top
     // level is this package.
     let toplevel = git(&["rev-parse", "--show-toplevel"])?;
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
     match (
         Path::new(&toplevel).canonicalize(),
-        Path::new(manifest_dir).canonicalize(),
+        manifest_dir.canonicalize(),
     ) {
         (Ok(toplevel), Ok(manifest_dir)) if toplevel == manifest_dir => {}
-        _ => return Err(format!("the git top level is {toplevel}")),
+        _ => {
+            return Err(format!(
+                "the git top level is {toplevel}, not the package directory {}",
+                manifest_dir.display()
+            ))
+        }
     }
     let sha = git(&["rev-parse", "--short", "HEAD"])?;
     watch_head();
@@ -45,8 +57,8 @@ fn short_head() -> Result<String, String> {
 /// a watched git file, Cargo would not run this script again, and each later build would
 /// lack the commit. A watched path that does not exist makes Cargo run the script on each
 /// build until git gives the commit. A package without git metadata stays quiet.
-fn retry_on_next_build(reason: &str) {
-    if !Path::new(env!("CARGO_MANIFEST_DIR")).join(".git").exists() {
+fn retry_on_next_build(manifest_dir: &Path, reason: &str) {
+    if !manifest_dir.join(".git").exists() {
         return;
     }
     println!("cargo:rerun-if-changed=.git/tilth-version-retry");
