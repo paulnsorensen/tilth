@@ -40,7 +40,8 @@ class GhRecorder:
 
     def __call__(self, argv, **_kwargs):
         self.calls.append(list(argv))
-        listed = json.dumps([{"baseRefName": self.open_base, "url": self.open_url}] if self.open_url else [])
+        # What ``gh pr list --json baseRefName,url --jq OPEN_PR_FILTER`` prints: one JSON array, or nothing.
+        listed = json.dumps([self.open_base, self.open_url]) if self.open_url else ""
         out = listed if argv[:3] == ["gh", "pr", "list"] else PR_URL
         return subprocess.CompletedProcess(argv, 0, out + "\n", "")
 

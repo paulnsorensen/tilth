@@ -20,6 +20,8 @@ LOG_PATH = Path("benchmark/log/evolve.jsonl")
 BRANCH_PREFIX = "benchmark-log/"
 # The temporary worktree lives outside the repository under a directory with this prefix.
 WORKTREE_PREFIX = "tilth-benchmark-log-"
+# Prints ``["<base>","<url>"]`` for the first open PR, and nothing when there is none.
+OPEN_PR_FILTER = ".[0] | select(.) | [.baseRefName, .url] | @json"
 
 
 class PublishError(RuntimeError):
@@ -63,12 +65,16 @@ class GitHubLogClient(GitHubPRClient):
 
     def open_pr(self, *, head: str) -> tuple[str, str] | None:
         """The base branch and the URL of the open PR from ``head``; None when there is none."""
+        # The jq filter prints one JSON array as a plain string. ``gh`` colors a bare ``--json`` result when the
+        # environment forces color, and a split on spaces breaks a branch name that holds a space that is not ASCII.
         completed = self.run(["gh", "pr", "list", *self._repo_flag(), "--head", head, "--state", "open",
-                              "--json", "baseRefName,url"],
+                              "--json", "baseRefName,url", "--jq", OPEN_PR_FILTER],
                              cwd=self.repo, capture_output=True, text=True, check=True)
-        # Parsed as JSON, not split on spaces: a branch name can hold a space that is not ASCII.
-        found = json.loads(completed.stdout or "[]")
-        return (found[0]["baseRefName"], found[0]["url"]) if found else None
+        found = completed.stdout.strip()
+        if not found:
+            return None
+        base, url = json.loads(found)
+        return base, url
 
     def create_ready(self, *, base: str, head: str, title: str, body: str) -> str:
         """Open a ready (not draft) PR and return its URL."""
