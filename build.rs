@@ -85,7 +85,11 @@ fn watch_head() {
     let Ok(path) = git(&["rev-parse", "--git-path", &branch]) else {
         return;
     };
-    if let Some(directory) = Path::new(&path).ancestors().skip(1).find(|dir| dir.is_dir()) {
+    if let Some(directory) = Path::new(&path)
+        .ancestors()
+        .skip(1)
+        .find(|dir| dir.is_dir())
+    {
         println!("cargo:rerun-if-changed={}", directory.display());
     }
 }
