@@ -70,25 +70,37 @@ fn retry_on_next_build(manifest_dir: &Path, reason: &str) {
 /// Cargo accepts both. A checkout rewrites `HEAD`. A commit rewrites the loose branch ref,
 /// but after `git pack-refs` the branch has no loose ref until the commit creates one.
 /// The HEAD reflog `logs/HEAD` changes on every commit, checkout, reset, and rebase, so it
-/// catches that case.
+/// catches that case. A repository without a reflog gets a watch on the nearest directory
+/// above the absent loose ref: the commit creates the ref in or below that directory.
 fn watch_head() {
-    let mut files = vec![
-        "HEAD".to_owned(),
-        "logs/HEAD".to_owned(),
-        "packed-refs".to_owned(),
-    ];
-    if let Ok(branch) = git(&["symbolic-ref", "-q", "HEAD"]) {
-        files.push(branch);
+    watch("HEAD");
+    watch("packed-refs");
+    let has_reflog = watch("logs/HEAD");
+    let Ok(branch) = git(&["symbolic-ref", "-q", "HEAD"]) else {
+        return;
+    };
+    if watch(&branch) || has_reflog {
+        return;
     }
-    for file in files {
-        let Ok(path) = git(&["rev-parse", "--git-path", &file]) else {
-            continue;
-        };
-        // Cargo reruns on every build for a path that does not exist, so skip absent files.
-        if Path::new(&path).exists() {
-            println!("cargo:rerun-if-changed={path}");
-        }
+    let Ok(path) = git(&["rev-parse", "--git-path", &branch]) else {
+        return;
+    };
+    if let Some(directory) = Path::new(&path).ancestors().skip(1).find(|dir| dir.is_dir()) {
+        println!("cargo:rerun-if-changed={}", directory.display());
     }
+}
+
+/// Watch one git file when it exists, and say whether it does. Cargo reruns on every build
+/// for a path that does not exist, so an absent file gets no watch.
+fn watch(file: &str) -> bool {
+    let Ok(path) = git(&["rev-parse", "--git-path", file]) else {
+        return false;
+    };
+    let exists = Path::new(&path).exists();
+    if exists {
+        println!("cargo:rerun-if-changed={path}");
+    }
+    exists
 }
 
 /// The trimmed output of one git command, or one line that says why there is none.

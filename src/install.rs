@@ -781,10 +781,11 @@ fn npm_package_name(path: &str) -> Option<String> {
     is_npm_name_part(first).then(|| first.to_string())
 }
 
-/// One part of an npm package name: lowercase, URL-safe, and not starting with `.` or `_`.
+/// One part of an npm package name: lowercase, URL-safe, and not starting with `.`, `_`, or
+/// `-`. A leading `-` would make `npx` read the name as an option.
 fn is_npm_name_part(part: &str) -> bool {
     !part.is_empty()
-        && !part.starts_with(['.', '_'])
+        && !part.starts_with(['.', '_', '-'])
         && part
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-._~".contains(c))
@@ -2592,6 +2593,8 @@ mod tests {
             "/x/node_modules/Bad Name/bin/tilth",
             "/x/node_modules/.bin/tilth",
             "/x/node_modules/@/tilth/bin/tilth",
+            "/x/node_modules/--version/bin/tilth",
+            "/x/node_modules/@scope/-x/bin/tilth",
         ] {
             assert_eq!(
                 command_and_args_for(Some(exe)),

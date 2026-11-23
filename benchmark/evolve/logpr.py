@@ -36,7 +36,7 @@ class LogClient(Protocol):
 
     def push_log(self, sha: str, branch: str, *, lease: str) -> None: ...
 
-    def open_pr(self, *, head: str) -> str | None: ...
+    def open_pr(self, *, head: str) -> tuple[str, str] | None: ...
 
     def create_ready(self, *, base: str, head: str, title: str, body: str) -> str: ...
 
@@ -60,12 +60,13 @@ class GitHubLogClient(GitHubPRClient):
         git("push", "--quiet", f"--force-with-lease=refs/heads/{branch}:{lease}", self.remote,
             f"{sha}:refs/heads/{branch}", cwd=self.repo)
 
-    def open_pr(self, *, head: str) -> str | None:
-        """The URL of the open PR from ``head``; None when there is none."""
+    def open_pr(self, *, head: str) -> tuple[str, str] | None:
+        """The base branch and the URL of the open PR from ``head``; None when there is none."""
         completed = self.run(["gh", "pr", "list", *self._repo_flag(), "--head", head, "--state", "open",
-                              "--json", "url", "--jq", ".[0].url // empty"],
+                              "--json", "baseRefName,url", "--jq", '.[0] | select(.) | "\\(.baseRefName) \\(.url)"'],
                              cwd=self.repo, capture_output=True, text=True, check=True)
-        return completed.stdout.strip() or None
+        found = completed.stdout.split()
+        return (found[0], found[1]) if len(found) == 2 else None
 
     def create_ready(self, *, base: str, head: str, title: str, body: str) -> str:
         """Open a ready (not draft) PR and return its URL."""
@@ -127,7 +128,8 @@ def publish(run_dir: Path | str, entry: dict, *, repo: Path, base: str, client: 
 
     The commit goes on branch ``benchmark-log/<run-id>``. Without ``replace``, a branch that exists on the remote
     is a fault. With ``replace``, the push overwrites that branch with ``--force-with-lease`` and an open PR from
-    it stays. A fault raises ``PublishError`` and removes the temporary worktree.
+    it stays. An open PR that targets another branch than ``base`` is a fault: the rebuilt branch would add the
+    commits of ``base`` to that PR. A fault raises ``PublishError`` and removes the temporary worktree.
     """
     run_id = entry["run_id"]
     branch = BRANCH_PREFIX + run_id
@@ -140,6 +142,10 @@ def publish(run_dir: Path | str, entry: dict, *, repo: Path, base: str, client: 
         if current is not None and not replace:
             raise PublishError(step, f"{branch} exists on the remote; to rebuild it on {base}, run "
                                      f"{publish_command(run_dir, base, replace=True)}")
+        existing = client.open_pr(head=branch) if replace else None
+        if existing is not None and existing[0] != base:
+            raise PublishError(step, f"the open PR {existing[1]} targets {existing[0]}, not {base}; to rebuild it "
+                                     f"there, run {publish_command(run_dir, existing[0], replace=True)}")
         step = "worktree"
         scratch = Path(tempfile.mkdtemp(prefix=WORKTREE_PREFIX))
         tree = scratch / "tree"
@@ -154,9 +160,10 @@ def publish(run_dir: Path | str, entry: dict, *, repo: Path, base: str, client: 
         step = "push"
         client.push_log(commit, branch, lease=current or "")
         step = "pr"
-        found = client.open_pr(head=branch) if replace else None
-        return found or client.create_ready(base=base, head=branch, title=f"chore(benchmark): log evolve run {run_id}",
-                                            body=_body(entry, run_dir, base))
+        if existing is not None:
+            return existing[1]
+        return client.create_ready(base=base, head=branch, title=f"chore(benchmark): log evolve run {run_id}",
+                                   body=_body(entry, run_dir, base))
     except PublishError:
         raise
     except Exception as error:  # noqa: BLE001 - every fault names its step

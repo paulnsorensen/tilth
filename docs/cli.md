@@ -32,7 +32,7 @@ tilth src/install.rs
 | More than about 6,000 tokens | Outline with line ranges |
 
 The limit counts tokens, not lines. When an outline is not much smaller than the file, tilth prints the whole file.
-When stdout is not a terminal, a file read always prints the whole file.
+When stdout is not a terminal, a file read prints the whole file, with these exceptions: a binary, generated, or minified file still gets its header only, and a file above the full-read size limit gets an outline with a warning.
 
 ### Sections
 

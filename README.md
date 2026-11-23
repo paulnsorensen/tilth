@@ -167,7 +167,7 @@ Read the script before you install it. Run its self-test first:
 python3 scripts/tilth-bash-guard --self-test
 ```
 
-To install it, add it to `.claude/settings.json` in a tilth-enabled project:
+To install it, copy `scripts/tilth-bash-guard` into the `scripts/` directory of your project. Then add it to `.claude/settings.json` in that project:
 
 ```json
 {

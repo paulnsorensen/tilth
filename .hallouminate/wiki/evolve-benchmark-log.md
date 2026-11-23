@@ -1,6 +1,6 @@
 # Evolve benchmark log
 
-The evolve benchmark log is `benchmark/log/evolve.jsonl`: one JSON entry per evolve run past preflight, with a light and a dark SVG chart next to it (`evolve.svg`, `evolve-dark.svg`). The top `README.md` embeds both charts. The owner made three decisions about it in November 2026 (PR #471). The full contract is in `benchmark/evolve/README.md` § Benchmark log.
+The evolve benchmark log is `benchmark/log/evolve.jsonl`: one JSON entry per evolve run past preflight and the baseline purchase, with a light and a dark SVG chart next to it (`evolve.svg`, `evolve-dark.svg`). The top `README.md` embeds both charts. The owner made three decisions about it in November 2026 (PR #471). The full contract is in `benchmark/evolve/README.md` § Benchmark log.
 
 ## Decision 1: evolve runs Sonnet only
 

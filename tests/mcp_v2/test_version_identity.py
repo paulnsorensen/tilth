@@ -5,6 +5,7 @@ stale binary is visible. An upstream sync must not bring back upstream's number,
 `v*` tag must not publish a release.
 """
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -21,13 +22,23 @@ def setUpModule():
     harness.build_if_needed()
 
 
+def git_line(*args):
+    proc = subprocess.run(["git", *args], cwd=harness.REPO_ROOT, capture_output=True, text=True)
+    return proc.stdout.strip() if proc.returncode == 0 else None
+
+
 def head_sha():
+    """HEAD of this checkout, or None when `build.rs` gives no suffix.
+
+    `build.rs` gives no suffix without git, and when the git top level is not the package:
+    a source archive inside another repository must not take that repository's commit.
+    """
     if shutil.which("git") is None:
         return None
-    proc = subprocess.run(
-        ["git", "rev-parse", "HEAD"], cwd=harness.REPO_ROOT, capture_output=True, text=True
-    )
-    return proc.stdout.strip() if proc.returncode == 0 else None
+    top_level = git_line("rev-parse", "--show-toplevel")
+    if top_level is None or os.path.realpath(top_level) != os.path.realpath(harness.REPO_ROOT):
+        return None
+    return git_line("rev-parse", "HEAD")
 
 
 def cli_version():

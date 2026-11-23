@@ -28,15 +28,20 @@ BASE_ENTRY = {"schema": 2, "run_id": "earlier", "recorded_at": "2026-11-01T10:00
 
 
 class GhRecorder:
-    """Stands in for ``subprocess.run`` of ``gh``: it records each call and prints a PR URL."""
+    """Stands in for ``subprocess.run`` of ``gh``: it records each call and prints a PR URL.
 
-    def __init__(self, open_url: str = "") -> None:
+    ``gh pr list`` prints the open PR as ``<base> <url>``, or nothing without ``open_url``.
+    """
+
+    def __init__(self, open_url: str = "", open_base: str = "main") -> None:
         self.calls: list[list[str]] = []
         self.open_url = open_url
+        self.open_base = open_base
 
     def __call__(self, argv, **_kwargs):
         self.calls.append(list(argv))
-        out = self.open_url if argv[:3] == ["gh", "pr", "list"] else PR_URL
+        listed = f"{self.open_base} {self.open_url}" if self.open_url else ""
+        out = listed if argv[:3] == ["gh", "pr", "list"] else PR_URL
         return subprocess.CompletedProcess(argv, 0, out + "\n", "")
 
     def creates(self) -> list[list[str]]:
@@ -313,3 +318,37 @@ def test_a_publish_command_survives_a_shell_for_any_branch_and_path() -> None:
                                     "--base-branch", "release(testing)", "--replace"]
     done = subprocess.run(["bash", "-n", "-c", command], capture_output=True, text=True)
     assert done.returncode == 0, done.stderr
+
+
+def test_replace_refuses_an_open_pr_that_targets_another_base(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                              capsys: pytest.CaptureFixture[str]) -> None:
+    """A rebuild on ``main`` of a branch whose open PR targets ``release`` would add ``main``'s commits to it."""
+    world = winning_world(monkeypatch, tmp_path)
+    origin, _base = with_origin(world)
+    assert main(world, log_client=client_for(world, GhRecorder())) == 0
+    old_tip = git("rev-parse", "refs/heads/benchmark-log/run1", cwd=origin).strip()
+    run_dir = run.RESULTS_DIR / "evolve" / "run1"
+    capsys.readouterr()
+    gh = GhRecorder(open_url=PR_URL, open_base="release")
+
+    assert benchlog.main(["publish", str(run_dir), "--replace"], client=client_for(world, gh), repo=world.repo) == 1
+
+    err = capsys.readouterr().err
+    assert f"the open PR {PR_URL} targets release, not main" in err
+    assert logpr.publish_command(run_dir, "release", replace=True) in err
+    assert git("rev-parse", "refs/heads/benchmark-log/run1", cwd=origin).strip() == old_tip
+    assert gh.creates() == [] and temp_worktrees(world) == []
+
+
+def test_git_calls_ignore_an_inherited_repository_location(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """``GIT_DIR`` from the environment must not send a commit of the temporary worktree to another repository."""
+    from evolve import gitops
+
+    here, other = tmp_path / "here", tmp_path / "other"
+    for repo in (here, other):
+        repo.mkdir()
+        git("init", "-q", "-b", "main", str(repo), cwd=tmp_path)
+    monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(other))
+
+    assert Path(gitops.git("rev-parse", "--show-toplevel", cwd=here).strip()).resolve() == here.resolve()

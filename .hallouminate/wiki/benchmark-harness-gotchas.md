@@ -62,7 +62,10 @@ Fix (2026-11-22, [fork version identity](adr/fork-version-identity.md)): the
 fork version is now `0.0.0-experimental`, and `tilth --version` adds the short
 git commit (`tilth 0.0.0-experimental+<sha>`). Compare that suffix with
 `git rev-parse --short HEAD`. A build without git metadata prints no suffix,
-so its age stays unknown.
+so its age stays unknown. The suffix has no dirty flag: when the checkout has
+uncommitted changes (an edited prompt, for example), the binary and `HEAD` can
+show the same commit while the binary serves the old text. Rebuild, or check
+byte sizes, in that case.
 
 ## Related
 

@@ -80,7 +80,9 @@ Codex does not run a new hook until you trust it. After the install, run `/hooks
 ### Remove the guard
 
 `tilth install` has no uninstall step.
-To remove the guard, delete the entry whose command ends in `hook --host <family>` from the hook file. Then restart the host.
+To remove the guard, delete the tilth entry from the hook file. Then restart the host.
+In the shell form, the entry's `command` ends in `hook --host <family>`.
+In the exec form (`claude-code`), `command` is the binary path, and `args` holds `hook --host <family>`.
 
 ### `tilth hook` flags
 

@@ -318,7 +318,8 @@ denies raises `HookLoosenedError`. A candidate therefore cannot loosen the hook 
 
 ## Benchmark log
 
-Every run that passes preflight builds one entry for the benchmark log at its end. This includes a run that finds
+Every run that passes preflight and buys its baselines builds one entry for the benchmark log at its end. A run
+that preflight or the baseline purchase refuses has no result and writes no entry. The log includes a run that finds
 no improvement, ends incomplete, or fails in finish. `Evolution.benchmark_entry` builds the entry from the run's
 own state: its settings, panel, seed and frontier cascades, spend totals, arms, and the result record that finish
 fills. The run writes the entry to `<run_dir>/benchmark-entry.json`. A value the run did not reach is `null`.
