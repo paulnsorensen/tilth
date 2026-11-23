@@ -5,6 +5,7 @@ for ``gh``. No test reaches the network, pushes to GitHub, or opens a real PR.
 """
 
 import json
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -302,3 +303,13 @@ def test_every_publish_command_names_the_base_branch() -> None:
     assert logpr.publish_command("runs/x", "release-testing") == command
     assert logpr.publish_command("runs/x", "release-testing", replace=True) == command + " --replace"
     assert command + " --replace" in logpr._body({"run_id": "x"}, "runs/x", "release-testing")
+
+
+def test_a_publish_command_survives_a_shell_for_any_branch_and_path() -> None:
+    """`release(testing)` is a valid branch name; unquoted, a shell rejects the command that names it."""
+    command = logpr.publish_command(Path("runs/my run"), "release(testing)", replace=True)
+
+    assert shlex.split(command) == ["python3", "benchmark/evolve/benchlog.py", "publish", "runs/my run",
+                                    "--base-branch", "release(testing)", "--replace"]
+    done = subprocess.run(["bash", "-n", "-c", command], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr

@@ -4,6 +4,7 @@ The run checkout does not change. The commit goes on a temporary detached worktr
 worktree goes away after the push, also after a fault. Nothing here merges.
 """
 
+import shlex
 import shutil
 import tempfile
 from pathlib import Path
@@ -98,13 +99,14 @@ def _remove_worktree(repo: Path, scratch: Path) -> None:
 
 
 def publish_command(run_dir: Path | str, base: str, *, replace: bool = False) -> str:
-    """The command that publishes ``run_dir``'s entry against ``base``; every message that names one uses it.
+    """The shell command that publishes ``run_dir``'s entry against ``base``; every message that names one uses it.
 
     The base is always explicit: the command's default is ``main``, and a rebuild on another base than the PR's
-    target would add that base's commits to the PR.
+    target would add that base's commits to the PR. Each argument is shell-quoted, so a branch such as
+    ``release(testing)`` or a path with a space gives a command that a shell accepts.
     """
-    flags = f"--base-branch {base}" + (" --replace" if replace else "")
-    return f"python3 benchmark/evolve/benchlog.py publish {run_dir} {flags}"
+    words = ["python3", "benchmark/evolve/benchlog.py", "publish", str(run_dir), "--base-branch", base]
+    return shlex.join(words + (["--replace"] if replace else []))
 
 
 def _body(entry: dict, run_dir: Path | str, base: str) -> str:
