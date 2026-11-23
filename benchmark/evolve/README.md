@@ -354,9 +354,10 @@ one lands first. Run `publish RUN_DIR --replace` for the PR that conflicts. It r
 overwrites the run's own branch with `--force-with-lease`, and keeps the open PR.
 
 `--benchmark-log PATH` keeps the local mode: the run appends the entry to PATH, redraws the charts next to it, and
-opens no PR. A log or chart fault there writes the same `benchmark log: <step> failed (...)` line. The test suite
-gives every run an offline log client, and a session fixture checks that no test changes the committed
-`benchmark/log/`.
+opens no PR. A PATH that ends in `.svg` is a usage error, because the light chart takes that path. A log whose last
+line has no newline gets one before the new entry. A log or chart fault there writes the same
+`benchmark log: <step> failed (...)` line. The test suite gives every run an offline log client, and a session
+fixture checks that no test changes the committed `benchmark/log/`.
 
 A resumed run builds a new entry and publishes a second entry for its run id. The log keeps both lines. The chart
 shows the last entry of each run id (`benchlog.latest`).

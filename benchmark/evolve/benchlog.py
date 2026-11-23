@@ -36,8 +36,13 @@ def sonnet_models() -> list[str]:
 
 
 def chart_paths(log: Path) -> tuple[Path, Path]:
-    """The light and dark chart paths next to ``log``: ``<stem>.svg`` and ``<stem>-dark.svg``."""
+    """The light and dark chart paths next to ``log``: ``<stem>.svg`` and ``<stem>-dark.svg``.
+
+    A log that ends in ``.svg`` raises ``ValueError``: a chart would take its path and replace its lines.
+    """
     log = Path(log)
+    if log.suffix.lower() == ".svg":
+        raise ValueError(f"the benchmark log {log} must not end in .svg: a chart takes that path")
     return log.with_suffix(".svg"), log.with_name(f"{log.stem}-dark.svg")
 
 
@@ -70,11 +75,20 @@ def load(log: Path) -> list[dict]:
 
 
 def append(log: Path, entry: dict) -> None:
-    """Append ``entry`` to ``log`` as one line; earlier lines stay as they are."""
+    """Append ``entry`` to ``log`` as one line; earlier lines stay as they are.
+
+    A log whose last line has no newline gets one first, so the new entry does not join that line.
+    """
     log = Path(log)
+    chart_paths(log)  # refuse a log path that a chart would replace, before any write
     log.parent.mkdir(parents=True, exist_ok=True)
+    separator = ""
+    if log.is_file() and log.stat().st_size:
+        with log.open("rb") as handle:
+            handle.seek(-1, 2)
+            separator = "" if handle.read(1) == b"\n" else "\n"
     with log.open("a") as handle:
-        handle.write(json.dumps(entry, sort_keys=True) + "\n")
+        handle.write(separator + json.dumps(entry, sort_keys=True) + "\n")
 
 
 def latest(entries: list[dict]) -> list[dict]:
@@ -92,10 +106,10 @@ def redraw(log: Path) -> tuple[Path, Path]:
     from evolve import chart
 
     log = Path(log)
+    light, dark = chart_paths(log)  # before any write: a log path that a chart would replace is refused
     log.parent.mkdir(parents=True, exist_ok=True)
     log.touch()
     entries = latest(load(log))
-    light, dark = chart_paths(log)
     light.write_text(chart.render(entries, "light"))
     dark.write_text(chart.render(entries, "dark"))
     return light, dark
@@ -116,7 +130,12 @@ def main(argv: list[str] | None = None, *, client=None, repo: Path | None = None
     args = parser.parse_args(argv)
     if args.command == "publish":
         return _publish(args, client, repo or REPO_ROOT)
-    for path in redraw(args.log):
+    try:
+        charts = redraw(args.log)
+    except ValueError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    for path in charts:
         print(f"wrote {path}")
     return 0
 

@@ -97,6 +97,16 @@ def _remove_worktree(repo: Path, scratch: Path) -> None:
         pass
 
 
+def publish_command(run_dir: Path | str, base: str, *, replace: bool = False) -> str:
+    """The command that publishes ``run_dir``'s entry against ``base``; every message that names one uses it.
+
+    The base is always explicit: the command's default is ``main``, and a rebuild on another base than the PR's
+    target would add that base's commits to the PR.
+    """
+    flags = f"--base-branch {base}" + (" --replace" if replace else "")
+    return f"python3 benchmark/evolve/benchlog.py publish {run_dir} {flags}"
+
+
 def _body(entry: dict, run_dir: Path | str, base: str) -> str:
     return "\n".join([
         f"Adds the benchmark log entry of evolve run `{entry['run_id']}` to `{LOG_PATH}` and redraws both charts.",
@@ -105,7 +115,7 @@ def _body(entry: dict, run_dir: Path | str, base: str) -> str:
         "",
         f"When another log PR lands on `{base}` first, this PR conflicts. Rebuild it on the new base:",
         "",
-        f"    python3 benchmark/evolve/benchlog.py publish {run_dir} --replace",
+        f"    {publish_command(run_dir, base, replace=True)}",
     ])
 
 
@@ -127,7 +137,7 @@ def publish(run_dir: Path | str, entry: dict, *, repo: Path, base: str, client: 
         current = client.remote_branch(branch)
         if current is not None and not replace:
             raise PublishError(step, f"{branch} exists on the remote; to rebuild it on {base}, run "
-                                     f"python3 benchmark/evolve/benchlog.py publish {run_dir} --replace")
+                                     f"{publish_command(run_dir, base, replace=True)}")
         step = "worktree"
         scratch = Path(tempfile.mkdtemp(prefix=WORKTREE_PREFIX))
         tree = scratch / "tree"

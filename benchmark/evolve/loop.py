@@ -1430,7 +1430,7 @@ class Evolution:
             benchlog.write_entry(self.run_dir, entry)
             if entry["outcome"] is None:
                 self.log("benchmark log: not published (the run has no finish result); to publish it, run "
-                         f"python3 benchmark/evolve/benchlog.py publish {self.run_dir}")
+                         + logpr.publish_command(self.run_dir, self.settings.base_branch))
                 return
             path = self.settings.benchmark_log
             if path is not None:

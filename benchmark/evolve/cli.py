@@ -260,6 +260,11 @@ def build(argv: list[str] | None = None, *,
     if args.finish_reserve_usd is not None and (not math.isfinite(args.finish_reserve_usd)
                                                 or args.finish_reserve_usd < 0):
         return _error("--finish-reserve-usd must be a finite number of at least 0")
+    if args.benchmark_log is not None:
+        try:
+            benchlog.chart_paths(args.benchmark_log)
+        except ValueError as error:
+            return _error(f"--benchmark-log: {error}")
     if args.max_unselected < len(seed) - 1:
         return _error(f"--max-unselected must be at least {len(seed) - 1}, one less than the {len(seed)} "
                       "components, or a component can wait past its bound")

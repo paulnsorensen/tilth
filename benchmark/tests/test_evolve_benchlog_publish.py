@@ -234,7 +234,8 @@ def test_an_interrupted_run_keeps_its_entry_and_opens_no_pr(monkeypatch: pytest.
     assert git("ls-remote", "--heads", str(origin), "benchmark-log/*", cwd=world.repo) == ""
     assert temp_worktrees(world) == []
     [line] = [line for line in log_text(world).splitlines() if line.startswith("benchmark log: ")]
-    assert line.startswith("benchmark log: not published (") and "benchlog.py publish" in line
+    assert line.startswith("benchmark log: not published (")
+    assert line.endswith(logpr.publish_command(run.RESULTS_DIR / "evolve" / "run1", "main"))
 
 
 def test_an_interrupted_run_appends_nothing_to_a_local_log(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -266,3 +267,38 @@ def test_arm_numbers_count_completed_cells_only() -> None:
     assert arm_stats([passed, failed, timed_out]) == {"pass_rate": 0.5, "mean_cost_usd": 2.0,
                                                      "cost_per_correct_usd": 4.0, "cells": 2}
     assert arm_stats([timed_out]) is None
+
+
+def test_append_separates_the_entry_from_an_unterminated_last_line(tmp_path: Path) -> None:
+    log = tmp_path / "evolve.jsonl"
+    log.write_text(json.dumps(BASE_ENTRY, sort_keys=True))  # a valid log with no final newline
+
+    benchlog.append(log, {**BASE_ENTRY, "run_id": "next"})
+
+    assert [entry["run_id"] for entry in benchlog.load(log)] == ["earlier", "next"]
+    assert log.read_text().endswith("}\n")
+
+
+def test_a_log_path_that_a_chart_would_replace_is_refused(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+                                                          capsys: pytest.CaptureFixture[str]) -> None:
+    """The light chart of ``results.svg`` is ``results.svg``: a redraw would replace the log's lines."""
+    log = tmp_path / "results.svg"
+
+    with pytest.raises(ValueError, match="must not end in .svg"):
+        benchlog.append(log, BASE_ENTRY)
+    assert benchlog.main(["redraw", "--log", str(log)]) == 2
+    assert not log.exists()
+
+    world = winning_world(monkeypatch, tmp_path)
+    assert main(world, "--benchmark-log", str(log)) == 2
+    assert "--benchmark-log" in capsys.readouterr().err
+    assert not log.exists()
+
+
+def test_every_publish_command_names_the_base_branch() -> None:
+    """A rebuild on ``main`` of a log PR that targets another branch would add ``main``'s commits to that PR."""
+    command = "python3 benchmark/evolve/benchlog.py publish runs/x --base-branch release-testing"
+
+    assert logpr.publish_command("runs/x", "release-testing") == command
+    assert logpr.publish_command("runs/x", "release-testing", replace=True) == command + " --replace"
+    assert command + " --replace" in logpr._body({"run_id": "x"}, "runs/x", "release-testing")
