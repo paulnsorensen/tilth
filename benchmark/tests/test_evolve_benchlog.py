@@ -405,7 +405,9 @@ def test_the_evolve_agent_model_is_sonnet_only(monkeypatch: pytest.MonkeyPatch, 
     assert exit_.value.code == 2
     assert world.runner_calls() == []
     err = capsys.readouterr().err
-    assert "invalid choice: 'haiku'" in err and all(f"'{name}'" in err for name in sonnet)
+    # argparse quotes the choices from Python 3.13 on and does not before, so match the names alone.
+    choices = err.rsplit("choose from", 1)[-1]
+    assert "invalid choice: 'haiku'" in err and all(name in choices for name in sonnet)
 
 
 def expected_arm(world, tasks: tuple[str, ...], mode: str, keep) -> dict:
