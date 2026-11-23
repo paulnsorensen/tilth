@@ -63,7 +63,7 @@ Other hosts refuse `--hook`.
 
 ### Command form
 
-- `claude-code` gets an exec form: the binary path goes in `command` and `hook --host <family>` goes in `args`. No shell reads the path.
+- `claude-code` gets an exec form when the entry runs the binary by its absolute path: the path goes in `command` and `hook --host <family>` goes in `args`. No shell reads the path. An install from npm runs `npx <package>`, so it gets the shell form.
 - Every other host gets a shell string. A path with characters other than letters, digits, and `_./:-` is put in single quotes.
 - On Windows, `windsurf` runs the string through PowerShell.
 - In shell form, the install refuses a binary path that contains `'`, `"`, `$`, a backtick, `%`, or a newline.
@@ -81,8 +81,8 @@ Codex does not run a new hook until you trust it. After the install, run `/hooks
 
 `tilth install` has no uninstall step.
 To remove the guard, delete the tilth entry from the hook file. Then restart the host.
-In the shell form, the entry's `command` ends in `hook --host <family>`.
-In the exec form (`claude-code`), `command` is the binary path, and `args` holds `hook --host <family>`.
+In the shell form, the entry's `command` contains `hook --host <family>`; a `--hint` value can follow it.
+In the exec form (`claude-code` with an absolute binary path), `command` is the binary path, and `args` holds `hook --host <family>`.
 
 ### `tilth hook` flags
 

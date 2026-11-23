@@ -40,7 +40,7 @@ class GhRecorder:
 
     def __call__(self, argv, **_kwargs):
         self.calls.append(list(argv))
-        listed = f"{self.open_base} {self.open_url}" if self.open_url else ""
+        listed = json.dumps([{"baseRefName": self.open_base, "url": self.open_url}] if self.open_url else [])
         out = listed if argv[:3] == ["gh", "pr", "list"] else PR_URL
         return subprocess.CompletedProcess(argv, 0, out + "\n", "")
 
@@ -320,22 +320,27 @@ def test_a_publish_command_survives_a_shell_for_any_branch_and_path() -> None:
     assert done.returncode == 0, done.stderr
 
 
+@pytest.mark.parametrize("pr_base", ["release", "release candidate"])
 def test_replace_refuses_an_open_pr_that_targets_another_base(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-                                                              capsys: pytest.CaptureFixture[str]) -> None:
-    """A rebuild on ``main`` of a branch whose open PR targets ``release`` would add ``main``'s commits to it."""
+                                                              capsys: pytest.CaptureFixture[str],
+                                                              pr_base: str) -> None:
+    """A rebuild on ``main`` of a branch whose open PR targets another base would add ``main``'s commits to it.
+
+    A branch name can hold a no-break space; the lookup must still find that PR.
+    """
     world = winning_world(monkeypatch, tmp_path)
     origin, _base = with_origin(world)
     assert main(world, log_client=client_for(world, GhRecorder())) == 0
     old_tip = git("rev-parse", "refs/heads/benchmark-log/run1", cwd=origin).strip()
     run_dir = run.RESULTS_DIR / "evolve" / "run1"
     capsys.readouterr()
-    gh = GhRecorder(open_url=PR_URL, open_base="release")
+    gh = GhRecorder(open_url=PR_URL, open_base=pr_base)
 
     assert benchlog.main(["publish", str(run_dir), "--replace"], client=client_for(world, gh), repo=world.repo) == 1
 
     err = capsys.readouterr().err
-    assert f"the open PR {PR_URL} targets release, not main" in err
-    assert logpr.publish_command(run_dir, "release", replace=True) in err
+    assert f"the open PR {PR_URL} targets {pr_base}, not main" in err
+    assert logpr.publish_command(run_dir, pr_base, replace=True) in err
     assert git("rev-parse", "refs/heads/benchmark-log/run1", cwd=origin).strip() == old_tip
     assert gh.creates() == [] and temp_worktrees(world) == []
 

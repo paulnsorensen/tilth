@@ -4,6 +4,7 @@ The run checkout does not change. The commit goes on a temporary detached worktr
 worktree goes away after the push, also after a fault. Nothing here merges.
 """
 
+import json
 import shlex
 import shutil
 import tempfile
@@ -63,10 +64,11 @@ class GitHubLogClient(GitHubPRClient):
     def open_pr(self, *, head: str) -> tuple[str, str] | None:
         """The base branch and the URL of the open PR from ``head``; None when there is none."""
         completed = self.run(["gh", "pr", "list", *self._repo_flag(), "--head", head, "--state", "open",
-                              "--json", "baseRefName,url", "--jq", '.[0] | select(.) | "\\(.baseRefName) \\(.url)"'],
+                              "--json", "baseRefName,url"],
                              cwd=self.repo, capture_output=True, text=True, check=True)
-        found = completed.stdout.split()
-        return (found[0], found[1]) if len(found) == 2 else None
+        # Parsed as JSON, not split on spaces: a branch name can hold a space that is not ASCII.
+        found = json.loads(completed.stdout or "[]")
+        return (found[0]["baseRefName"], found[0]["url"]) if found else None
 
     def create_ready(self, *, base: str, head: str, title: str, body: str) -> str:
         """Open a ready (not draft) PR and return its URL."""
