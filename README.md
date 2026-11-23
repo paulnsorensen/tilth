@@ -1,301 +1,173 @@
-# tilth
+# tilth (experimental fork)
 
-[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/jahala/tilth/badge)](https://scorecard.dev/viewer/?uri=github.com/jahala/tilth)
+tilth is a Rust CLI and MCP server that gives coding agents tree-sitter outlines, symbol search, callers, and tag-checked file edits.
 
-**Smart code reading for humans and AI agents.** Reduces cost per correct answer by **44%** on Sonnet, **39%** on Opus, and **38%** on Haiku across 160 benchmark runs. ([benchmarks](#benchmarks))
+> [!WARNING]
+> **This repository is an experimental fork of [jahala/tilth](https://github.com/jahala/tilth).**
+> The fork lives at [paulnsorensen/tilth](https://github.com/paulnsorensen/tilth).
+>
+> - Interfaces, prompts, and output formats change without notice.
+> - The fork makes no stability or compatibility promise.
+> - An automated evolve loop writes much of the prompt text and some source changes.
+> - If you need a stable tool, use [upstream tilth](https://github.com/jahala/tilth).
 
-tilth is what happens when you give `ripgrep`, `tree-sitter`, and `cat` a shared brain.
+## Contents
 
-```bash
-$ tilth src/auth.ts
-# src/auth.ts (258 lines, ~3.4k tokens) [outline]
+- [How this fork differs from upstream](#how-this-fork-differs-from-upstream)
+- [Install](#install)
+- [MCP server](#mcp-server)
+- [Launcher and preamble](#launcher-and-preamble)
+- [Shell guard hook](#shell-guard-hook)
+- [CLI](#cli)
+- [Benchmarks](#benchmarks)
+- [Benchmark log](#benchmark-log)
+- [Relationship to upstream](#relationship-to-upstream)
+- [Credits and license](#credits-and-license)
 
-[1-12]   imports: express(2), jsonwebtoken, @/config
-[14-22]  interface AuthConfig
-[24-42]  fn validateToken(token: string): Claims | null
-[44-89]  export fn handleAuth(req, res, next)
-[91-258] export class AuthManager
-  [99-130]  fn authenticate(credentials)
-  [132-180] fn authorize(user, resource)
-```
+## How this fork differs from upstream
 
-Small files come back whole. Large files get an outline. Drill in with `--section`. A line range that ends inside a function grows to the function's end. If that does not fit `--budget`, the range stops before the function and names the next `tilth` call:
+These differences are permanent. A sync from upstream keeps the fork side.
 
-```bash
-tilth src/auth.ts --section 44-89
-tilth docs/guide.md --section "## Installation"
-```
-
-## Search finds definitions first
-
-```
-$ tilth handleAuth --scope src/
-# Search: "handleAuth" in src/ — 6 matches (2 definitions, 4 usages)
-
-## src/auth.ts:44-89 [definition]
-  [24-42]  fn validateToken(token: string)
-→ [44-89]  export fn handleAuth(req, res, next)
-  [91-120] fn refreshSession(req, res)
-
-  44 │ export function handleAuth(req, res, next) {
-  45 │   const token = req.headers.authorization?.split(' ')[1];
-  ...
-  88 │   next();
-  89 │ }
-
-── calls ──
-  validateToken  src/auth.ts:24-42  fn validateToken(token: string): Claims | null
-  refreshSession  src/auth.ts:91-120  fn refreshSession(req, res)
-
-## src/routes/api.ts:34 [usage]
-→ [34]   router.use('/api/protected/*', handleAuth);
-```
-
-Tree-sitter finds where symbols are **defined** — not just where strings appear. Each match shows its surrounding file structure so you know what you're looking at without a second read.
-
-Expanded definitions include a **callee footer** (`── calls ──`) showing resolved callees with file, line range, and signature — the agent can follow call chains without separate searches for each callee.
-
-### Expanded search
-
-CLI search returns compact results by default. Use `--expand` to inline source for the top matches:
-
-```bash
-tilth handleAuth --scope src/ --expand       # top 2 (default when flag is bare)
-tilth handleAuth --scope src/ --expand=5     # top 5
-```
-
-In MCP mode, `tilth_search` routes each `query` automatically. Do not pass `expand`, `kind`, or `context`.
-
-### Multi-symbol search
-
-Trace across files in one call:
-
-```bash
-tilth "ServeHTTP, HandlersChain, Next" --scope .
-```
-
-Each symbol gets its own result block with definitions and expansions. The expand budget is shared — at least one expansion per symbol, deduped across files.
-
-### Callers query
-
-Find all call sites of a symbol using structural tree-sitter matching (not text search):
-
-```bash
-$ tilth isTrustedProxy --callers --scope .
-# Callers of "isTrustedProxy" — 5 call sites
-
-## context.go:1011 [caller: ClientIP]
-→ trusted = c.engine.isTrustedProxy(remoteIP)
-```
-
-In MCP mode, pass an unchanged `fetch_callers` hint from a search response as a `follow` entry.
-
-### Structural patterns in MCP
-
-Use an explicit pattern entry to match syntax, rather than literal text or regular expressions:
-
-```json
-{
-  "cwd": "/absolute/project",
-  "queries": [
-    {"pattern": "Some($A)", "language": "rust", "glob": "src/*.rs"},
-    {"pattern": "wrap($A)", "language": "typescript"},
-    {"pattern": "wrap($$$ARGS)", "language": "python"}
-  ]
-}
-```
-
-Supported languages are Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, Swift, Kotlin, C#, Elixir, and Bash.
-The `language` value is the lowercase name, for example `c++` or `c#`.
-`typescript` matches `.ts` files only; use `tsx` for `.tsx` files.
-In every language, `$` followed by an uppercase letter or `_` starts a metavariable.
-So in PHP and Bash, `$this` and `$name` stay literal variables, but `$HOME` is a metavariable.
-In C, a bare call such as `wrap($A)` parses as a declaration; write `wrap($A);` to match the call statement.
-Each entry contains exactly one of `query`, `follow`, or `pattern`.
-Pattern entries require `language` and accept only an optional `glob`.
-Invalid patterns and unsupported languages fail without a text-search fallback.
-
-Each structural result carries `view`, `total_matches` (all matches in scope, including any beyond the retention cap), and `files_matched`.
-Ordering is always deterministic: by path, then by start byte, then by end byte.
-
-The default `view` is `"matches"`.
-Its `items` are file groups sorted by path: `{"path": "src/a.rs", "matches": [[start_line, end_line, start_byte, end_byte], ...]}`.
-A match with captures has a fifth element, an object that maps each capture name to a list of the same four-number ranges.
-Byte offsets are zero-based and half-open. Line numbers are one-based.
-The end line identifies the exclusive end position, including the next line when the range ends after a newline.
-Multi-captures retain matched punctuation, such as commas, in source order.
-Results contain owned ranges, not source text or borrowed syntax nodes.
-Structural coordinates do not include edit tags because they do not include source text.
-Read the matched ranges before using `rewrite`.
-
-When the response exceeds the budget, a structural result steps down the first of these tiers that fits.
-Every step sets `completeness: "partial"` and `budget_limited: true`, and adds a `note`.
-
-1. One matched file: `items` keeps the longest prefix of that file's matches that fits, and `shown` gives its length. `view` stays `"matches"`.
-2. `view: "files"`: `files` is `[[path, count], ...]` sorted by path. It covers every matching file, and counts include matches beyond the retention cap. This tier applies only to 100 or fewer matching files; a longer list is not actionable, so it skips to tier 3. When a listed path has no `/`, the note adds "Prefix a top-level file with / to match only that file."
-3. `view: "directories"`: `directories` is `[[dir, count, files], ...]` sorted by directory. Directories group at the smallest depth of at least 1 that yields two or more groups, and root-level files group as `"."`. `top_files` lists up to 10 `[path, count]` pairs, largest count first, then by path.
-4. `view: "none"`: the listing is removed. Only the totals, `budget_limited`, and a `note` that says to raise the budget or narrow with `glob` are left.
-
-To narrow a trimmed result, rerun the entry with `glob` set to a listed path or to `"<dir>/**"`.
-A path that contains a `/` matches exactly that file.
-A root-level file name has no `/`, so a bare name also matches same-named files in subdirectories; prefix it with `/` (for example `"/main.rs"`) to match only the root file.
-Paths that contain glob metacharacters (`*`, `?`, `[`, `]`, `{`, `}`, `\`) are treated as patterns, not literal paths, so they cannot be used as an exact glob.
-
-Structural search uses the same scope, ignore, secret-file, and response-budget policies as other search entries.
-Matching reuses cached source and trees.
-Each distinct language/pattern pair compiles once per request.
-The scan retains at most 1,000 matches, sets `match_limited` with a `note` when more exist, and marks limited or skipped-file scans as partial.
-Files above the existing 500,000-byte parse limit are skipped.
-Skipped files are counted in `skipped_files`.
-
-### Session dedup
-
-In MCP mode, previously expanded definitions show `[shown earlier]` instead of the full body on subsequent searches. Saves tokens when the agent revisits symbols it already saw.
-
-## Benchmarks
-
-Code navigation tasks across 4 real-world repos (Express, FastAPI, Gin, ripgrep). Baseline = Claude Code built-in tools. tilth = built-in tools + tilth MCP server. We report **cost per correct answer** (`total_spend / correct_answers`) — the expected cost under retry. See [benchmark/](benchmark/) for full methodology.
-
-| Model | Tasks | Runs | Baseline $/correct | tilth $/correct | Change | Baseline acc | tilth acc |
-|---|---|---|---|---|---|---|---|
-| Sonnet 4.6 | 26 | 86 | $0.26 | $0.15 | **-44%** | 84% | 94% |
-| Opus 4.6 | 26 | 25 | $0.22 | $0.14 | **-39%** | 91% | 92% |
-| Haiku 4.5 | 26 | 49 | $0.12 | $0.08 | **-38%** | 54% | 73% |
-| **Average** | | **160** | **$0.20** | **$0.12** | **-40%** | **76%** | **86%** |
-
-v0.5.0 introduces top-weighted MCP instructions and scope fallback, achieving 40% average cost reduction across all three models. Sonnet accuracy improves from 84% to 94%, Haiku from 54% to 73%. All models show significant turn reduction (25% average fewer turns).
-
-Scope confusion (models passing invalid directory paths) is now handled with automatic fallback to cwd with a warning. DO NOT rules at the top of MCP instructions reduced redundant built-in tool usage (Grep, Read, Glob) to near-zero across all models.
-
-See [benchmark/](benchmark/) for per-task results, by-language breakdowns, and model comparison.
-
-## Why
-
-I built this because I watched AI agents make 6 tool calls to find one function. `glob → read → "too big" → grep → read again → read another file`. Each round-trip burns tokens and inference time.
-
-tilth gives structural awareness in one call. The outline tells you *what's in the file*. The search tells you *where things are defined*. `--section` gets you *exactly the lines you need*.
+| Area | This fork | Upstream |
+|---|---|---|
+| Edits | `tilth_write` takes a JSON `edits` array of `{path, tag, ops}` sections. A whole-file tag binds each edit to the content you saw. A changed file gets a 3-way merge, and the section fails only on a conflict. | A different `tilth_write` edit surface. |
+| Paths | Every path-taking MCP tool requires `cwd`. A relative path anchors under `cwd`, and the server refuses `..`. The server uses an absolute path as given. The server does not use the MCP roots handshake. | An optional `root` argument. |
+| Server mode | The MCP server always registers `tilth_write`. It has no read-only mode. The server accepts `--edit` and ignores it. | Read-only and edit modes. |
+| Removed commands | No `tilth diff`, `tilth overview`, or `tilth --map`. Use `git diff`, `git log`, `ls`, and `find`. | Present. |
+| Removed tools | No `tilth_grok` MCP tool and no `tilth grok` command. | Present. |
+| Version | The version is always `0.0.0-experimental`. `tilth --version` prints `tilth 0.0.0-experimental+<commit>`, so the commit identifies the build. The fork has no tagged releases. | Semantic versions with tagged releases. |
 
 ## Install
 
-```bash
-cargo install tilth
-# or
-npx tilth
-```
+`cargo install tilth` and `npx tilth` install **upstream** tilth, not this fork.
+The `install.sh` script and the jahala releases page also give upstream binaries.
 
-Prebuilt binaries on the [releases page](https://github.com/jahala/tilth/releases).
+Use one of these fork paths.
 
-### MCP server
+### Build from source (recommended)
 
 ```bash
-tilth install claude-code      # ~/.claude.json
-tilth install cursor           # ~/.cursor/mcp.json
-tilth install windsurf         # ~/.codeium/windsurf/mcp_config.json
-tilth install vscode           # .vscode/mcp.json (project scope)
-tilth install claude-desktop
-tilth install opencode         # ~/.config/opencode/opencode.json
-tilth install gemini           # ~/.gemini/settings.json
-tilth install codex            # ~/.codex/config.toml
-tilth install amp              # ~/.config/amp/settings.json
-tilth install droid            # ~/.factory/mcp.json
-tilth install antigravity      # ~/.gemini/antigravity/mcp_config.json
-tilth install zed              # ~/.config/zed/settings.json
-tilth install copilot-cli      # ~/.copilot/mcp-config.json
-tilth install augment          # ~/.augment/settings.json
-tilth install kiro             # ~/.kiro/settings/mcp.json
-tilth install kilo-code        # VS Code globalStorage (extension)
-tilth install cline            # VS Code globalStorage (extension)
-tilth install roo-code         # VS Code globalStorage (extension)
-tilth install trae             # .trae/mcp.json (project scope)
-tilth install qwen-code        # ~/.qwen/settings.json
-tilth install crush            # ~/.config/crush/crush.json
-tilth install pi               # ~/.pi/agent/mcp.json
+cargo install --git https://github.com/paulnsorensen/tilth
 ```
 
-Every install includes tag-anchored file editing (see [Edit mode](#edit-mode)). The old `--edit` flag is still accepted and does nothing.
-
-#### Shell guard hook (opt-in)
-
-`tilth install <host> --hook` also registers `tilth hook`, a pre-tool guard that denies shell file reads, searches, and writes (`cat`, `grep`, `sed -i`, and similar) and points the agent at the tilth tools. It writes the MCP config as usual, then merges one tilth entry into the host's hook file. Re-running it replaces the entry and leaves your other hooks alone.
-
-Where a host documents an exec form, the entry stores the binary path unquoted in `command` and `hook --host <family>` in `args`, so no shell parses the path. Only `claude-code` documents one. Every other host gets a shell string with forward slashes. A path with other characters is single-quoted, and `windsurf` on Windows adds the PowerShell `&` call operator. The install refuses a binary path that contains `'`, `"`, `$`, a backtick, `%`, or a newline in shell form.
-
-Supported hosts: `claude-code` (`~/.claude/settings.json`), `codex` (`~/.codex/hooks.json`), `droid` (`~/.factory/hooks.json` when it exists, otherwise the `hooks` key of `~/.factory/settings.json`, so existing settings hooks keep running), `crush` (`~/.config/crush/crush.json`), `augment` (`~/.augment/settings.json`), `cursor` (`~/.cursor/hooks.json`), and `windsurf` (`~/.codeium/windsurf/hooks.json`). Any other host refuses `--hook`.
-
-A host that fails open when the guard cannot run gets its documented fail-closed field: `onFailure: "block"` for `claude-code`. The other hosts document no compatible field, so a missing or moved binary there disables the guard; keep the installed binary path stable. Cursor's `failClosed` counts the guard's silent allow (exit 0, no output) as a failure, so `cursor` gets none and its guard fails open if the binary is missing.
-
-Codex does not run a new hook until you trust it: after the install, run `/hooks` in Codex and approve the tilth entry.
-
-To remove the guard, delete the tilth entry (the handler whose command ends in `hook --host <family>`) from the host's hook file listed above, then restart the host. `tilth install` has no uninstall step. With `claude-code`, `onFailure: "block"` means a moved or missing binary (after `cargo clean`, or an npx cache miss) blocks every Bash call until you reinstall or remove the entry.
-
-Or call it from bash — see [AGENTS.md](./AGENTS.md) for the MCP agent prompt, or [skills/SKILL.md](./skills/SKILL.md) for a Claude Code skill prompt.
-
-### Launch with the tilth preamble
-
-`tilth claude` and `tilth codex` start the harness with the tilth preamble: a short system prompt that tells the agent to use the tilth tools.
+From a local checkout:
 
 ```bash
-tilth claude -p "find where handleAuth is defined"   # runs: claude --system-prompt-file <F> -p ...
-tilth codex exec "summarize src/auth.ts"             # runs: codex -c model_instructions_file="<F>" exec ...
+cargo install --path .
 ```
 
-- The tilth preamble replaces the built-in system prompt of the harness.
-- The launcher does not register the tilth MCP server. The preamble sends file reads and edits to the tilth tools, so run `tilth install claude-code` or `tilth install codex` first (see [MCP server](#mcp-server)).
-- `<F>` is `$XDG_CACHE_HOME/tilth/preamble-<hash>.md`, or `~/.cache/tilth/` when `XDG_CACHE_HOME` is unset. The launcher writes only in this directory. It writes no host config (`~/.claude.json`, `~/.claude/settings.json`, `~/.codex/config.toml`).
-- On Unix, the launcher refuses a `tilth` cache directory that is a symlink, that another user owns, or that all users can write.
-- Your own `--system-prompt` or `--system-prompt-file` (claude), or a `model_instructions_file` override (codex), wins. The launcher then adds nothing. Arguments after `--` are text, so they do not count.
-- All arguments pass through unchanged, including `--` and `--help`.
-- Run management subcommands (`claude mcp ...`, `codex login`) with the harness directly. The launcher adds the tilth preamble to every call.
-- `tilth claude` and `tilth codex` run the launcher. They do not search for that word. To search for the word, run `tilth -- claude` or use `tilth_search`.
-- `tilth codex` exits 1 when the cache path is not valid UTF-8, because TOML cannot hold it.
-- `claude` or `codex` must be the first argument to tilth. `tilth --json claude` is a usage error (exit 2).
-- On Windows, the launcher needs a native `claude.exe` or `codex.exe` on `PATH`. It does not run `.cmd` shims, such as the ones npm creates.
+Both commands put `tilth` in `~/.cargo/bin`.
 
-### Use the tilth preamble in another harness
+### Nightly npm package
 
-`tilth preamble` prints the tilth preamble. `tilth preamble --path` writes it to the cache file and prints the path of that file.
+The nightly workflow publishes `@paulnsorensen/tilth-nightly` from `main`. Its `latest` dist-tag points at the newest build.
 
 ```bash
-tilth preamble >> AGENTS.md                               # add it to project instructions
-claude --append-system-prompt "$(tilth preamble)"         # add it after the built-in Claude Code prompt
-<harness> --system-prompt-file "$(tilth preamble --path)" # give the file to a harness that takes one
+npx --yes @paulnsorensen/tilth-nightly@latest --version
 ```
 
-- The text is the same text that `tilth claude` and `tilth codex` use.
-- `--path` uses the same cache file and the same directory checks as the launcher.
-- The preamble tells the agent to use the tilth tools, so register the tilth MCP server in that harness too (see [MCP server](#mcp-server)).
+When you run `tilth install <host>` from this package, the config entry is `npx @paulnsorensen/tilth-nightly --mcp`. The `--hook` entry uses the same `npx` form.
+This entry has no version pin, so it can run a new nightly each time the host starts.
+For a fixed binary, build from source.
 
-### Smaller models
+## MCP server
 
-Smaller models (e.g. Haiku) may ignore tilth tools in favor of built-in Bash/Grep. To force tilth adoption, disable the overlapping built-in tools:
+Register tilth with your agent host:
 
 ```bash
-claude --disallowedTools "Bash,Grep,Glob"
+tilth install claude-code     # writes ~/.claude.json
+tilth install codex           # writes ~/.codex/config.toml
 ```
 
-Benchmarks show Haiku benefits significantly from tilth (54% → 73% accuracy) but may still fall back to built-in tools. Forced mode ensures consistent tool adoption.
+`tilth install` supports 22 hosts. [docs/hosts.md](docs/hosts.md) lists each host and its config file.
+The entry runs `<path-to-tilth> --mcp`, a JSON-RPC server on stdio. From an npm install, the entry runs `npx <package> --mcp`, where `<package>` is the npm package that holds the binary.
+
+The server has three tools. Each tool requires `cwd`, the absolute path of your checkout.
+
+| Tool | Use |
+|---|---|
+| `tilth_read` | Read files. Takes `paths` such as `src/a.rs`, `src/a.rs#12-40`, `src/a.rs#parse`, or `README.md### Install`. Small files come back whole. Large code files come back as an outline. |
+| `tilth_search` | Find symbols, text, and regexes. Takes `queries`. An entry can also be an ast-grep `pattern` or a `follow` entry that fetches callers, callees, siblings, or tests. |
+| `tilth_write` | Edit files. Takes `edits` with the tags that reads and searches print. |
+
+The served instructions and tool descriptions are in [prompts/](prompts/). [AGENTS.md](AGENTS.md) is a copy of the instructions.
+[docs/mcp.md](docs/mcp.md) describes the edit model and structural search in more detail.
 
 ### Tool gating
 
-Descriptions alone do not flip write routing: in production telemetry across three model tiers, agents given a free choice preferred the host editor 3–9× over `tilth_write` (Sonnet: 10% tilth share), while the same tier ran 93% through tilth once the agent definition removed the host edit tools. Gate tools instead of prompting for them — in Claude Code subagents, allowlist tools and omit `Edit`/`Write`/`Grep`/`Glob`, keeping `Bash` for tests and builds:
+A tool description alone does not make an agent use `tilth_write`. Remove the host tools that overlap with tilth instead.
+In a Claude Code subagent, list the tools you allow and leave out `Edit`, `Write`, `Grep`, and `Glob`:
 
 ```yaml
 # .claude/agents/coder.md frontmatter
 tools: Bash, Read, ToolSearch, mcp__tilth
 ```
 
-For headless runs, `--disallowedTools` (above) is the equivalent lever.
+For headless runs, use `claude --disallowedTools "Grep,Glob"`.
+
+## Launcher and preamble
+
+`tilth claude` and `tilth codex` start the harness with the tilth preamble as its system prompt. The preamble is [prompts/preamble.md](prompts/preamble.md).
+
+```bash
+tilth claude -p "find where handleAuth is defined"   # runs: claude --system-prompt-file <F> -p ...
+tilth codex exec "summarize src/auth.ts"             # runs: codex -c model_instructions_file="<F>" exec ...
+```
+
+- `<F>` is `$XDG_CACHE_HOME/tilth/preamble-<hash>.md`. When `XDG_CACHE_HOME` is not set, the directory is `~/.cache/tilth/`.
+- The launcher writes only in that directory. It does not change host config files.
+- The launcher does not register the MCP server. Run `tilth install claude-code` or `tilth install codex` first.
+- `claude` or `codex` must be the first argument. `tilth --json claude` is a usage error (exit 2).
+- All later arguments pass to the harness unchanged.
+- The launcher adds the preamble to every call, management subcommands such as `claude mcp` and `codex login` included.
+- On Windows, the launcher starts only a native `claude.exe` or `codex.exe`. It does not start an npm `.cmd` shim.
+- If you give `--system-prompt` or `--system-prompt-file` (claude), or a `model_instructions_file` override (codex), the launcher adds nothing. Arguments after `--` do not count.
+- On Unix, the launcher refuses a cache directory that is not a real directory, that another user owns, or that all users can write.
+- `tilth codex` exits 1 when the cache path is not valid UTF-8.
+- To search for the word `claude` or `codex`, run `tilth -- claude`.
+
+To use the preamble in another harness:
+
+```bash
+tilth preamble >> AGENTS.md                               # add it to project instructions
+claude --append-system-prompt "$(tilth preamble)"         # add it after the built-in prompt
+<harness> --system-prompt-file "$(tilth preamble --path)" # give the cache file to a harness
+```
+
+`tilth preamble --path` writes the cache file and prints its path.
+
+## Shell guard hook
+
+`tilth hook` reads one pre-tool event on stdin. It exits 2 to deny shell file reads, searches, and writes such as `cat`, `grep`, and `sed -i`. The deny message names the tilth tool to use.
+
+```bash
+tilth install claude-code --hook
+```
+
+`--hook` writes the MCP config and adds one tilth entry to the host's hook file. A second run replaces that entry and keeps your other hooks.
+Seven hosts support `--hook`: `claude-code`, `codex`, `droid`, `crush`, `augment`, `cursor`, and `windsurf`.
+[docs/hosts.md](docs/hosts.md#shell-guard-hook) gives the hook file, fail-closed behavior, and removal steps for each host.
+
+> [!IMPORTANT]
+> For `claude-code`, the entry sets `onFailure: "block"`.
+> If the binary moves or disappears, the hook blocks every Bash call until you reinstall or remove the entry.
 
 ### Bash guard hook
 
-`scripts/tilth-bash-guard` routes project content reads from leading `grep`/`rg`/`cat` commands to `tilth_search`/`tilth_read`.
-Shell `ls` and `find` allow directory browsing.
-Project input reads, output redirects, and `find` execution or write actions remain guarded.
-Wrapper forms such as `bash -c` are not inspected.
-Pipe filters (`cargo test | grep foo`) and paths outside the project pass through.
-Run `python3 scripts/tilth-bash-guard --self-test` before installation.
-Install the hook in a tilth-enabled project's `.claude/settings.json`.
-Review the script before installation, especially on untrusted branches:
+[scripts/tilth-bash-guard](scripts/tilth-bash-guard) is an older Python guard for Claude Code. It sends `grep`, `rg`, and `cat` reads of project files to the tilth tools.
+The guard does not catch these forms:
+
+- A command inside a wrapper such as `bash -c '...'`.
+- A pipe filter such as `cargo test | grep foo`.
+- A path outside the project.
+
+Read the script before you install it. Run its self-test first:
+
+```bash
+python3 scripts/tilth-bash-guard --self-test
+```
+
+To install it, copy `scripts/tilth-bash-guard` into the `scripts/` directory of your project. Then add it to `.claude/settings.json` in that project:
 
 ```json
 {
@@ -312,98 +184,62 @@ Review the script before installation, especially on untrusted branches:
 }
 ```
 
-## How it decides what to show
-
-| Input | Behaviour |
-|-------|-----------|
-| 0 bytes | `[empty]` |
-| Binary | `[skipped]` with mime type |
-| Generated (lockfiles, .min.js) | `[generated]` |
-| < ~6000 tokens | Full content with line numbers |
-| > ~6000 tokens | Structural outline with line ranges |
-
-Token-based, not line-based — a 1-line minified bundle gets outlined; a 120-line focused module prints whole.
-
-## Edit mode
-
-The MCP server always registers `tilth_write`. `tilth_read` prints a `[path#TAG]` header over 1-based numbered lines. `tilth_search` shows `path#TAG` in match headers too, so lines a search shows are editable with no read:
-
-```
-[src/auth.ts#1A2B]
-42:  let x = compute();
-43:  return x;
-```
-
-`tilth_write` takes a JSON `edits` array of `{path, tag, ops}` sections. Copy the TAG verbatim — it binds the edit to the content you saw. Every edit must fall on lines a read or search showed. If the file changed since, tilth 3-way-merges your ops onto the live file and rejects the section only when the merge conflicts:
-
-```json
-{"path": "src/auth.ts", "tag": "1A2B", "ops": [
-  {"op": "replace_text", "old": "compute()", "new": "recompute()", "all": true},
-  {"op": "rewrite", "pattern": "$R.Render($W)", "rewrite": "$R.Render(ctx, $W)"}
-]}
-```
-
-`replace_text` matches one exact string; `all: true` replaces every match and `count: N` requires exactly N. `rewrite` replaces outermost, non-overlapping ast-grep matches in the file's language. Nested matches inside a selected match are not rewritten, and `count: N` counts only selected matches.
-
-Large files still outline first — read a `path#n-m` section to get numbered content for the part you need.
-
-Inspired by [The Harness Problem](https://blog.can.ac/2026/02/12/the-harness-problem/).
-
-## Usage
+## CLI
 
 ```bash
-tilth <path>                      # read file (outline if large)
+tilth <path>                      # read a file (outline if large, on a terminal)
 tilth <path> --section 45-89      # line range, grown to the end of a cut function
-tilth <path> --section "## Foo"   # markdown heading
-tilth <path> --full               # force full content
-tilth <symbol> --scope <dir>      # definitions + usages
-tilth <symbol> --expand=5         # inline source for top 5 matches
-tilth <symbol> --callers          # find call sites (structural)
-tilth "TODO: fix" --scope <dir>   # content search
+tilth <path> --section "## Foo"   # markdown section
+tilth <path> --full               # whole file
+tilth <symbol> --scope <dir>      # definitions and usages
+tilth <symbol> --expand=5         # inline source for the top 5 matches
+tilth <symbol> --callers          # call sites (structural)
+tilth "TODO: fix" --scope <dir>   # text search
 tilth "/<regex>/" --scope <dir>   # regex search
-tilth "*.test.ts" --scope <dir>   # glob files
+tilth "*.test.ts" --scope <dir>   # glob
 ```
 
-Use shell `git diff` and `git log` for change review, and `ls` or `find` to browse directories.
+When stdout is not a terminal, a file read returns the whole file.
+[docs/cli.md](docs/cli.md) has all flags and real output samples.
 
-## Speed
+## Benchmarks
 
-CLI times on x86_64 Mac, 26–1060 file codebases. Includes ~17ms process startup (MCP mode pays this once).
+The numbers in upstream's README are upstream measurements. They do not describe this fork.
 
-| Operation | ~30 files | ~1000 files |
-|-----------|-----------|-------------|
-| File read + type detect | ~18ms | ~18ms |
-| Code outline (400 lines) | ~18ms | ~18ms |
-| Symbol search | ~27ms | — |
-| Content search | ~26ms | — |
-| Glob | ~24ms | — |
-| Map (codebase skeleton) | ~21ms | ~240ms |
+The fork measures **cost per correct answer** against Claude Code with its built-in tools. The method is in [benchmark/README.md](benchmark/README.md).
+The current results do not show that the fork is cheaper than the built-in tools. The work continues.
 
-Search, content search, and glob use early termination — time is roughly constant regardless of codebase size.
+- **Stock-prompt A/B (2026-11-02).** 18 tasks, 3 reps, Sonnet. Every tilth arm costs 11.6% to 15.6% more per correct answer than the built-in-tools baseline. All three cost intervals exclude 0. The tilth arms solve 52 or 53 of 54 cells; the baseline solves 54.
+- **tools-sonnet-r1 evolve round (2026-11-06).** On the held-out test split (8 tasks, 4 reps), the winning candidate scores 0.938 and the seed scores 0.812. The paired interval [-0.057, 0.220] includes 0, so no change shipped.
+- **gepa-v3 campaign (October 2026).** On the held-out test split, the campaign's last measured `main` costs 2% to 6% less per correct answer than the baseline. On the dev split, the result is within noise.
 
-## What's inside
+Source: [.hallouminate/wiki/benchmark-gepa-v3-evolve.md](.hallouminate/wiki/benchmark-gepa-v3-evolve.md). The cost causes are in [.hallouminate/wiki/stock-ab-trajectory-diagnosis.md](.hallouminate/wiki/stock-ab-trajectory-diagnosis.md).
 
-Rust. ~20,000 lines. No runtime dependencies.
+## Benchmark log
 
-- **tree-sitter** — AST parsing for 17 languages (Rust, TypeScript, TSX, JavaScript, Python, Go, Java, Scala, C, C++, Ruby, PHP, Swift, Kotlin, C#, Elixir, Bash). Used for definition detection, callee extraction, callers query, and structural outlines.
-- **ast-grep** (`ast-grep-core`, `ast-grep-language`) — structural pattern search over the cached tree-sitter trees, with metavariables (`$A`, `$$$ARGS`) for every language above. PHP patterns parse with the same full grammar as PHP documents, so templates with inline HTML match too.
-- **ripgrep internals** (`grep-regex`, `grep-searcher`) — fast content search
-- **ignore** crate — parallel directory walking, searches all files including gitignored
-- **memmap2** — memory-mapped file reads (no buffers)
-- **clru** — bounded LRU outline cache, invalidated by file revision
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="benchmark/log/evolve-dark.svg" />
+  <source media="(prefers-color-scheme: light)" srcset="benchmark/log/evolve.svg" />
+  <img alt="Evolve runs over time: score against the built-in-tools baseline" src="benchmark/log/evolve.svg" width="100%" />
+</picture>
 
-Search runs definitions and usages in parallel via `rayon::join`. Callee resolution runs at expand time — extract callee names via tree-sitter queries, resolve against the source file's outline and imported files. Callers query uses the same tree-sitter patterns in reverse, walking the codebase with `memchr` SIMD pre-filtering for fast elimination.
+The chart shows the evolve runs over time. Each run scores tilth candidates against the built-in-tools baseline.
+A score of 1.0 is cost-per-correct parity with the baseline. A score above 1.0 is cheaper per correct answer.
+Every evolve run uses a Sonnet agent model. Each band of the chart names its task panel and the resolved model.
+Scores from different panels or models do not compare, so a divider separates the bands and no line joins them.
+A table under the chart gives the real numbers per band: the dev-split pass rate and cost per correct answer of
+the baseline (built-in tools, no tilth), the tilth seed, and the tilth winner.
+Each evolve run opens its own ready PR that adds one entry to [benchmark/log/evolve.jsonl](benchmark/log/evolve.jsonl) and redraws the chart. The run builds the entry from its own state and keeps a copy in its run directory. `--benchmark-log PATH` writes to a local log and opens no PR. `benchmark/evolve/benchlog.py publish RUN_DIR --replace` rebuilds a log PR that conflicts after another one lands. The chart shows the last entry of each run id.
+The evolve loop is a GEPA search over tilth commits, which change prompt texts and `src/**`. See [benchmark/evolve/README.md](benchmark/evolve/README.md#benchmark-log).
 
-The search output format is informed by wavelet multi-resolution (outline headers show line ranges for drill-down) and 1-hop callee expansion (expanded definitions resolve callees inline).
+## Relationship to upstream
 
-## Name
+- **Upstream to fork.** Upstream changes come in on a `sync/upstream-<date>` branch. Conflicts resolve to the fork side for the differences above.
+- **Fork to upstream.** A weekly routine finds self-contained fork changes and opens pull requests against `jahala/tilth`. The [upstream contribution roadmap](.hallouminate/wiki/roadmaps/upstream-contrib/index.md) tracks their state.
 
-**tilth** — the state of soil that's been prepared for planting. Your codebase is the soil; tilth gives it structure so you can find where to dig.
+## Credits and license
 
-## Support
+[jahala](https://github.com/jahala) wrote tilth. This fork builds on that work.
+To support the original author, see [upstream tilth](https://github.com/jahala/tilth).
 
-[!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://buymeacoffee.com/jahala)
-
-## License
-
-MIT
+MIT. See [LICENSE](LICENSE).

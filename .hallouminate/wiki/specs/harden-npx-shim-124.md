@@ -7,6 +7,8 @@ CI regression smoke test.
 
 ## Context / ground truth (verified this session)
 
+- **Update 2026-11-22:** this context is out of date. PR #471 deletes `release.yml`, and the fork publishes only `npm-nightly/`. See [fork version identity](../adr/fork-version-identity.md).
+
 - **Two shim dirs, both download from the SAME URL.** `npm/` (canonical `tilth` /
   `@plotplot/tilth`) and `npm-nightly/` (`@paulnsorensen/tilth-nightly`) both
   download `https://github.com/paulnsorensen/tilth/releases/download/nightly/tilth-<target>.<ext>`.
