@@ -52,6 +52,7 @@ def harness_digest(
     command: Sequence[str] = (),
     hook_source_key: str | None = None,
     home_isolation: str | None = None,
+    agent_env: Mapping[str, str] | None = None,
 ) -> str:
     """Hash the runner configuration a cell's agent sees.
 
@@ -61,12 +62,15 @@ def harness_digest(
     strict-mode Bash hook source (``src/hook`` tree hash and ``Cargo.lock`` hash),
     which the settings only name by binary path. ``home_isolation`` names how a Codex cell's
     home is isolated; it joins the digest only when set, so other runners keep their keys.
+    ``agent_env`` holds the extra shell settings for the task's upstream repo; it joins the digest
+    only when it is not empty, so other tasks keep their keys.
     """
     return canonical_digest({
         "system_prompt": system_prompt, "tools": tools, "strict_file_tools": strict_file_tools,
         "bare": bare, "max_budget_usd": max_budget_usd, "mcp_shape": mcp_shape,
         "command": list(command), "hook_source_key": hook_source_key,
         **({"home_isolation": home_isolation} if home_isolation is not None else {}),
+        **({"agent_env": dict(agent_env)} if agent_env else {}),
     })
 
 
