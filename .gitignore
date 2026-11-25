@@ -4,8 +4,11 @@ spikes/*/target/
 /result
 /result-*
 
-# Internal docs (reviews, feedback, specs)
-/docs
+# Internal docs (reviews, feedback, specs). The public reference pages that README.md links stay tracked.
+/docs/*
+!/docs/cli.md
+!/docs/hosts.md
+!/docs/mcp.md
 
 # OS
 .DS_Store

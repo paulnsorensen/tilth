@@ -270,7 +270,7 @@ fn handle_request(req: &JsonRpcRequest, services: &Services) -> JsonRpcResponse 
                     },
                     "serverInfo": {
                         "name": "tilth",
-                        "version": env!("CARGO_PKG_VERSION")
+                        "version": env!("TILTH_VERSION")
                     },
                     "instructions": instructions
                 })),

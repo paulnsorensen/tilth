@@ -1,10 +1,10 @@
 [package]
 name = "tilth"
-version = "0.8.4"
+version = "0.0.0-experimental"
 edition = "2021"
 description = "Tree-sitter indexed lookups — smart code reading for AI agents"
 license = "MIT"
-repository = "https://github.com/jahala/tilth"
+repository = "https://github.com/paulnsorensen/tilth"
 readme = "README.md"
 keywords = ["mcp", "code-search", "tree-sitter", "developer-tools"]
 categories = ["command-line-utilities", "development-tools"]

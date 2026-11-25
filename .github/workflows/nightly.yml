@@ -3,7 +3,7 @@ name: Nightly (main)
 # Fork-side rolling build: every push to main cross-compiles the binaries,
 # refreshes the `nightly` GitHub prerelease, and publishes the npm wrapper
 # under a fork-owned scope so `npx @paulnsorensen/tilth-nightly` runs the latest
-# main. The upstream tag-triggered release.yml is untouched.
+# main. This is the only release channel of the fork: a `v*` tag publishes nothing.
 
 on:
   push:
@@ -178,7 +178,7 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false # release build — skip the dependency cache
       # Stamp a unique experimental prerelease version per run (run_number is
-      # monotonic). Decoupled from Cargo.toml — fork law keeps that at 0.8.4.
+      # monotonic). The base `0.0.0-experimental` matches Cargo.toml (fork law).
       # OIDC injects auth automatically; provenance is attached on publish.
       - name: Stamp version and publish
         working-directory: ./npm-nightly

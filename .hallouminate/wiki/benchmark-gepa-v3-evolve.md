@@ -203,7 +203,7 @@ The tools-sonnet-r1 run started from seed main `e6d47cd4`, which holds the #433-
 - Panel `benchmark/panels/gepa-v3-long-3.json`, model sonnet.
 - Flags: `--max-usd 200 --max-metric-calls 60 --cell-budget-usd 3 --cell-estimate-usd 1.1 --directives benchmark/evolve/directives/tools-r1.json --deep-diagnosis --replay-diagnostic 2 --budget-id evolve-tools-r1`.
 - Deep diagnosis ran with the isolation of PR #440: no host `CLAUDE.md`, hooks, or skills.
-- A first launch did not pass `--model`, so it ran haiku, the evolve default. It stopped after $0.19. Always pass `--model`.
+- A first launch did not pass `--model`, so it ran haiku, which was then the evolve default. It stopped after $0.19. Evolve now runs Sonnet only: `--model` accepts only Sonnet names and defaults to `sonnet` (see [Evolve benchmark log](evolve-benchmark-log.md)).
 - #431 added `autoMemoryEnabled: false` to the append-mode settings. That changed `harness_digest`, so the run bought every baseline cell again.
 - The run exited 0 at 2026-11-06T00:32:56Z. Ledger spend was $174.88 of $200.
 

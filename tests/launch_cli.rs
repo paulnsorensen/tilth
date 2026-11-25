@@ -1002,3 +1002,81 @@ fn launch_preamble_append_takes_a_relative_file_and_the_plain_cache_file() {
     assert_eq!(fs::read(&plain).unwrap(), PREAMBLE, "the plain file stays");
     assert_eq!(fs::read(&file).unwrap(), joined(PREAMBLE));
 }
+
+#[test]
+fn launch_preamble_append_keeps_an_aged_cache_source() {
+    let sb = Sandbox::new();
+    let plain = preamble_path(&sb, &[]);
+    set_age_in_days(&plain, 40);
+
+    let alias = sb.home.join("source.md");
+    std::os::unix::fs::symlink(&plain, &alias).unwrap();
+    let work = sb.home.join("work");
+    fs::create_dir_all(&work).unwrap();
+    std::os::unix::fs::symlink(&alias, work.join("notes.md")).unwrap();
+    for _ in 0..2 {
+        let out = sb
+            .tilth(&["preamble", "--path", "--append", "notes.md"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let path = PathBuf::from(String::from_utf8(out.stdout).unwrap().trim_end());
+        assert_eq!(fs::read(path).unwrap(), joined(PREAMBLE));
+        assert_eq!(
+            fs::read(&plain).unwrap(),
+            PREAMBLE,
+            "append source must stay"
+        );
+    }
+}
+
+#[test]
+fn launch_preamble_files_have_owner_only_permissions() {
+    let sb = Sandbox::new();
+    let dir = sb.xdg.join("tilth");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let source = sb.home.join("source.md");
+    fs::write(&source, b"private notes\n").unwrap();
+
+    let joined_file = append_path(&sb, &source);
+    assert_eq!(fs::read(&joined_file).unwrap(), joined(b"private notes\n"));
+    assert_eq!(
+        fs::metadata(&joined_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let plain = preamble_path(&sb, &[]);
+    assert_eq!(
+        fs::metadata(&plain).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn launch_preamble_replaces_public_or_symlink_cache_files() {
+    use std::os::unix::fs::MetadataExt;
+
+    let sb = Sandbox::new();
+    let source = sb.home.join("source.md");
+    fs::write(&source, b"private notes\n").unwrap();
+    let file = append_path(&sb, &source);
+    let original_inode = fs::metadata(&file).unwrap().ino();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(append_path(&sb, &source), file);
+    let meta = fs::metadata(&file).unwrap();
+    assert_ne!(meta.ino(), original_inode, "a public file must be replaced");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+    let target = sb.home.join("target.md");
+    fs::write(&target, b"leave target unchanged\n").unwrap();
+    fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&target, &file).unwrap();
+    assert_eq!(append_path(&sb, &source), file);
+    assert_eq!(fs::read(&target).unwrap(), b"leave target unchanged\n");
+    assert_eq!(fs::read(&file).unwrap(), joined(b"private notes\n"));
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}

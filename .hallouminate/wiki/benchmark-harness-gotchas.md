@@ -51,11 +51,21 @@ visible instead of silent.
 instruction-cap shortening) — it served an 8,688-char instructions blob for
 weeks after #151 landed. It was mistaken for current HEAD behavior during an
 early measurement pass (the "24,917-char fork surface" reading). Root cause:
-version is pinned at `0.8.4` across the whole fork (see CLAUDE.md fork law),
-so `tilth --version` cannot distinguish a stale binary from current HEAD.
+the version was pinned at `0.8.4` across the whole fork, so
+`tilth --version` could not distinguish a stale binary from current HEAD.
 
 **Check byte sizes (or rebuild from source), not `--version`, when a fork
-binary's prompt surface is in question.**
+binary's prompt surface is in question.** This applies to builds before
+2026-11-22.
+
+Fix (2026-11-22, [fork version identity](adr/fork-version-identity.md)): the
+fork version is now `0.0.0-experimental`, and `tilth --version` adds the short
+git commit (`tilth 0.0.0-experimental+<sha>`). Compare that suffix with
+`git rev-parse --short HEAD`. A build without git metadata prints no suffix,
+so its age stays unknown. The suffix has no dirty flag: when the checkout has
+uncommitted changes (an edited prompt, for example), the binary and `HEAD` can
+show the same commit while the binary serves the old text. Rebuild, or check
+byte sizes, in that case.
 
 ## Related
 

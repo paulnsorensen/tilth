@@ -8,7 +8,7 @@ use clap_complete::Shell;
 /// tilth — Tree-sitter indexed lookups, smart code reading for AI agents.
 /// One tool replaces `read_file`, grep, glob, `ast_grep`, and find.
 #[derive(Parser)]
-#[command(name = "tilth", version, about)]
+#[command(name = "tilth", version = env!("TILTH_VERSION"), about)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
