@@ -1406,6 +1406,7 @@ def cell_identity(
     variant_flags = {
         "bare": bare, "strict_file_tools": strict_file_tools,
         "max_budget_usd": max_budget_usd if runner == "claude" else None,
+        **({"hook_capture": hook_capture()} if strict_file_tools or codex_hooked else {}),
     }
     return {"run_key": baselines.run_key(key_inputs), **identity, **variant_flags,
             **({"hook_source_key": hook_source_key} if hook_source_key else {}),

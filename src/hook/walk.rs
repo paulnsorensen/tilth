@@ -18,6 +18,9 @@ pub(super) fn check(source: &str, capture: Capture) -> Option<Rule> {
 struct Ctx {
     piped: bool,
     here: bool,
+    skip_fd0: bool,
+    /// A trailing redirect connects the last command, not the first pipeline stage.
+    tail_stdin: bool,
     /// Where the stdin of the node comes from.
     feed: Feed,
 }
@@ -100,8 +103,14 @@ impl Walker {
             "list" | "negated_command" => {
                 let mut out = Authored::default();
                 let mut cursor = node.walk();
-                for child in node.named_children(&mut cursor) {
-                    let Authored { any, last } = self.visit(child, src, Ctx::default())?;
+                let children: Vec<_> = node
+                    .named_children(&mut cursor)
+                    .filter(|child| child.kind() != "comment")
+                    .collect();
+                let count = children.len();
+                for (i, child) in children.into_iter().enumerate() {
+                    let child_ctx = if i + 1 == count { ctx } else { Ctx::default() };
+                    let Authored { any, last } = self.visit(child, src, child_ctx)?;
                     out = Authored {
                         any: out.any || any,
                         last,
@@ -111,10 +120,9 @@ impl Walker {
             }
             "redirected_statement" => self.redirected(node, src, ctx),
             "command" => self.command(node, src, ctx, Vec::new()),
-            "file_redirect" | "heredoc_redirect" => {
-                self.redirect_node(node, src, Feed::Unknown)?;
-                Ok(Authored::default())
-            }
+            "file_redirect" | "heredoc_redirect" => Ok(self
+                .redirect_node(node, src, Feed::Unknown)?
+                .unwrap_or_default()),
             "command_substitution" | "process_substitution" => {
                 self.children(node, src)?;
                 Ok(Authored::default())
@@ -128,10 +136,16 @@ impl Walker {
     /// but the shell gives it to the last stage.
     fn pipeline(&mut self, node: Node, src: &[u8], ctx: Ctx) -> Walk {
         let mut out = Authored::default();
-        let last = node.named_child_count().saturating_sub(1);
         let mut cursor = node.walk();
-        for (i, child) in node.named_children(&mut cursor).enumerate() {
-            let feed = if i == last && ctx.here {
+        let stages: Vec<_> = node
+            .named_children(&mut cursor)
+            .filter(|child| child.kind() != "comment")
+            .collect();
+        let last = stages.len().saturating_sub(1);
+        for (i, child) in stages.into_iter().enumerate() {
+            let feed = if i == last && ctx.tail_stdin {
+                Feed::Connected
+            } else if i == last && ctx.here {
                 Feed::Authored
             } else if i == 0 {
                 ctx.feed
@@ -139,8 +153,10 @@ impl Walker {
                 out.feed()
             };
             let stage = Ctx {
-                piped: i > 0,
+                piped: ctx.piped || i > 0,
                 here: false,
+                skip_fd0: i == last && ctx.skip_fd0,
+                tail_stdin: i == last && ctx.tail_stdin,
                 feed,
             };
             out = self.visit(child, src, stage)?;
@@ -167,8 +183,27 @@ impl Walker {
             .named_children(&mut cursor)
             .flat_map(|c| redirect_words(c, src))
             .collect();
-        let inner = Ctx { here, ..ctx };
-        let out = match body {
+        let connected = node
+            .named_children(&mut cursor)
+            .any(|child| permitted_stdin(child, src, self.capture));
+        let own_fd0 = node.named_children(&mut cursor).any(|child| {
+            permitted_stdin(child, src, self.capture)
+                && explicit_fd0(child, src)
+                && child.child_by_field_name("descriptor").is_none()
+        });
+        let simple = body.is_some_and(|b| b.kind() == "command");
+        let inner = Ctx {
+            here,
+            skip_fd0: ctx.skip_fd0 || own_fd0,
+            tail_stdin: ctx.tail_stdin || (connected && !simple),
+            feed: if connected && simple {
+                Feed::Connected
+            } else {
+                ctx.feed
+            },
+            ..ctx
+        };
+        let mut out = match body {
             Some(b) if b.kind() == "command" => self.command(b, src, inner, extra)?,
             _ if !extra.is_empty() => return Err(UNRESOLVED),
             Some(b) => self.visit(b, src, inner)?,
@@ -176,7 +211,9 @@ impl Walker {
         };
         for child in node.named_children(&mut cursor) {
             if Some(child.id()) != body.map(|b| b.id()) {
-                self.redirect_node(child, src, out.writer())?;
+                if let Some(tail) = self.redirect_node(child, src, out.writer())? {
+                    out = tail;
+                }
             }
         }
         Ok(out)
@@ -187,7 +224,13 @@ impl Walker {
     ///
     /// The grammar puts two things under the heredoc of `a <<EOF > f | b`: the file redirects
     /// of `a`, and the rest of the pipeline, which reads the output of `a`.
-    fn redirect_node(&mut self, node: Node, src: &[u8], writer: Feed) -> Result<(), Rule> {
+    fn redirect_node(
+        &mut self,
+        node: Node,
+        src: &[u8],
+        writer: Feed,
+    ) -> Result<Option<Authored>, Rule> {
+        let mut tail = None;
         match node.kind() {
             "file_redirect" => {
                 let captured = self.capture == Capture::Allow && writer == Feed::Real;
@@ -202,13 +245,15 @@ impl Walker {
                 let mut cursor = node.walk();
                 for child in node.named_children(&mut cursor) {
                     match child.kind() {
-                        "file_redirect" => self.redirect_node(child, src, writer)?,
+                        "file_redirect" => {
+                            self.redirect_node(child, src, writer)?;
+                        }
                         "pipeline" => {
                             let fed = Ctx {
                                 feed: writer,
                                 ..Ctx::default()
                             };
-                            self.visit(child, src, fed)?;
+                            tail = Some(self.visit(child, src, Ctx { piped: true, ..fed })?);
                         }
                         _ => {
                             self.visit(child, src, Ctx::default())?;
@@ -220,12 +265,15 @@ impl Walker {
                 self.visit(node, src, Ctx::default())?;
             }
         }
-        Ok(())
+        Ok(tail)
     }
 
     /// Checks a simple command and reparses any shell source it runs. A command with no words
     /// holds only redirects and assignments, so no program writes its output.
-    fn command(&mut self, node: Node, src: &[u8], ctx: Ctx, extra: Vec<Arg>) -> Walk {
+    fn command(&mut self, node: Node, src: &[u8], mut ctx: Ctx, extra: Vec<Arg>) -> Walk {
+        if ctx.tail_stdin {
+            ctx.feed = Feed::Connected;
+        }
         let mut cursor = node.walk();
         let mut words: Vec<Arg> = Vec::new();
         let mut here = ctx.here;
@@ -243,7 +291,16 @@ impl Walker {
                 _ => words.push(arg_of(child, src)),
             }
         }
+        if ctx.skip_fd0 {
+            words.pop();
+        }
         words.extend(extra);
+        if node
+            .named_children(&mut cursor)
+            .any(|child| permitted_stdin(child, src, self.capture))
+        {
+            ctx.feed = Feed::Connected;
+        }
         if self.depth > 0 && words.first().is_some_and(|w| !w.literal) {
             return Err(UNRESOLVED);
         }
@@ -270,14 +327,16 @@ impl Walker {
             }
         }
         let authored = authored.get();
-        let out = Authored {
+        let mut out = Authored {
             any: authored,
             last: authored,
         };
         for child in node.named_children(&mut cursor) {
             match child.kind() {
                 "file_redirect" | "heredoc_redirect" => {
-                    self.redirect_node(child, src, out.writer())?;
+                    if let Some(tail) = self.redirect_node(child, src, out.writer())? {
+                        out = tail;
+                    }
                 }
                 _ => {
                     self.visit(child, src, Ctx::default())?;
@@ -345,6 +404,53 @@ fn is_structure(kind: &str) -> bool {
 /// Recognizes heredoc and here-string redirect nodes.
 fn is_here(kind: &str) -> bool {
     matches!(kind, "heredoc_redirect" | "herestring_redirect")
+}
+
+/// Return an explicit descriptor immediately before a redirect operator.
+fn explicit_fd<'a>(node: Node, src: &'a [u8]) -> Option<&'a [u8]> {
+    if let Some(fd) = node.child_by_field_name("descriptor") {
+        return Some(&src[fd.start_byte()..fd.end_byte()]);
+    }
+    let previous = node.prev_named_sibling()?;
+    let number = if previous.kind() == "command" {
+        previous.named_child(
+            previous
+                .named_child_count()
+                .checked_sub(1)?
+                .try_into()
+                .ok()?,
+        )?
+    } else {
+        previous
+    };
+    (number.kind() == "number" && number.end_byte() == node.start_byte())
+        .then_some(&src[number.start_byte()..number.end_byte()])
+}
+
+fn explicit_fd0(node: Node, src: &[u8]) -> bool {
+    explicit_fd(node, src) == Some(b"0".as_slice())
+}
+
+/// Whether a permitted literal file connects descriptor zero without proving a real writer.
+fn permitted_stdin(node: Node, src: &[u8], capture: Capture) -> bool {
+    if node.kind() != "file_redirect" || capture != Capture::Allow {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let Some(op) = node.children(&mut cursor).find(|child| !child.is_named()) else {
+        return false;
+    };
+    if op.utf8_text(src).ok() != Some("<") {
+        return false;
+    }
+    let fd = explicit_fd(node, src);
+    if fd.is_some_and(|fd| fd != b"0") {
+        return false;
+    }
+    node.child_by_field_name("destination").is_some_and(|dest| {
+        let (text, literal) = literal(dest, src);
+        rules::is_pseudo_file(&text, literal)
+    })
 }
 
 /// Deny a redirect that reads a path or writes a file. With `--allow-capture`, output to a

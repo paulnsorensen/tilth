@@ -2433,3 +2433,85 @@ fn capture_flag_maps_to_the_policy() {
     assert_eq!(Capture::from(false), Capture::Deny);
     assert_eq!(Capture::from(true), Capture::Allow);
 }
+
+#[test]
+fn capture_tracks_pipeline_stages_and_heredoc_tail_output() {
+    for command in [
+        "go test ./... | # stage note\n tee capture.log",
+        "go test ./... <<EOF | tee capture.log\ninput\nEOF",
+    ] {
+        assert_eq!(capture_rule(command, Hint::Tilth), None, "{command:?}");
+    }
+    for command in [
+        "printf input | # stage note\n tr a-z A-Z > capture.log",
+        "printf input <<EOF | tr a-z A-Z > capture.log\ninput\nEOF",
+    ] {
+        assert_eq!(
+            capture_rule(command, Hint::Tilth),
+            Some("output redirect"),
+            "{command:?}"
+        );
+    }
+}
+
+#[test]
+fn capture_tracks_connected_search_stdin_without_authored_provenance() {
+    for command in [
+        "rg '^MemTotal:' < /proc/meminfo",
+        "rg '^MemTotal:' 0< /proc/meminfo",
+        "go test ./... <<EOF | rg result > capture.log\ninput\nEOF",
+    ] {
+        assert_eq!(capture_rule(command, Hint::Tilth), None, "{command:?}");
+        assert!(denies(command), "strict mode allows {command:?}");
+    }
+    for command in [
+        "rg pattern /proc/meminfo",
+        "rg pattern 1< /proc/meminfo",
+        "rg pattern < ./file",
+    ] {
+        assert!(capture_rule(command, Hint::Tilth).is_some(), "{command:?}");
+    }
+    assert_eq!(
+        capture_rule("rg pattern < /proc/meminfo > capture.log", Hint::Tilth),
+        Some("output redirect")
+    );
+}
+
+#[test]
+fn capture_routes_stdin_to_the_redirect_owner() {
+    for command in [
+        "rg pattern | rg pattern < /dev/null",
+        "rg pattern && rg pattern < /dev/null",
+        "rg pattern; rg pattern < /dev/null",
+    ] {
+        assert!(capture_rule(command, Hint::Tilth).is_some(), "{command:?}");
+    }
+    for command in [
+        "rg pattern < /dev/null | rg pattern",
+        "rg pattern < /dev/null && go test ./...",
+        "rg pattern 0< /dev/null",
+    ] {
+        assert_eq!(capture_rule(command, Hint::Tilth), None, "{command:?}");
+    }
+}
+
+#[test]
+fn capture_debugger_tracks_only_launched_program_output() {
+    for command in [
+        "gdb -batch -ex run --args echo input > capture.log",
+        "gdb -batch -ex starti --args echo input > capture.log",
+        "lldb -b -o run -- echo input > capture.log",
+    ] {
+        assert_eq!(
+            capture_rule(command, Hint::Tilth),
+            Some("output redirect"),
+            "{command:?}"
+        );
+    }
+    for command in [
+        "gdb -batch -ex bt --args echo input > capture.log",
+        "gdb -batch -ex run --args go test ./... > capture.log",
+    ] {
+        assert_eq!(capture_rule(command, Hint::Tilth), None, "{command:?}");
+    }
+}

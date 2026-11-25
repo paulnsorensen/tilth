@@ -51,7 +51,7 @@ impl Cmd<'_> {
     fn real_stdin(&self) -> bool {
         match self.feed {
             Feed::Real => !self.here,
-            Feed::Unknown | Feed::Authored => false,
+            Feed::Unknown | Feed::Connected | Feed::Authored => false,
         }
     }
 }
@@ -62,6 +62,8 @@ pub(super) enum Feed {
     /// No pipeline stage feeds the command, or the rules cannot tell.
     #[default]
     Unknown,
+    /// Descriptor zero has a permitted input, but no real writer is proven.
+    Connected,
     /// The output of a real command.
     Real,
     /// Authored content: a content generator, or a heredoc on the pipeline.
@@ -230,7 +232,7 @@ fn check_from(cmd: &Cmd, words: &[Arg], xargs: bool) -> Outcome {
         "source" | "." => source(args),
         _ => match interpreter_family(name) {
             Some(family) => interpreter(family, args, cmd),
-            None => stdin_reader(name, args, &env_assigns(cmd, words)),
+            None => stdin_reader(name, args, &env_assigns(cmd, words), cmd),
         },
     }
 }
@@ -2232,7 +2234,7 @@ fn search(name: &str, spec: &Searcher, args: &[Arg], cmd: &Cmd, xargs: bool) -> 
     let recursive_flag = spec
         .recursive
         .is_some_and(|flags| p.has_any(flags) || directories_recurse(args));
-    let stdin_fed = cmd.piped || cmd.here;
+    let stdin_fed = cmd.piped || cmd.here || cmd.feed == Feed::Connected;
     if recursive_flag || xargs || (spec.recursive.is_none() && !stdin_fed) {
         return Outcome::Deny(rule);
     }
@@ -2917,11 +2919,11 @@ const INFO_FLAGS: &[&str] = &[
 
 /// Routes a command that is not an inline interpreter to the debugger, make, sqlite3, or stdin
 /// REPL rules. `env` holds the `NAME=value` words that set the command's environment.
-fn stdin_reader(name: &str, args: &[Arg], env: &[&Arg]) -> Outcome {
+fn stdin_reader(name: &str, args: &[Arg], env: &[&Arg], cmd: &Cmd) -> Outcome {
     let stem = name.trim_end_matches(|c: char| c.is_ascii_digit() || matches!(c, '.' | '-'));
     match stem {
-        "gdb" | "rust-gdb" | "gdb-multiarch" => debugger(&GDB, args),
-        "lldb" | "rust-lldb" => debugger(&LLDB, args),
+        "gdb" | "rust-gdb" | "gdb-multiarch" => debugger(&GDB, args, cmd),
+        "lldb" | "rust-lldb" => debugger(&LLDB, args, cmd),
         "make" | "gmake" if make_evals(args) || env.iter().any(|a| make_runs_code(&a.text)) => {
             Outcome::Deny(MAKE_EVAL)
         }
@@ -3148,8 +3150,9 @@ fn debugger_option<'t>(spec: &Debugger, t: &'t str) -> Option<(DebugOpt, Option<
 /// gdb and lldb read commands from stdin unless `-batch` stops them. A command option can run a
 /// shell command, which the rules reparse, or a script or meta command, which denies. The rules
 /// check the program and its arguments like any other command.
-fn debugger(spec: &Debugger, args: &[Arg]) -> Outcome {
+fn debugger(spec: &Debugger, args: &[Arg], cmd: &Cmd) -> Outcome {
     let mut scripts: Vec<String> = Vec::new();
+    let mut launches = false;
     let mut program: Vec<Arg> = Vec::new();
     let (mut batched, mut info) = (false, false);
     let mut i = 0;
@@ -3222,6 +3225,10 @@ fn debugger(spec: &Debugger, args: &[Arg]) -> Outcome {
                     Ok(None) => {}
                     Err(rule) => return Outcome::Deny(rule),
                 }
+                let (head, rest) = first_word(value.text.trim_start());
+                let (sub, _) = first_word(rest);
+                launches |= runs_program(head)
+                    || (!spec.gdb && abbrev(head, "process", 3) && abbrev(sub, "launch", 1));
             }
         }
     }
@@ -3236,6 +3243,7 @@ fn debugger(spec: &Debugger, args: &[Arg]) -> Outcome {
     if program.is_empty() {
         return scripts;
     }
+    let authored = Cell::new(false);
     let run = Cmd {
         words: &program,
         assigns: &[],
@@ -3243,9 +3251,13 @@ fn debugger(spec: &Debugger, args: &[Arg]) -> Outcome {
         here: false,
         capture: Capture::Deny,
         feed: Feed::Unknown,
-        authored: &Cell::new(false),
+        authored: &authored,
     };
-    either(check(&run), scripts)
+    let checked = check(&run);
+    if launches && authored.get() {
+        cmd.authored.set(true);
+    }
+    either(checked, scripts)
 }
 
 /// Debugger commands that run a script or a shell, define or rename commands, read a command
@@ -3365,10 +3377,14 @@ fn apply_body(text: &str) -> &str {
     }
 }
 
+fn runs_program(head: &str) -> bool {
+    abbrev(head, "run", 1) || matches!(head, "start" | "starti")
+}
+
 /// The command gives the program arguments or input. `run ARGS` passes them through a shell,
 /// and the rules check program arguments only after `--args` (gdb) or `--` (lldb).
 fn sets_program_input(head: &str, sub: &str, after: &str, rest: &str) -> bool {
-    let runs = abbrev(head, "run", 1) || matches!(head, "start" | "starti");
+    let runs = runs_program(head);
     let launches = abbrev(head, "process", 3) && abbrev(sub, "launch", 1);
     (runs && !rest.is_empty())
         || (launches && !after.trim().is_empty())

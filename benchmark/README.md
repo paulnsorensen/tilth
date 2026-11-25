@@ -254,6 +254,7 @@ Reflection and the `src/` proposer get a compact `attribution` record (coverage,
 The `attribution` key is separate from `scores`. The `module_selector` weights the next component by the parent's leading causes (`component_hint`), picks `src_patch` within the first 2 proposals, and leaves no component unselected for more than 10 proposals in a row (hint-weighted choice with a starvation bound and an early `src_patch` turn). Each pick, with its evidence and reason, goes to `log.txt`.
 Reflection (after `</new_text>`) and the proposer (after its edits) add one `<hypothesis>` block with `metric`, `scope`, `direction`, `tolerance` and `invariants`. The run stores it in `hypotheses.jsonl`, keyed by parent and child content id, and records `met`, `unmet` or `unmeasurable` after the child's paid dev tier. Later calls see the last outcomes as a `hypothesis_feedback` record. A hypothesis never rejects a candidate and never changes a content id.
 `--replay-diagnostic N` (default 0, off) replays N seed dev cells against the seed and candidate binaries when a candidate changes `src_patch`. The `compare` result goes to `log.txt` and to later calls as a `replay` record. It never rejects a candidate and writes no result rows.
+Each run past preflight and the baseline purchase writes its entry to `<run_dir>/benchmark-entry.json` and opens its own ready PR that appends the entry to `benchmark/log/evolve.jsonl` and redraws `benchmark/log/evolve.svg` and `evolve-dark.svg`. `--benchmark-log PATH` writes to a local log and opens no PR; see [Benchmark log](evolve/README.md#benchmark-log).
 
 ```bash
 python3 benchmark/evolve/cli.py --panel benchmark/panels/gepa-v1.json --seed-sha "$(git rev-parse HEAD)" \
@@ -269,7 +270,8 @@ When that remote-tracking ref does not exist, the run checks the local branch.
 `--cell-budget-usd` sets the Claude `--max-budget-usd` of every cell in the run: seed, candidate, baseline, and finish cells (default: `1.0`, the `run.py` default).
 The value must be a positive finite number; the run refuses any other value before a paid call.
 The per-cell budget is part of each cell's run key, so a run at one budget does not reuse rows bought at another budget, and it buys its baselines again.
-A stronger model, such as `sonnet`, costs more per token, so give it a larger budget than `haiku`: at `$1` many external cells stop with `error_max_budget_usd`.
+Evolve accepts only a Sonnet agent model: `--model` takes the Claude names in `run.MODELS` whose model is a Sonnet, and the default is `sonnet`. Any other model is a usage error (exit 2).
+Sonnet costs more per token than `haiku`, so give it a larger budget: at `$1` many external cells stop with `error_max_budget_usd`.
 `--cell-estimate-usd` defaults to `--cell-budget-usd`, so the finish reserve and a cell with no stored cost are estimated at the full per-cell budget.
 Evolve runs strict by default (`--no-strict-file-tools` opts out), and its strict hooks run with `--allow-capture` (`--no-allow-capture` opts out); see [evolve/README.md](evolve/README.md) for the seed-hook preflight and the hook gate.
 A panel row from `run.py --panel` has the same key only when that run passed `--bare` and the same `--max-budget-usd`, passed `--strict-file-tools` with its hook commit equal to the evolve `--seed-sha`, passed `--allow-capture` (unless the evolve run passed `--no-allow-capture`), and did not pass `--reasoning-effort`.

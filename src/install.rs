@@ -311,7 +311,12 @@ fn build_hook_invocation(
     } else {
         path
     };
-    for word in extra_args.iter().map(String::as_str).chain(tail) {
+    // A scoped npm package name starts with `@`, which PowerShell reads as splatting.
+    for word in extra_args {
+        command.push(' ');
+        command.push_str(&shell_quote(word)?);
+    }
+    for word in tail {
         command.push(' ');
         command.push_str(word);
     }
@@ -382,15 +387,89 @@ fn push_words(invocation: &mut HookInvocation, words: &[&str]) {
 /// Whether an existing tilth hook command anywhere in `config` has `--allow-capture`, so a
 /// reinstall keeps a user's choice.
 fn existing_allow_capture(config: &Value, own_prefix: &str) -> bool {
-    let own = handler_line(config).filter(|c| is_tilth_hook_command(c, own_prefix));
-    if own.is_some_and(|line| line.split_whitespace().any(|w| w == ALLOW_CAPTURE)) {
-        return true;
+    if handler_line(config).is_some_and(|c| is_tilth_hook_command(&c, own_prefix)) {
+        if let Some(words) = shell_handler_words(config) {
+            let hook = words.iter().position(|word| word == "hook");
+            if let Some(hook) =
+                hook.filter(|&i| i == 1 || (i == 2 && matches!(words[0].as_str(), "npx" | "node")))
+            {
+                if words.get(hook + 1).is_some_and(|word| word == "--host")
+                    && words.get(hook + 2).is_some_and(|word| !word.is_empty())
+                {
+                    let mut options = words[hook + 3..].iter();
+                    while let Some(option) = options.next() {
+                        match option.as_str() {
+                            ALLOW_CAPTURE => return true,
+                            "--hint" => {
+                                if options
+                                    .next()
+                                    .is_none_or(|value| value.parse::<crate::hook::Hint>().is_err())
+                                {
+                                    break;
+                                }
+                            }
+                            option if option.starts_with("--hint=") => {
+                                if option[7..].parse::<crate::hook::Hint>().is_err() {
+                                    break;
+                                }
+                            }
+                            _ => break,
+                        }
+                    }
+                }
+            }
+        }
     }
     match config {
         Value::Object(map) => map.values().any(|v| existing_allow_capture(v, own_prefix)),
         Value::Array(items) => items.iter().any(|v| existing_allow_capture(v, own_prefix)),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => false,
     }
+}
+
+/// Read literal words without executing shell text. Reject operators and expansions.
+fn shell_handler_words(handler: &Value) -> Option<Vec<String>> {
+    let command = handler.get("command")?.as_str()?;
+    if let Some(args) = handler.get("args") {
+        let mut words = vec![command.to_string()];
+        for arg in args.as_array()? {
+            words.push(arg.as_str()?.to_string());
+        }
+        return Some(words);
+    }
+    let command = command.trim_start();
+    let command = command.strip_prefix("& ").unwrap_or(command);
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut started = false;
+    for ch in command.chars() {
+        match ch {
+            '\'' | '"' if quote.is_none() => {
+                quote = Some(ch);
+                started = true;
+            }
+            '\'' | '"' if quote == Some(ch) => quote = None,
+            ';' | '|' | '&' | '<' | '>' | '(' | ')' | '$' | '`' | '\n' | '\r' => return None,
+            c if c.is_whitespace() && quote.is_none() => {
+                if started {
+                    words.push(std::mem::take(&mut word));
+                    started = false;
+                }
+            }
+            _ => {
+                word.push(ch);
+                started = true;
+            }
+        }
+    }
+    if quote.is_some() {
+        return None;
+    }
+    if started {
+        words.push(word);
+    }
+    Some(words)
 }
 
 /// The `tilth hook` option that lets a command capture its own output.
@@ -768,24 +847,47 @@ fn write_toml_config(host_info: &HostInfo) -> Result<(), String> {
 
 /// Returns (command, args) for the tilth MCP server entry.
 fn tilth_command_and_args() -> (String, Vec<String>) {
-    let mcp_args: Vec<String> = vec!["--mcp".into()];
+    let exe = std::env::current_exe().ok();
+    command_and_args_for(exe.as_ref().and_then(|p| p.to_str()))
+}
 
-    let via_npm = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.to_str().map(|s| s.contains("node_modules")))
-        .unwrap_or(false);
-
-    if via_npm {
-        let mut args = vec!["tilth".to_string()];
-        args.extend(mcp_args);
-        ("npx".into(), args)
-    } else {
-        let command = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.to_str().map(String::from))
-            .unwrap_or_else(|| "tilth".into());
-        (command, mcp_args)
+/// The MCP entry for the binary at `exe`. A binary inside `node_modules` runs as
+/// `npx <package>`, where `<package>` is the npm package that holds the binary, so the host
+/// runs code from the same publisher. Any other binary runs by its absolute path.
+fn command_and_args_for(exe: Option<&str>) -> (String, Vec<String>) {
+    let mcp_args = vec!["--mcp".to_string()];
+    let Some(exe) = exe else {
+        return ("tilth".into(), mcp_args);
+    };
+    match npm_package_name(exe) {
+        Some(package) => ("npx".into(), vec![package, "--mcp".into()]),
+        None => (exe.to_string(), mcp_args),
     }
+}
+
+/// The npm package name from the path segments after the last `node_modules` component.
+/// A scoped name (`@scope/name`) takes two segments. `None` when the path has no
+/// `node_modules` component or the segments do not make a valid npm package name.
+fn npm_package_name(path: &str) -> Option<String> {
+    let segments: Vec<&str> = path.split(['/', '\\']).collect();
+    let at = segments.iter().rposition(|s| *s == "node_modules")?;
+    let first = *segments.get(at + 1)?;
+    if let Some(scope) = first.strip_prefix('@') {
+        let name = *segments.get(at + 2)?;
+        return (is_npm_name_part(scope) && is_npm_name_part(name))
+            .then(|| format!("{first}/{name}"));
+    }
+    is_npm_name_part(first).then(|| first.to_string())
+}
+
+/// One part of an npm package name: lowercase, URL-safe, and not starting with `.`, `_`, or
+/// `-`. A leading `-` would make `npx` read the name as an option.
+fn is_npm_name_part(part: &str) -> bool {
+    !part.is_empty()
+        && !part.starts_with(['.', '_', '-'])
+        && part
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "-._~".contains(c))
 }
 
 #[derive(Debug)]
@@ -2509,18 +2611,96 @@ mod tests {
 
     #[test]
     fn npx_hook_is_shell_form_and_replaces_stale_exec_entry() {
-        let args = vec!["tilth".to_string()];
+        let args = vec!["@paulnsorensen/tilth-nightly".to_string()];
         let ok = exec_form_applies(true, "npx", true);
         let inv = build_hook_invocation(ok, true, "claude", "npx", &args).unwrap();
-        assert_eq!(inv.command, "npx tilth hook --host claude");
+        assert_eq!(
+            inv.command,
+            "npx '@paulnsorensen/tilth-nightly' hook --host claude"
+        );
         assert!(inv.args.is_none());
-        let stale_exec = "npx tilth hook --host claude";
+        let stale_exec = "npx @paulnsorensen/tilth-nightly hook --host claude";
         assert!(is_tilth_hook_command(stale_exec, &inv.own_prefix));
+        assert!(is_tilth_hook_command(&inv.command, &inv.own_prefix));
+        assert!(is_tilth_hook_command(
+            "npx tilth hook --host claude",
+            &inv.own_prefix
+        ));
         let native = build_hook_invocation(true, false, "claude", "/a/tilth", &[]).unwrap();
         assert!(is_tilth_hook_command(
             &native.line(),
             "/a/tilth hook --host "
         ));
+    }
+
+    #[test]
+    fn npm_install_entry_names_the_scoped_package_it_runs_from() {
+        let exe = "/home/u/.npm/_npx/ab12/node_modules/@paulnsorensen/tilth-nightly/bin/tilth";
+        assert_eq!(
+            command_and_args_for(Some(exe)),
+            (
+                "npx".to_string(),
+                vec![
+                    "@paulnsorensen/tilth-nightly".to_string(),
+                    "--mcp".to_string()
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn npm_install_entry_names_the_unscoped_package_it_runs_from() {
+        let exe = "/usr/lib/node_modules/tilth/bin/tilth";
+        assert_eq!(
+            command_and_args_for(Some(exe)),
+            (
+                "npx".to_string(),
+                vec!["tilth".to_string(), "--mcp".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn npm_install_entry_reads_a_windows_path() {
+        let exe = r"C:\Users\u\AppData\Roaming\npm\node_modules\@paulnsorensen\tilth-nightly\bin\tilth.exe";
+        assert_eq!(
+            command_and_args_for(Some(exe)),
+            (
+                "npx".to_string(),
+                vec![
+                    "@paulnsorensen/tilth-nightly".to_string(),
+                    "--mcp".to_string()
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn non_npm_install_entry_is_the_absolute_binary_path() {
+        let exe = "/home/u/.cargo/bin/tilth";
+        assert_eq!(
+            command_and_args_for(Some(exe)),
+            (exe.to_string(), vec!["--mcp".to_string()])
+        );
+    }
+
+    #[test]
+    fn npm_path_without_a_valid_package_name_falls_back_to_the_binary_path() {
+        for exe in [
+            "/x/node_modules/@scope",
+            "/x/node_modules/",
+            "/x/node_modules/Bad Name/bin/tilth",
+            "/x/node_modules/.bin/tilth",
+            "/x/node_modules/@/tilth/bin/tilth",
+            "/x/node_modules/--version/bin/tilth",
+            "/x/node_modules/@scope/-x/bin/tilth",
+        ] {
+            assert_eq!(
+                command_and_args_for(Some(exe)),
+                (exe.to_string(), vec!["--mcp".to_string()]),
+                "{exe}"
+            );
+        }
     }
 
     #[test]
@@ -2743,6 +2923,139 @@ mod tests {
         let lines = all_commands(&read_json(&path));
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(lines[0].ends_with("claude --allow-capture"), "{lines:?}");
+    }
+
+    #[test]
+    fn reinstall_keeps_literal_quoted_capture_in_shell_form() {
+        for command in [
+            "'/old dir/tilth' hook --host claude '--allow-capture'",
+            "\"/old dir/tilth\" hook --host claude \"--allow-capture\"",
+            "& 'C:/old dir/tilth.exe' hook --host claude '--allow-capture'",
+            "npx @paulnsorensen/tilth hook --host claude '--allow-capture'",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let path = seed(
+                home.path(),
+                ".codex/hooks.json",
+                &json!({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+                    {"type":"command","command":command}]}]}})
+                .to_string(),
+            );
+            install_hook("codex", home.path()).unwrap();
+            let lines = all_commands(&read_json(&path));
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert!(lines[0].ends_with("claude --allow-capture"), "{lines:?}");
+        }
+    }
+
+    #[test]
+    fn reinstall_keeps_only_separate_exec_capture_argument() {
+        for (args, expected) in [
+            (json!(["hook", "--host", "claude", "--allow-capture"]), true),
+            (
+                json!([
+                    "hook",
+                    "--host",
+                    "claude",
+                    "--hint",
+                    "tilth",
+                    "--allow-capture"
+                ]),
+                true,
+            ),
+            (
+                json!([
+                    "hook",
+                    "--host",
+                    "claude",
+                    "--hint=tilth",
+                    "--allow-capture"
+                ]),
+                true,
+            ),
+            (
+                json!(["hook", "--host", "claude", "--hint=bad", "--allow-capture"]),
+                false,
+            ),
+            (
+                json!(["hook", "--host", "claude", "prefix --allow-capture"]),
+                false,
+            ),
+            (
+                json!(["hook", "--host", "claude", "--hint", "--allow-capture"]),
+                false,
+            ),
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let path = seed(
+                home.path(),
+                ".claude/settings.json",
+                &json!({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+                    {"type":"command","command":"/old/tilth","args":args}]}]}})
+                .to_string(),
+            );
+            install_hook("claude-code", home.path()).unwrap();
+            let cfg = read_json(&path);
+            let handler = &cfg["hooks"]["PreToolUse"][0]["hooks"][0];
+            let args = handler["args"].as_array().unwrap();
+            assert_eq!(
+                args.iter().any(|arg| arg == "--allow-capture"),
+                expected,
+                "{handler}"
+            );
+        }
+    }
+
+    #[test]
+    fn reinstall_keeps_exec_capture_with_space_in_binary_path() {
+        let home = tempfile::tempdir().unwrap();
+        let path = seed(
+            home.path(),
+            ".claude/settings.json",
+            &json!({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+                {"type":"command","command":"/old dir/tilth",
+                 "args":["hook","--host","claude","--allow-capture"]}]}]}})
+            .to_string(),
+        );
+        install_hook("claude-code", home.path()).unwrap();
+        let cfg = read_json(&path);
+        let handler = &cfg["hooks"]["PreToolUse"][0]["hooks"][0];
+        assert!(
+            handler["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--allow-capture"),
+            "{handler}"
+        );
+    }
+
+    #[test]
+    fn reinstall_does_not_take_capture_from_shell_data_or_another_command() {
+        for command in [
+            "/old/tilth hook --host claude --hint '--allow-capture'",
+            "/old/tilth hook --host claude '--allow-capture payload'",
+            "/old/tilth hook --host claude; other --allow-capture",
+            "other --allow-capture; /old/tilth hook --host claude",
+            "/old/tilth hook --host claude && other --allow-capture",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let path = seed(
+                home.path(),
+                ".codex/hooks.json",
+                &json!({"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[
+                    {"type":"command","command":command}]}]}})
+                .to_string(),
+            );
+            install_hook("codex", home.path()).unwrap();
+            let lines = all_commands(&read_json(&path));
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.ends_with("claude --allow-capture")),
+                "{command}: {lines:?}"
+            );
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 """Evolve tilth: a GEPA search over instruction texts and ``src/**`` patches, scored by cost per correct.
 
     python3 benchmark/evolve/cli.py --panel benchmark/panels/gepa-v1.json --seed-sha SHA \\
-        --max-usd 200 --max-metric-calls 60 [--base-branch main] [--model haiku] [--replay-diagnostic N] \\
+        --max-usd 200 --max-metric-calls 60 [--base-branch main] [--model sonnet] [--replay-diagnostic N] \\
         [--preamble]
 
 Every candidate is a local commit on the seed; the winner, when it is not the
@@ -32,7 +32,7 @@ import panels  # noqa: E402
 import run  # noqa: E402
 import tmp_aging  # noqa: E402
 from config import REPO_ROOT  # noqa: E402
-from evolve import deepdiag, diagnosis, directives, failures, rust  # noqa: E402
+from evolve import benchlog, deepdiag, diagnosis, directives, failures, logpr, rust  # noqa: E402
 from evolve.candidate import SeedError, read_seed  # noqa: E402
 from evolve.finish import GitHubPRClient, PRClient  # noqa: E402
 from evolve.gitops import GitError, git  # noqa: E402
@@ -118,8 +118,9 @@ def _parser() -> argparse.ArgumentParser:
                              "branch when there is no remote-tracking ref (default: main)")
     # Candidates run under the strict Bash hook, which only the claude runner wires in evolve; a Codex
     # tilth-only arm enforces its restriction through the catalog and the pinned hook, not through this path.
-    claude_models = sorted(name for name in run.MODELS if run.RUNNERS[name] == "claude")
-    parser.add_argument("--model", default="haiku", choices=claude_models, help="agent model for every cell")
+    # The benchmark log compares runs, so every evolve run uses a Sonnet model.
+    parser.add_argument("--model", default="sonnet", choices=benchlog.sonnet_models(),
+                        help="Sonnet agent model for every cell (default sonnet)")
     parser.add_argument("--reruns", type=int, default=3, help="re-runs R before a candidate is accepted (default 3)")
     parser.add_argument("--cell-retries", type=int, default=2, metavar="N",
                         help="re-run a cell that did not complete (crash, infra, timeout) up to N more times per "
@@ -184,6 +185,10 @@ def _parser() -> argparse.ArgumentParser:
                              "run's log.txt must record the same --seed-sha: a verdict holds only on its own seed, so "
                              "a log that records another seed or no seed is refused")
     parser.add_argument("--run-id", default=datetime.now().strftime("%Y%m%d-%H%M%S"))
+    parser.add_argument("--benchmark-log", type=Path, default=None, metavar="PATH",
+                        help="append this run's entry to the log at PATH, draw its charts next to it, and open no "
+                             "PR; without it, the run opens its own PR that adds the entry to "
+                             "benchmark/log/evolve.jsonl on --base-branch")
     parser.add_argument("--repo", type=Path, default=REPO_ROOT, help=argparse.SUPPRESS)
     return parser
 
@@ -209,7 +214,8 @@ def build(argv: list[str] | None = None, *,
           pr_client: PRClient | None = None, just_check: Callable[[Path], tuple[bool, str]] | None = None,
           spawn: Callable | None = None, auth_spawn: Callable | None = None,
           deep_runner: deepdiag.Runner | None = None,
-          cargo: Callable[[Path, list[str]], tuple[bool, str]] | None = None) -> Evolution | int:
+          cargo: Callable[[Path, list[str]], tuple[bool, str]] | None = None,
+          log_client: logpr.LogClient | None = None) -> Evolution | int:
     """Validate the flags and build the run, or return an exit code; no model call happens here."""
     args = _parser().parse_args(argv)
     if args.max_usd is None:
@@ -258,6 +264,11 @@ def build(argv: list[str] | None = None, *,
     if args.finish_reserve_usd is not None and (not math.isfinite(args.finish_reserve_usd)
                                                 or args.finish_reserve_usd < 0):
         return _error("--finish-reserve-usd must be a finite number of at least 0")
+    if args.benchmark_log is not None:
+        try:
+            benchlog.chart_paths(args.benchmark_log)
+        except ValueError as error:
+            return _error(f"--benchmark-log: {error}")
     if args.max_unselected < len(seed) - 1:
         return _error(f"--max-unselected must be at least {len(seed) - 1}, one less than the {len(seed)} "
                       "components, or a component can wait past its bound")
@@ -310,11 +321,12 @@ def build(argv: list[str] | None = None, *,
         deep_diagnosis_max=args.deep_diagnosis_max, deep_diagnosis_timeout=args.deep_diagnosis_timeout,
         finish_reserve_usd=args.finish_reserve_usd, max_unselected=args.max_unselected,
         src_patch_by=args.src_patch_by, avoid_failures_from=tuple(args.avoid_failures_from),
+        benchmark_log=args.benchmark_log,
     )
     return Evolution(settings, panel=panel, ledger=ledger, judge_=factory(ledger, args.cell_estimate_usd), seed=seed,
                      pr_client=pr_client or GitHubPRClient(repo), just_check=just_check or default_just_check,
                      spawn=spawn or subprocess.run, deep_runner=deep_runner,
-                     cargo=cargo)
+                     cargo=cargo, log_client=log_client or logpr.GitHubLogClient(repo))
 
 
 INTEGRITY_OFF = ("WARNING: the integrity stage is OFF: a custom just_check was injected without a cargo runner, so the "

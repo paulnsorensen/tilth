@@ -327,3 +327,101 @@ deletes the seed's directory (the seed binary is the hook binary for every cell)
 
 Every strict cell replays each Bash call through the seed hook. A cell that ran a call the seed hook
 denies raises `HookLoosenedError`. A candidate therefore cannot loosen the hook to win cells.
+
+## Benchmark log
+
+Every run that passes preflight and buys its baselines builds one entry for the benchmark log at its end. A run
+that preflight or the baseline purchase refuses has no result and writes no entry. The log includes a run that finds
+no improvement, ends incomplete, or fails in finish. `Evolution.benchmark_entry` builds the entry from the run's
+own state: its settings, panel, seed and frontier cascades, spend totals, arms, and the result record that finish
+fills. The run writes the entry to `<run_dir>/benchmark-entry.json`. A value the run did not reach is `null`.
+
+An interrupt or an uncaught error ends a run with no finish result (`outcome` is `null`). That run writes its
+entry file, appends nothing, and opens no PR. Its log line names the `publish` command for a manual publish.
+
+By default, the run then opens its own PR for the log:
+
+1. It fetches `origin/<base-branch>` and adds a temporary detached worktree at that commit, outside the repository.
+2. It appends the entry to that tree's `benchmark/log/evolve.jsonl` and redraws `benchmark/log/evolve.svg`
+   (light) and `benchmark/log/evolve-dark.svg` (dark) with the running code.
+3. It commits (`chore(benchmark): log evolve run <run-id>`), pushes branch `benchmark-log/<run-id>`, and opens a
+   ready PR against the base branch.
+4. It removes the temporary worktree and writes `benchmark log: opened <url> from benchmark-log/<run-id>`.
+
+The checkout that runs evolve keeps its tracked `benchmark/log/` files unchanged. The tool never merges a PR. The
+log is append-only: a run never rewrites an earlier line. The top README embeds both charts.
+
+A publish fault (no network, a branch that exists, a refused push, a `gh` failure) writes one
+`benchmark log: <step> failed (...)` line to `log.txt`. It keeps `benchmark-entry.json`, removes the temporary
+worktree, and does not change the exit code or the finish result. To publish the entry again:
+
+```bash
+python3 benchmark/evolve/benchlog.py publish RUN_DIR             # open the log PR for RUN_DIR/benchmark-entry.json
+python3 benchmark/evolve/benchlog.py publish RUN_DIR --replace   # rebuild this run's own log PR on the new base
+python3 benchmark/evolve/benchlog.py redraw                      # redraw both charts from the committed log
+```
+
+Without `--replace`, a `benchmark-log/<run-id>` branch on the remote is an error that names the flag. Each open
+log PR appends a line to the same file, and GitHub does not apply `merge=union`, so a log PR conflicts when another
+one lands first. Run `publish RUN_DIR --replace` for the PR that conflicts. It rebuilds the commit on the new base,
+overwrites the run's own branch with `--force-with-lease`, and keeps the open PR.
+
+`--benchmark-log PATH` keeps the local mode: the run appends the entry to PATH, redraws the charts next to it, and
+opens no PR. A PATH that ends in `.svg` is a usage error, because the light chart takes that path. A log whose last
+line has no newline gets one before the new entry. A log or chart fault there writes the same
+`benchmark log: <step> failed (...)` line. The test suite gives every run an offline log client, and a session
+fixture checks that no test changes the committed `benchmark/log/`.
+
+A resumed run builds a new entry and publishes a second entry for its run id. The log keeps both lines. The chart
+shows the last entry of each run id (`benchlog.latest`).
+
+The log holds Sonnet runs only, so its runs compare. `cli.py --model` accepts only the Claude names in
+`run.MODELS` whose model is a Sonnet (`benchlog.sonnet_models`), and the default is `sonnet`. Any other model is a
+usage error (exit 2) that names the Sonnet choices. The helper model of reflection and the proposer does not
+change.
+
+| Field | Value |
+|---|---|
+| `schema` | `2` |
+| `run_id` | The run directory name (`--run-id`). |
+| `recorded_at` | UTC time of the entry build (`YYYY-MM-DDTHH:MM:SSZ`). |
+| `seed_sha` | The seed commit (`--seed-sha`). |
+| `tilth_version` | The version that the seed build reports, with its `+<sha>` build suffix: the one `tilth_version` of the seed's rows; `null` when they hold none or several. |
+| `panel`, `model`, `preamble` | The task panel name, `--model`, and `--preamble`. |
+| `model_id` | The one `resolved_model` of the run's rows, the model id that the alias resolved to; `null` when the rows hold none or several. |
+| `stop_reason` | The stop reason, else `metric-call budget` when the search used its metric calls. |
+| `outcome` | The finish result: `pr_opened`, `no_improvement`, `incomplete`, `refused` (finish refused the winner or its push), `failed` (the run failed), or `pr_failed` (the push worked, the draft PR did not). |
+| `seed_dev_mean` | The seed's dev-split mean score. |
+| `best_cid`, `best_dev_mean` | The accepted non-seed candidate with the best dev mean (12-character content id). |
+| `test_means` | Test-split pass rate per finalist content id, when finish compared them. |
+| `paired_test_delta` | `{point, low, high, tasks}`: winner minus seed per-task score, with its 95% CI. |
+| `pass_rate_delta` | Winner minus seed test pass rate. |
+| `arms` | `{dev, test}`. Each split is `{baseline, seed, best}`, and each arm is `{pass_rate, mean_cost_usd, cost_per_correct_usd, cells}` or `null`. `test` is `null` unless finish compared the finalists. |
+| `spend` | `{cells, judge, reflection, proposer, total, max_usd}` in USD, the values of the `spend:` line. |
+| `pr_url` | The draft winner PR URL when finish opened one. |
+
+The test means, the paired delta, and the pass-rate delta keep three decimals, as the `finish:` lines show them.
+
+An arm is the baseline (built-in tools, no tilth), the seed, or `best`: the accepted non-seed candidate with the
+best dev mean, which is also the finish winner. An arm counts only completed cells: a cell with an infra failure,
+a timeout, or an error that is not a budget cap is no verdict on the arm. `cells` is that count, and `pass_rate`
+is the correct cells over it. `mean_cost_usd` is the mean row cost per cell. `cost_per_correct_usd` is the total
+cost over the correct count, and it is `null` when no cell is correct. Correctness and cost come from
+`loop.correct` and `loop.row_cost`, the helpers that the score uses. The dev arms use the rows that each arm
+scored: the baseline plan rows of the dev tasks, and the seed and best rows with their re-runs. The test arms use
+the paired rows that finish compared, after it drops an incomplete task.
+
+A score of 1.0 is cost-per-correct parity with the baseline (see [Score and finish rule](#score-and-finish-rule)).
+The chart shows the seed and winner dev means per run against a dashed parity line at 1.0. A green ring marks a
+run that opened a draft PR. A band is a sequence of runs with one panel and one model (`model_id`, else
+`model`). Scores from different bands do not compare, and `sonnet` can resolve to a new model over time. A dotted
+divider separates the bands, each band has its panel and model above its runs, and no line joins two bands. A
+middle panel shows the paired test delta with its 95% CI. A table under the chart has one row per band. It shows
+the dev-split pass rate and cost per correct answer of `baseline (no tilth)`, `tilth seed`, and `tilth winner`.
+The numbers come from the latest run of the band with a baseline arm, and the row names that run. An arm without
+numbers shows `not recorded`. The chart uses only the standard library, and the same log gives the same bytes.
+
+The first 12 entries came from a one-time import of old run directories, before runs built their entry from
+memory. Their seed and best arms come from the stored rows of exact commits: the `run seed:` commit, the
+`refs/evolve/<run-id>/<cid>` ref of a finalist, the one non-seed commit with test-split rows, or the pushed
+`evolve/<run-id>-winner` branch. Without such a commit, the arm is `null`, and the table shows `not recorded`.

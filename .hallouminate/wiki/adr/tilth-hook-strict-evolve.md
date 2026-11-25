@@ -157,7 +157,7 @@ The user asked for the flag as the default of the evolve benchmarks. A strict ce
 
 - `run.set_hook_capture` is one switch for the process. `_hook_options` adds `--allow-capture` to the cell hook (`_strict_bash_settings`), the Codex hook (`_codex_hook_config`), the seed replay, and the probes (`_run_hook`). All of them must agree: a replay with other options than the cell hook reports a false `hook_loosened`.
 - `Evolution.__init__` turns the switch on when the run is strict and `Settings.allow_capture` is true (the default). `--no-allow-capture` turns it off. `run.py` keeps it off unless it gets `--allow-capture`: only the evolve default has user approval.
-- The flag is in the argv of each hooked cell, so the command template and the run key change. No new key field is necessary, and capture cells never share a row with strict cells. A `run.py --panel` row matches an evolve row only with `--allow-capture`.
+- The flag changes the command template and run key for hooked cells. The frozen stock slot also compares `hook_capture`; old rows without it count as strict. A `run.py --panel` row matches a capture-enabled evolve row only with `--allow-capture`.
 - `hookgate.corpus_failures` checks the mode of the cells. With the flag, the `allow_capture` section holds, and each default row holds too, except that a default `must_deny` row that `allow_capture.must_allow` lists must pass. The seed preflight and the candidate hook gate both use it.
 - The gate does not replay the other mode. `just check` runs before the gate and holds each candidate to the corpus in both modes through the Rust tests. A replay of both modes made each gate about 2.4 times slower, because the test fakes are Python scripts.
 - F-5 changes in one point: the floor for a candidate hook in an evolve run is the seed hook with `--allow-capture`, not the seed hook in its default mode. The two F-5 checks stay: the corpus gate and the `hook_loosened` replay.
@@ -175,13 +175,13 @@ The rules with the flag:
 - An output redirect to a file passes when the command that owns it is not authored. The grammar puts the redirect of `a && b > f` and of `a | b > f` on the whole list or pipeline. The walk gives it to the last command, as the shell does (`Authored::last`). A compound owner (`{ }`, `( )`, a loop) is authored when one command in it is. Shell source that the owner runs (`bash -c`, `eval`) counts too.
 - `cmd | tee FILE` passes when a real command feeds `tee`. `printf x | tee f`, `tee f <<EOF`, and `tee f` with no pipe deny.
 - Output to a stream device passes with any writer (`echo warn > /dev/stderr`). `is_stream_target` wants a literal path without `..`.
-- A reader or a searcher can read a pseudo-file (`is_pseudo_file`): `/dev/null`, or a literal path under `/proc` or `/sys`. An input redirect from a pseudo-file passes too.
+- A permitted pseudo-file is `/dev/null` or a literal path under `/proc` or `/sys` that passes `is_pseudo_file`. A redirect to descriptor zero connects stdin only for the pipeline stage that owns it. It does not prove a real writer. The explicit recursive-searcher operand exception below still applies.
 - `tail` with `-f`, `-F`, or `--follow` passes. `--retry` alone does not.
 - `curl -o`, `--output`, `-O`, `--remote-name`, and `--remote-name-all` pass. `-D`, `-c`, `--trace`, and `--stderr` stay denied.
 
 Gotchas found during the work:
 
-- A heredoc statement has two grammar quirks. The file redirects of `a <<EOF > f` and the pipeline tail of `a <<EOF | b` are children of the `heredoc_redirect` node. The walk gives the redirects to `a`, and it gives the pipeline tail the output of `a` as its feed. The heredoc of `a | b <<EOF` is on the whole pipeline, and the walk gives it to `b`.
+- A heredoc statement has two grammar quirks. The file redirects of `a <<EOF > f` and the pipeline tail of `a <<EOF | b` are children of the `heredoc_redirect` node. The walk gives the redirects to `a` and connects its stdout to the tail. The last command in the tail determines what reaches stdout. Comments are not pipeline stages. The heredoc of `a | b <<EOF` belongs to `b`.
 - Lexical `..` removal is wrong after a link: the kernel resolves `/proc/self/cwd/../x` from the target of `cwd`. `is_pseudo_file` and `is_stream_target` refuse every path with a `..` segment.
 - A glob can hide a link name (`/proc/self/cw?/f`), so `is_pseudo_file` refuses glob and brace characters.
 - `is_device` also matches `NAME=/dev/stdout`. A redirect target of that form is a real file, so the stream rule uses `is_stream_target`, not `is_device`.
@@ -202,3 +202,5 @@ Open gaps with the flag (accepted):
 - Retiring `scripts/tilth-bash-guard`.
 - The wozcode strict arm gets native-tool deny hints it cannot use.
 - Policy gaps outside the named rules: top-level `$c f`, `docker run` (tool runners closed 2026-11-22, see above), `git blame`, `busybox`, `find -fprint`, `parallel` and other shell-string runners, `awk` programs that build file names or commands at run time, `sed` scripts read with `-f`.
+
+_Source for stdin ownership: [PR #474](https://github.com/paulnsorensen/tilth/pull/474), `src/hook/walk.rs` · Updated: 2026-11-25_

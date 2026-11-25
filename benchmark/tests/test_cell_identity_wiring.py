@@ -94,6 +94,9 @@ def test_hook_source_key_feeds_only_the_strict_key(hook_source: dict) -> None:
 def test_allow_capture_changes_each_hooked_key_and_no_plain_key() -> None:
     """The flag is in the argv of a hooked cell, so capture cells and strict cells never share a row."""
     strict_before, plain_before = _key(strict=True), _key()
+    plain_identity = run.cell_identity("wiring_task", "baseline", "sonnet5", 0, bare=False,
+                                       reasoning_effort=None, max_budget_usd=1.0,
+                                       strict_file_tools=False)
     forced_before, codex_before = _key(mode="tilth_forced", strict=True), _key(mode="tilth_forced", model="luna56")
 
     run.set_hook_capture(True)
@@ -102,10 +105,39 @@ def test_allow_capture_changes_each_hooked_key_and_no_plain_key() -> None:
     assert _key(mode="tilth_forced", strict=True) != forced_before
     assert _key(mode="tilth_forced", model="luna56") != codex_before
     assert _key() == plain_before
+    assert run.cell_identity("wiring_task", "baseline", "sonnet5", 0, bare=False,
+                             reasoning_effort=None, max_budget_usd=1.0,
+                             strict_file_tools=False) == plain_identity
     template = run._command_template(StoreTask(), run.MODES["baseline"], "baseline", "sonnet5", bare=True,
                                      reasoning_effort=None, max_budget_usd=1.0, strict_file_tools=True)
     settings = json.loads(template[template.index("--settings") + 1])
     assert settings["hooks"]["PreToolUse"][0]["hooks"][0]["args"] == ["hook", "--hint", "native", "--allow-capture"]
+
+
+@pytest.mark.parametrize("stored_capture, planned_capture", [(False, True), (True, False)])
+def test_hook_capture_has_its_own_frozen_slot(
+    stored_capture: bool, planned_capture: bool, tmp_path: Path,
+) -> None:
+    def stock_row() -> dict:
+        identity = run.cell_identity("wiring_task", "baseline", "sonnet5", 0, bare=False,
+                                     reasoning_effort=None, max_budget_usd=1.0,
+                                     strict_file_tools=True, hook_sha="h")
+        return {**identity, "task": "wiring_task", "model": run.MODELS["sonnet5"],
+                "mode": "baseline", "repetition": 0, "reasoning_effort": None, "correct": True}
+
+    run.set_hook_capture(stored_capture)
+    stored = stock_row()
+    if not stored_capture:
+        stored.pop("hook_capture")  # Historical strict rows lack this field.
+    path = tmp_path / "result_store.jsonl"
+    baselines.store(stored, path=path)
+    history = baselines.load_rows(path)
+    run.set_hook_capture(planned_capture)
+    planned = stock_row()
+
+    assert planned["run_key"] != stored["run_key"]
+    assert baselines.baseline_drift(planned, history) == []
+    assert baselines.baseline_drift({**stored, "run_key": "changed", "cli_version": "new"}, history) == ["cli_version"]
 
 
 def test_digest_carries_hook_source_key_and_not_the_python_guard() -> None:

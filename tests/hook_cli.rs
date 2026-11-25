@@ -186,6 +186,21 @@ fn allow_capture_corpus_rows_hold_through_the_binary_in_both_hint_modes() {
     }
 }
 
+#[test]
+fn capture_routes_pseudofile_input_to_its_command() {
+    for (command, capture_code) in [
+        ("rg pattern < /dev/null", 0),
+        ("rg pattern 0< /dev/null", 0),
+        ("rg pattern | rg pattern < /dev/null", 2),
+        ("rg pattern && rg pattern < /dev/null", 2),
+    ] {
+        let event = claude_event(command);
+        assert_eq!(run(&["hook"], &event, None).code, 2, "strict: {command}");
+        let out = run(&["hook", "--allow-capture"], &event, None);
+        assert_eq!(out.code, capture_code, "capture: {command}: {}", out.stderr);
+    }
+}
+
 /// Issue #470: each capture that the default mode denies has a decided verdict with
 /// `--allow-capture`, and content from a generator still denies.
 #[test]
