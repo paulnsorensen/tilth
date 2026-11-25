@@ -92,6 +92,8 @@ class Settings:
     helper_model: str = "sonnet"
     # Strict cells guard Bash with the hook: candidates run their own hook, the baseline runs the seed's.
     strict_file_tools: bool = True
+    # Strict hooks run with `--allow-capture`: a command can write its own output to a file.
+    allow_capture: bool = True
     # Seed cells that the replay diagnostic re-sends to the seed and candidate binaries; 0 turns it off.
     replay_diagnostic: int = 0
     # Seeded proposals, tried in order before the selector picks a component itself.
@@ -373,6 +375,8 @@ class Evolution:
                  cargo: Callable[[Path, list[str]], tuple[bool, str]] | None = None,
                  log_client: logpr.LogClient | None = None) -> None:
         self.settings = settings
+        # Before any cell identity: the flag is in the argv of each strict cell, so it is in the run key.
+        run.set_hook_capture(settings.strict_file_tools and settings.allow_capture)
         # Opens the run's benchmark log PR when ``settings.benchmark_log`` is None; None publishes nothing.
         self.log_client = log_client
         self.panel = panel
@@ -656,7 +660,8 @@ class Evolution:
         except (run.CandidateBuildFailed, ValueError, subprocess.SubprocessError, OSError) as error:
             return self.refuse(f"seed hook probe failed: {tail(str(error))}")
         self.new_cascade(self.seed).hook_ok = True  # the cascade must not rerun the corpus for the seed
-        self.log("hook: seed hook passes the frozen corpus and the hint-text probe in both hint modes")
+        modes = "in both hint modes" + (f" with {run.HOOK_CAPTURE_FLAG}" if run.hook_capture() else "")
+        self.log(f"hook: seed hook passes the frozen corpus and the hint-text probe {modes}")
         return None
 
     def preflight(self) -> int | None:

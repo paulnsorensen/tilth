@@ -3,6 +3,7 @@
 //!
 //! The guard reads one host pre-tool event, parses the shell command with `tree-sitter-bash`,
 //! and denies shell file reads, searches, and writes. It only denies; it never rewrites.
+//! With [`Capture::Allow`], a command can write its own output to a file.
 //! This module imports only `std`, `serde_json`, `tree_sitter`, and `tree_sitter_bash`.
 
 mod hints;
@@ -93,6 +94,37 @@ impl FromStr for Hint {
     }
 }
 
+/// Whether a command can write its own output to a file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Capture {
+    /// Every shell file write denies.
+    #[default]
+    Deny,
+    /// `--allow-capture`: a redirect or `tee` passes when a real command writes the content.
+    /// `curl -o`, `tail -f`, and reads of `/proc`, `/sys`, and `/dev/null` pass too. Content
+    /// from `echo`, `printf`, `cat`, or a here-document still denies.
+    Allow,
+}
+
+impl From<bool> for Capture {
+    /// Maps the `--allow-capture` flag to a capture policy.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tilth::hook::Capture;
+    ///
+    /// assert_eq!(Capture::from(true), Capture::Allow);
+    /// ```
+    fn from(allow: bool) -> Self {
+        if allow {
+            Self::Allow
+        } else {
+            Self::Deny
+        }
+    }
+}
+
 /// The guard's decision for one command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
@@ -107,41 +139,38 @@ pub enum Verdict {
 
 /// Decide one shell command. A parse with an `ERROR` node denies.
 #[must_use]
-pub fn verdict(command: &str, hint: Hint) -> Verdict {
-    match walk::check(command) {
+pub fn verdict(command: &str, hint: Hint, capture: Capture) -> Verdict {
+    match walk::check(command, capture) {
         None => Verdict::Allow,
-        Some(rule) => Verdict::Deny {
-            rule,
-            reason: hints::reason(rule, hint),
-        },
+        Some(rule) => deny(rule, hint, capture),
     }
 }
 
 /// Evaluates a host event, denying malformed JSON or an invalid shell-event shape.
-fn event_verdict(host: Host, hint: Hint, input: &str) -> Verdict {
+fn event_verdict(host: Host, hint: Hint, capture: Capture, input: &str) -> Verdict {
     let event: serde_json::Value = match serde_json::from_str(input) {
         Ok(v) => v,
-        Err(_) => return deny(hints::MALFORMED_EVENT, hint),
+        Err(_) => return deny(hints::MALFORMED_EVENT, hint, capture),
     };
     match shape::read(host, &event) {
         shape::Shape::Allow => Verdict::Allow,
-        shape::Shape::Deny(rule) => deny(rule, hint),
-        shape::Shape::Command(command) => verdict(&command, hint),
+        shape::Shape::Deny(rule) => deny(rule, hint, capture),
+        shape::Shape::Command(command) => verdict(&command, hint, capture),
     }
 }
 
 /// Builds a denial with the rule name and a reason in the selected hint style.
-fn deny(rule: &'static str, hint: Hint) -> Verdict {
+fn deny(rule: &'static str, hint: Hint, capture: Capture) -> Verdict {
     Verdict::Deny {
         rule,
-        reason: hints::reason(rule, hint),
+        reason: hints::reason(rule, hint, capture),
     }
 }
 
 /// Evaluate one host event. Returns the process exit code: 0 allows, 2 denies.
 /// A deny writes its reason to `err`. Nothing goes to stdout.
-pub fn run_io(host: Host, hint: Hint, input: &str, err: &mut impl Write) -> i32 {
-    match event_verdict(host, hint, input) {
+pub fn run_io(host: Host, hint: Hint, capture: Capture, input: &str, err: &mut impl Write) -> i32 {
+    match event_verdict(host, hint, capture, input) {
         Verdict::Allow => 0,
         Verdict::Deny { reason, .. } => {
             let _ = writeln!(err, "{reason}");
@@ -153,7 +182,7 @@ pub fn run_io(host: Host, hint: Hint, input: &str, err: &mut impl Write) -> i32 
 /// Entry for the CLI: parse the host and hint names, read stdin, and evaluate.
 /// An unknown name writes the reason to stderr and returns 2.
 #[must_use]
-pub fn run_cli(host: &str, hint: &str) -> i32 {
+pub fn run_cli(host: &str, hint: &str, capture: Capture) -> i32 {
     let mut err = std::io::stderr();
     let (host, hint) = match (host.parse::<Host>(), hint.parse::<Hint>()) {
         (Ok(host), Ok(hint)) => (host, hint),
@@ -164,8 +193,12 @@ pub fn run_cli(host: &str, hint: &str) -> i32 {
     };
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
-        let _ = writeln!(err, "{}", hints::reason(hints::MALFORMED_EVENT, hint));
+        let _ = writeln!(
+            err,
+            "{}",
+            hints::reason(hints::MALFORMED_EVENT, hint, capture)
+        );
         return 2;
     }
-    run_io(host, hint, &input, &mut err)
+    run_io(host, hint, capture, &input, &mut err)
 }

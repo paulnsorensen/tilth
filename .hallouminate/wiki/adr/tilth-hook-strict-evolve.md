@@ -133,6 +133,68 @@ Open gaps added by this round:
 - From the review (not fixed): `make -p -f FILE` prints the make database, which holds the text of FILE. `uv run --env-file FILE printenv` prints the variables in FILE. gdb `search` and `forward-search` print matching source lines. `bundle console` starts a Ruby REPL that reads stdin.
 - Found during the round-3 work (not fixed): `deno` and `deno repl` start a REPL that reads stdin. `nix repl` reads stdin, and `nix eval --expr 'builtins.readFile ./f'` prints a file. lldb `repl` and `expression --repl` start a REPL that reads stdin.
 
+## Decision: opt-in output capture (2026-11-22, issue #470, user-approved guard change)
+
+The dotfiles `PreToolUse` dispatcher layers `tilth hook` over its own deny-list (`~/Dev/dotfiles/agents/lib/tool-reroute/io.js`). That deny-list lets a command capture its own output, and `tilth hook` denied every capture, so the layer could not merge. `tilth hook --allow-capture` adds the capture policy.
+
+The user settled three questions:
+
+- Shape: one boolean flag, `--allow-capture`. A named policy (`--policy strict|capture`) lost: a later relaxation changes what a policy name allows, and a flag keeps one meaning.
+- Scope: the flag also lifts `curl -o` and `-O`, `tail -f`, reads of `/proc`, `/sys`, and `/dev/null`, and output to a stream device. The user accepted that `tail -n +1 -f FILE` then prints a whole file.
+- Install: `tilth install <host> --hook` gets no flag. A reinstall keeps an `--allow-capture` that the tilth entry already has (`existing_allow_capture` in `src/install.rs`), as it keeps `--hint`.
+
+F-5 holds for the hook, because its default mode does not change:
+
+- The `must_deny` and `must_allow` rows of `benchmark/hook_corpus.json` are unchanged. The new `allow_capture` section holds the rows for the flag. `cargo test` checks the `allow_capture` rows in both hint modes, in `src/hook/tests.rs` and through the binary in `tests/hook_cli.rs`.
+- `capture_lifts_only_the_default_denials_that_the_corpus_lists` fails when the flag allows a default `must_deny` row that no `allow_capture.must_allow` row lists. Five default rows flip: `echo hi > /dev/tty`, two `go test` redirects, and two `tee` rows.
+- A differential run of the old binary and the new binary found no verdict change in the default mode. It used 1,515 commands (the corpus, every string in `src/hook/tests.rs`, and the probe lists of this change) in both hint modes.
+- The strict deny text for `output redirect` and `tee` has one more sentence. It names the route for command output that stays open: `<command> 2>&1 | tail -n 40`.
+- The baseline key uses the tree hash of `src/hook`, so this change buys a new strict baseline, as each `src/hook` change does.
+
+### Evolve runs with the flag by default (2026-11-22, user decision)
+
+The user asked for the flag as the default of the evolve benchmarks. A strict cell then behaves like daily work: a command can write its own output to a file.
+
+- `run.set_hook_capture` is one switch for the process. `_hook_options` adds `--allow-capture` to the cell hook (`_strict_bash_settings`), the Codex hook (`_codex_hook_config`), the seed replay, and the probes (`_run_hook`). All of them must agree: a replay with other options than the cell hook reports a false `hook_loosened`.
+- `Evolution.__init__` turns the switch on when the run is strict and `Settings.allow_capture` is true (the default). `--no-allow-capture` turns it off. `run.py` keeps it off unless it gets `--allow-capture`: only the evolve default has user approval.
+- The flag changes the command template and run key for hooked cells. The frozen stock slot also compares `hook_capture`; old rows without it count as strict. A `run.py --panel` row matches a capture-enabled evolve row only with `--allow-capture`.
+- `hookgate.corpus_failures` checks the mode of the cells. With the flag, the `allow_capture` section holds, and each default row holds too, except that a default `must_deny` row that `allow_capture.must_allow` lists must pass. The seed preflight and the candidate hook gate both use it.
+- The gate does not replay the other mode. `just check` runs before the gate and holds each candidate to the corpus in both modes through the Rust tests. A replay of both modes made each gate about 2.4 times slower, because the test fakes are Python scripts.
+- F-5 changes in one point: the floor for a candidate hook in an evolve run is the seed hook with `--allow-capture`, not the seed hook in its default mode. The two F-5 checks stay: the corpus gate and the `hook_loosened` replay.
+- A seed binary without the flag exits 2 on it. The preflight then refuses the run before any paid call.
+- The test fixture `hooks_without_capture` in `benchmark/tests/conftest.py` resets the switch for each test, because an `Evolution` object turns it on.
+
+The rules with the flag:
+
+- The walk returns, for each node, whether authored content reaches its stdout (`Authored` in `src/hook/walk.rs`). The rules report through `Cmd::authored`, a cell, because every reading of a wrapper or a tool runner goes through `check_from`.
+- Authored content comes from four sources:
+  - A content generator: `echo`, `printf`, or `cat` (`GENERATORS` in `src/hook/rules.rs`).
+  - A filter with no real input. The filters are the readers, the searchers, `tr`, `sponge`, and `tee`. Real input is a pipe from a command that is not authored (`Feed::Real`), or a file operand that the flag allows. A heredoc or a here-string is not real input.
+  - A command name that is not literal (`$cmd > f`).
+  - No command: `> f`, `exec > f`, and `xargs` with no command, which runs `echo`.
+- An output redirect to a file passes when the command that owns it is not authored. The grammar puts the redirect of `a && b > f` and of `a | b > f` on the whole list or pipeline. The walk gives it to the last command, as the shell does (`Authored::last`). A compound owner (`{ }`, `( )`, a loop) is authored when one command in it is. Shell source that the owner runs (`bash -c`, `eval`) counts too.
+- `cmd | tee FILE` passes when a real command feeds `tee`. `printf x | tee f`, `tee f <<EOF`, and `tee f` with no pipe deny.
+- Output to a stream device passes with any writer (`echo warn > /dev/stderr`). `is_stream_target` wants a literal path without `..`.
+- A permitted pseudo-file is `/dev/null` or a literal path under `/proc` or `/sys` that passes `is_pseudo_file`. A redirect to descriptor zero connects stdin only for the pipeline stage that owns it. It does not prove a real writer. The explicit recursive-searcher operand exception below still applies.
+- `tail` with `-f`, `-F`, or `--follow` passes. `--retry` alone does not.
+- `curl -o`, `--output`, `-O`, `--remote-name`, and `--remote-name-all` pass. `-D`, `-c`, `--trace`, and `--stderr` stay denied.
+
+Gotchas found during the work:
+
+- A heredoc statement has two grammar quirks. The file redirects of `a <<EOF > f` and the pipeline tail of `a <<EOF | b` are children of the `heredoc_redirect` node. The walk gives the redirects to `a` and connects its stdout to the tail. The last command in the tail determines what reaches stdout. Comments are not pipeline stages. The heredoc of `a | b <<EOF` belongs to `b`.
+- Lexical `..` removal is wrong after a link: the kernel resolves `/proc/self/cwd/../x` from the target of `cwd`. `is_pseudo_file` and `is_stream_target` refuse every path with a `..` segment.
+- A glob can hide a link name (`/proc/self/cw?/f`), so `is_pseudo_file` refuses glob and brace characters.
+- `is_device` also matches `NAME=/dev/stdout`. A redirect target of that form is a real file, so the stream rule uses `is_stream_target`, not `is_device`.
+- A filter counted as a real writer at first. Then `echo x | sort > f` and `cat <<EOF | sort | tee f` passed. The filter rule closes both.
+- A binary without the flag exits 2 on it (clap usage error). A hook entry with `--allow-capture` then blocks every shell command. Check `tilth hook --help` first.
+
+Open gaps with the flag (accepted):
+
+- The flag is a routing rule, not a sandbox. A program that prints its arguments or copies stdin, and that is not in the filter list, writes authored text through a redirect: `yes`, `seq`, `pv`, `envsubst`, `busybox echo`, a shell function.
+- `tail -n +1 -f FILE` prints a whole file.
+- False denies: a command name with an expansion (`"$HOME/bin/tool" > log`), a group with one generator (`{ echo header; make; } > log`), a filter that reads an input redirect (`sort < /proc/meminfo > f`), `make | { tee f; }`, `make | bash -c 'tee f'`, and `make > >(tee log)`.
+- `rg PATTERN /proc/meminfo` denies, because `rg` can recurse. Reads of `/dev/urandom` and `/dev/zero` deny. `tee /dev/stderr` denies as `device path`.
+- `sort -o`, `sponge FILE`, `script`, `time -o`, and `strace -o` stay denied.
 ## Deferred
 
 - vscode, copilot-cli, antigravity, gemini, qwen-code, and kiro install support waits until each host's docs and event shape are verified.
@@ -140,3 +202,5 @@ Open gaps added by this round:
 - Retiring `scripts/tilth-bash-guard`.
 - The wozcode strict arm gets native-tool deny hints it cannot use.
 - Policy gaps outside the named rules: top-level `$c f`, `docker run` (tool runners closed 2026-11-22, see above), `git blame`, `busybox`, `find -fprint`, `parallel` and other shell-string runners, `awk` programs that build file names or commands at run time, `sed` scripts read with `-f`.
+
+_Source for stdin ownership: [PR #474](https://github.com/paulnsorensen/tilth/pull/474), `src/hook/walk.rs` · Updated: 2026-11-25_

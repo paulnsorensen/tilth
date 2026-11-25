@@ -1,6 +1,6 @@
 //! Rule names, rule kinds, and deny-reason text.
 
-use super::Hint;
+use super::{Capture, Hint};
 
 /// A rule name. Every deny cites exactly one.
 pub(super) type Rule = &'static str;
@@ -155,12 +155,37 @@ fn kind(rule: &str) -> Kind {
     }
 }
 
-/// Formats a denial reason with the tool names selected by `hint`.
-pub(super) fn reason(rule: &str, hint: Hint) -> String {
+/// Formats a denial reason with the tool names selected by `hint`. `capture` selects the text
+/// for a denied file write: the strict text, or the `--allow-capture` text.
+pub(super) fn reason(rule: &str, hint: Hint, capture: Capture) -> String {
     let kind = kind(rule);
     match hint {
-        Hint::Tilth => tilth_reason(rule, kind),
-        Hint::Native => native_reason(rule, kind),
+        Hint::Tilth => tilth_reason(rule, kind, capture),
+        Hint::Native => native_reason(rule, kind, capture),
+    }
+}
+
+/// The route for command output when no shell command can write a file.
+const KEEP_OUTPUT: &str = "The shell cannot write command output to a file. To keep the output \
+    short, filter it in the pipe (`<command> 2>&1 | tail -n 40`).";
+
+/// The route for command output with `--allow-capture`.
+const CAPTURE_OUTPUT: &str = "A command can still capture its own output \
+    (`<command> > <log> 2>&1`, `<command> 2>&1 | tee <log>`). `echo`, `printf`, `cat`, and \
+    here-documents cannot.";
+
+/// The first sentence of a denied redirect or `tee`, and the route for command output.
+/// `strict` is what the rule does in the words of the strict first sentence.
+fn capture_lines(rule: &str, capture: Capture, strict: &str) -> (String, &'static str) {
+    match capture {
+        Capture::Allow => (
+            format!(
+                "Blocked: shell `{rule}` writes a file, and it is not a plain capture of \
+                 command output."
+            ),
+            CAPTURE_OUTPUT,
+        ),
+        Capture::Deny => (format!("Blocked: shell `{rule}` {strict}."), KEEP_OUTPUT),
     }
 }
 
@@ -176,7 +201,7 @@ const DEBUGGER_FIX: &str = "Use plain debugger commands with -batch, and pass pr
     arguments with `--args` (gdb) or after `--` (lldb).";
 
 /// Formats a denial reason with tilth tool calls for the rule's kind.
-fn tilth_reason(rule: &str, kind: Kind) -> String {
+fn tilth_reason(rule: &str, kind: Kind, capture: Capture) -> String {
     let read = "mcp__tilth__tilth_read(paths:[\"<path>\"], cwd:\"<checkout>\")";
     let search = "mcp__tilth__tilth_search(queries:[{query:\"<pattern>\"}], cwd:\"<checkout>\")";
     let write = "mcp__tilth__tilth_write(edits:[{path:\"<path>\", tag:\"<TAG>\", ops:[{op:\"replace_text\", old:\"...\", new:\"...\"}]}], cwd:\"<checkout>\")";
@@ -203,7 +228,7 @@ fn tilth_reason(rule: &str, kind: Kind) -> String {
              Filters on command output (`git log | grep fix`) still run.\n\n\
              {SHELL_MAP}"
         ),
-        Kind::Write => write_reason(rule, write),
+        Kind::Write => write_reason(rule, write, capture),
         Kind::Generic if rule == STDIN_REPL => format!(
             "Blocked: this command starts a REPL or debugger that reads its commands from stdin, \
              so the hook cannot see what it runs. Give it a program instead. \
@@ -240,7 +265,7 @@ fn tilth_reason(rule: &str, kind: Kind) -> String {
 }
 
 /// Formats a write denial, choosing the cheapest tilth call for the rule.
-fn write_reason(rule: &str, write: &str) -> String {
+fn write_reason(rule: &str, write: &str, capture: Capture) -> String {
     let create = "mcp__tilth__tilth_write(edits:[{path:\"<path>\", ops:[{op:\"create_file\", content:\"...\"}]}], cwd:\"<checkout>\")";
     if INTERPRETER_RULES.contains(&rule) {
         format!(
@@ -254,11 +279,13 @@ fn write_reason(rule: &str, write: &str) -> String {
              or tilth_search (read only if you have none):\n  {write}"
         )
     } else if rule == OUTPUT_REDIRECT || rule == "tee" {
+        let (blocked, output) = capture_lines(rule, capture, "writes files");
         format!(
-            "Blocked: shell `{rule}` writes files. Use tilth_write.\n\n\
+            "{blocked} Use tilth_write.\n\n\
              New file: no read needed, create it directly:\n  {create}\n\n\
              Existing file: use the [path#TAG] you already have from tilth_read or tilth_search \
-             (read only if you have none), then:\n  {write}"
+             (read only if you have none), then:\n  {write}\n\n\
+             {output}"
         )
     } else {
         format!(
@@ -271,8 +298,16 @@ fn write_reason(rule: &str, write: &str) -> String {
 }
 
 /// Formats a denial reason with the host's native tool names.
-fn native_reason(rule: &str, kind: Kind) -> String {
+fn native_reason(rule: &str, kind: Kind, capture: Capture) -> String {
     match kind {
+        Kind::Write if rule == OUTPUT_REDIRECT || rule == "tee" => {
+            let (blocked, output) =
+                capture_lines(rule, capture, "writes files or runs inline code");
+            format!(
+                "{blocked} Use the Edit tool to change an existing file and the Write tool to \
+                 create a new one. {output}"
+            )
+        }
         Kind::Read => format!(
             "Blocked: shell `{rule}` reads file content. Use the Read tool, not a shell reader. \
              Use the Glob tool to list files."

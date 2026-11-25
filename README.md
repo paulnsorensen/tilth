@@ -148,6 +148,8 @@ tilth install claude-code --hook
 Seven hosts support `--hook`: `claude-code`, `codex`, `droid`, `crush`, `augment`, `cursor`, and `windsurf`.
 [docs/hosts.md](docs/hosts.md#shell-guard-hook) gives the hook file, fail-closed behavior, and removal steps for each host.
 
+The hook stays strict by default. To let a tool save its own output, see [opt-in output capture](docs/hosts.md#output-capture).
+
 > [!IMPORTANT]
 > For `claude-code`, the entry sets `onFailure: "block"`.
 > If the binary moves or disappears, the hook blocks every Bash call until you reinstall or remove the entry.

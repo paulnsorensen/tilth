@@ -103,6 +103,12 @@ enum Command {
         /// Tool names the deny reason cites: tilth or native.
         #[arg(long, default_value = "tilth")]
         hint: String,
+
+        /// Let a command capture its own output: `cmd > log`, `cmd | tee log`, `curl -o`,
+        /// `tail -f`, and reads of `/proc`, `/sys`, and `/dev/null` pass. Content from `echo`,
+        /// `printf`, `cat`, or a here-document still denies.
+        #[arg(long)]
+        allow_capture: bool,
     },
     /// Start Claude Code with the tilth preamble as its system prompt.
     /// `claude` must be the first argument. Every later argument passes to `claude` unchanged.
@@ -184,8 +190,16 @@ fn main() {
                     process::exit(1);
                 }
             }
-            Command::Hook { host, ref hint } => {
-                process::exit(tilth::hook::run_cli(host.family(), hint));
+            Command::Hook {
+                host,
+                ref hint,
+                allow_capture,
+            } => {
+                process::exit(tilth::hook::run_cli(
+                    host.family(),
+                    hint,
+                    allow_capture.into(),
+                ));
             }
             Command::Preamble { path } => {
                 process::exit(tilth::launch::print_preamble(path));
@@ -482,13 +496,23 @@ mod tests {
         let cli = Cli::try_parse_from(["tilth", "hook"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::Hook { host, ref hint }) if host.family() == "claude" && hint == "tilth"
+            Some(Command::Hook { host, ref hint, allow_capture: false })
+                if host.family() == "claude" && hint == "tilth"
         ));
         let cli =
             Cli::try_parse_from(["tilth", "hook", "--host", "cursor", "--hint", "native"]).unwrap();
         assert!(matches!(
             cli.command,
-            Some(Command::Hook { host, ref hint }) if host.family() == "cursor" && hint == "native"
+            Some(Command::Hook { host, ref hint, allow_capture: false })
+                if host.family() == "cursor" && hint == "native"
+        ));
+        let cli = Cli::try_parse_from(["tilth", "hook", "--allow-capture"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Hook {
+                allow_capture: true,
+                ..
+            })
         ));
         for alias in ["claude-code", "codex", "droid", "crush", "augment"] {
             let cli = Cli::try_parse_from(["tilth", "hook", "--host", alias]).unwrap();

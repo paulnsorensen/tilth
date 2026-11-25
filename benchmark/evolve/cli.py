@@ -137,6 +137,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-strict-file-tools", dest="strict_file_tools", action="store_false",
                         help="run cells without the Bash file-tool hook (strict is the default: candidates run "
                              "their own hook, the baseline runs the seed's)")
+    parser.add_argument("--no-allow-capture", dest="allow_capture", action="store_false",
+                        help="run the strict hooks without `--allow-capture`, so every shell file write denies "
+                             "(capture is the default: a command can write its own output to a file); every "
+                             "strict cell key then changes")
     parser.add_argument("--replay-diagnostic", type=int, default=0, metavar="N",
                         help="for a candidate that changes src_patch, replay N seed dev cells against the seed and "
                              "candidate binaries and show the diff to later reflection (no model call; never "
@@ -309,7 +313,8 @@ def build(argv: list[str] | None = None, *,
         reruns=args.reruns, plateau=args.plateau, max_usd=args.max_usd, max_metric_calls=args.max_metric_calls,
         cell_estimate_usd=args.cell_estimate_usd, cell_budget_usd=args.cell_budget_usd,
         refreeze_baselines=args.refreeze_baselines, panel_path=args.panel,
-        strict_file_tools=args.strict_file_tools, replay_diagnostic=args.replay_diagnostic,
+        strict_file_tools=args.strict_file_tools, allow_capture=args.allow_capture,
+        replay_diagnostic=args.replay_diagnostic,
         directives=tuple(queue), repair=args.repair, preamble=args.preamble, cell_retries=args.cell_retries,
         deep_diagnosis=args.deep_diagnosis,
         deep_diagnosis_model=args.deep_diagnosis_model, deep_diagnosis_effort=args.deep_diagnosis_effort,

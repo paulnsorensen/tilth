@@ -87,9 +87,21 @@ In the exec form (`claude-code` with an absolute binary path), `command` is the 
 ### `tilth hook` flags
 
 ```bash
-tilth hook --host <claude|copilot|cursor|windsurf> --hint <tilth|native>
+tilth hook --host <claude|copilot|cursor|windsurf> --hint <tilth|native> [--allow-capture]
 ```
 
 - `--host` sets the event shape. The default is `claude`. The install host names `claude-code`, `codex`, `droid`, `crush`, and `augment` also select `claude`.
 - `--hint` sets which tool names the deny message cites. The default is `tilth`.
 - The guard exits 2 to deny.
+
+### Output capture
+
+The hook blocks file capture by default. `--allow-capture` lets a tool save its own output, for example `just check > check.log 2>&1`.
+It also permits a pipe from a tool to `tee`, curl downloads with `-o` or `-O`, and `tail -f`.
+Readers can use permitted literal paths under `/proc` or `/sys`, or `/dev/null`. The hook still blocks recursive repository searches.
+Output to a stream device is permitted. Authored text, including text from a generator or a here-document, does not qualify for file capture.
+This option routes tool use. It does not provide a security sandbox. See [the policy and its limits](../.hallouminate/wiki/adr/tilth-hook-strict-evolve.md).
+
+Run `tilth hook --help` before enabling capture. An older binary rejects the unknown option with exit 2, which the host reads as a denial.
+Add `--allow-capture` to the existing tilth hook's `args` array or to its shell command. Do not pass it to `tilth install`.
+Reinstalling the hook preserves the existing opt-in. A fresh install stays strict.

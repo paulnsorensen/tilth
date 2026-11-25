@@ -153,6 +153,133 @@ fn corpus_must_allow_rows_exit_0_silently() {
 }
 
 #[test]
+fn allow_capture_corpus_rows_hold_through_the_binary_in_both_hint_modes() {
+    let corpus = corpus();
+    let section = &corpus["allow_capture"];
+    let allow = section["must_allow"].as_array().unwrap();
+    let deny = section["must_deny"].as_array().unwrap();
+    assert_ne!(allow.len(), 0);
+    assert_ne!(deny.len(), 0);
+    for (hint, names_tilth) in [("tilth", true), ("native", false)] {
+        let args = ["hook", "--allow-capture", "--hint", hint];
+        for row in allow {
+            let command = row["command"].as_str().unwrap();
+            let out = run(&args, &claude_event(command), None);
+            assert_eq!(
+                (out.code, out.stdout.as_str(), out.stderr.as_str()),
+                (0, "", ""),
+                "{hint}: {command}"
+            );
+        }
+        for row in deny {
+            let command = row["command"].as_str().unwrap();
+            let out = run(&args, &claude_event(command), None);
+            assert_eq!(out.code, 2, "{hint}: {command}");
+            assert_eq!(out.stdout, "", "{hint}: {command}");
+            assert_eq!(
+                out.stderr.to_lowercase().contains("tilth"),
+                names_tilth,
+                "{hint}: {command}: {}",
+                out.stderr
+            );
+        }
+    }
+}
+
+#[test]
+fn capture_routes_pseudofile_input_to_its_command() {
+    for (command, capture_code) in [
+        ("rg pattern < /dev/null", 0),
+        ("rg pattern 0< /dev/null", 0),
+        ("rg pattern | rg pattern < /dev/null", 2),
+        ("rg pattern && rg pattern < /dev/null", 2),
+    ] {
+        let event = claude_event(command);
+        assert_eq!(run(&["hook"], &event, None).code, 2, "strict: {command}");
+        let out = run(&["hook", "--allow-capture"], &event, None);
+        assert_eq!(out.code, capture_code, "capture: {command}: {}", out.stderr);
+    }
+}
+
+/// Issue #470: each capture that the default mode denies has a decided verdict with
+/// `--allow-capture`, and content from a generator still denies.
+#[test]
+fn allow_capture_passes_real_captures_and_still_denies_authored_content() {
+    let captures = [
+        "just check > check.log 2>&1",
+        "just check 2>&1 | tee /tmp/check.log",
+        "cargo test 2> err.txt",
+        "git diff > /tmp/x.patch",
+        "curl -sS -o /tmp/page.html https://example.com",
+        "tail -f /tmp/server.log",
+        "cat /proc/cpuinfo",
+        "cat /dev/null",
+    ];
+    for command in captures {
+        let event = claude_event(command);
+        let strict = run(&["hook", "--host", "claude"], &event, None);
+        assert_eq!(strict.code, 2, "default mode: {command}");
+        for args in [
+            ["hook", "--allow-capture", "--host", "claude"],
+            ["hook", "--host", "claude", "--allow-capture"],
+        ] {
+            let out = run(&args, &event, None);
+            assert_eq!(
+                (out.code, out.stdout.as_str(), out.stderr.as_str()),
+                (0, "", ""),
+                "{command}"
+            );
+        }
+    }
+    let authored = [
+        "echo x > f",
+        "printf 'a\\n' > f",
+        "cat <<EOF > f\nhi\nEOF",
+        "printf 'a\\n' | tee f",
+    ];
+    for command in authored {
+        let event = claude_event(command);
+        for args in [&["hook"][..], &["hook", "--allow-capture"][..]] {
+            let out = run(args, &event, None);
+            assert_eq!(out.code, 2, "{args:?}: {command}");
+            assert!(
+                out.stderr.contains("tilth_write"),
+                "{command}: {}",
+                out.stderr
+            );
+        }
+    }
+    for command in [
+        "just check 2>&1 | tail -n 40",
+        "just check > /dev/null 2>&1",
+    ] {
+        for args in [&["hook"][..], &["hook", "--allow-capture"][..]] {
+            assert_eq!(run(args, &claude_event(command), None).code, 0, "{command}");
+        }
+    }
+}
+
+#[test]
+fn allow_capture_applies_to_cursor_and_windsurf_events() {
+    let command = "just check > check.log 2>&1";
+    let cursor = json!({"command": command, "cwd": "/p", "sandbox": false}).to_string();
+    let windsurf = json!({"tool_info": {"command_line": command, "cwd": "/p"}}).to_string();
+    for (host, event) in [("cursor", cursor), ("windsurf", windsurf)] {
+        assert_eq!(
+            run(&["hook", "--host", host], &event, None).code,
+            2,
+            "{host}"
+        );
+        let out = run(&["hook", "--host", host, "--allow-capture"], &event, None);
+        assert_eq!(
+            (out.code, out.stdout.as_str(), out.stderr.as_str()),
+            (0, "", ""),
+            "{host}"
+        );
+    }
+}
+
+#[test]
 fn malformed_json_and_unknown_host_deny() {
     let bad = run(&["hook"], "{not json", None);
     assert_eq!(bad.code, 2);

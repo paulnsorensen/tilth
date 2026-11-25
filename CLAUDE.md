@@ -137,6 +137,8 @@ python benchmark/run.py --models haiku --reps 3 --tasks rg_search_dispatch,rg_tr
 
 # Models: sonnet, opus, haiku (claude CLI aliases), sonnet46, sonnet5, opus5, haiku45 (pinned IDs), gpt5, luna56, o3, gpt5mini
 # Modes: baseline (built-in tools), tilth_forced (tilth MCP only; Claude runs strict by default, --no-strict-file-tools opts out)
+# --allow-capture: every hook call uses `tilth hook --allow-capture`, so a command can write its own output to a file;
+#   off by default in run.py, on by default in evolve (--no-allow-capture opts out)
 # --preamble: tilth arms run with prompts/preamble.md as their system prompt (Claude and Codex models only);
 #   evolve's --preamble also evolves that file as a text component
 # Tasks: all, or comma-separated names from benchmark/tasks/*.py

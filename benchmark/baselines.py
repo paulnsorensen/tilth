@@ -28,11 +28,11 @@ DIGEST_FIELDS = ("harness_digest", "task_digest", "env_fingerprint")
 
 # Coordinates under which two stock-arm rows describe the same frozen cell. The
 # harness variant flags every row records are part of the slot: a --bare,
-# strict-file-tools, or budget variant is its own baseline. Any other harness
-# change (system prompt, disallowed tools, runner flags) is drift.
+# strict-file-tools, capture, or budget variant is its own baseline. Any other
+# harness change (system prompt, disallowed tools, runner flags) is drift.
 BASELINE_SLOT_FIELDS = (
     "task", "model", "mode", "reasoning_effort", "timeout_s", "repetition",
-    "bare", "strict_file_tools", "max_budget_usd",
+    "bare", "strict_file_tools", "hook_capture", "max_budget_usd",
 )
 
 
@@ -263,6 +263,8 @@ def baseline_drift(planned: Mapping[str, Any], rows: list[dict]) -> list[str]:
     for row in rows:
         if (is_completed(row)
                 and row.get("run_key") != planned.get("run_key")
-                and all(row.get(field) == planned.get(field) for field in BASELINE_SLOT_FIELDS)):
+                and all(row.get(field, False if field == "hook_capture" else None)
+                        == planned.get(field, False if field == "hook_capture" else None)
+                        for field in BASELINE_SLOT_FIELDS)):
             changed.update(drifted_inputs(planned, row) or ["run_key"])
     return sorted(changed)
