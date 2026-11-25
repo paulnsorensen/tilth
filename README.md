@@ -124,6 +124,11 @@ tilth codex exec "summarize src/auth.ts"             # runs: codex -c model_inst
 - If you give `--system-prompt` or `--system-prompt-file` (claude), or a `model_instructions_file` override (codex), the launcher adds nothing. Arguments after `--` do not count.
 - On Unix, the launcher refuses a cache directory that is not a real directory, that another user owns, or that all users can write.
 - `tilth codex` exits 1 when the cache path is not valid UTF-8.
+- `--append <FILE>` gives the preamble, one empty line, and the bytes of `<FILE>` unchanged. Line 1 is always `# tilth agent preamble`, so a caller can test the result.
+- With `--path`, the joined text has its own cache file, `preamble-<hash>.md`. The hash is of the joined text, so a changed `<FILE>` gives a new file name, and a running session keeps its file.
+- tilth uses a cache file again when its content is equal. A call that writes a new file removes `preamble-*.md` files that no call used for 30 days.
+- tilth reads `<FILE>` on each call and keeps no record of it. `tilth claude` and `tilth codex` do not use it. The option does not repeat.
+- Exit codes: 0 on success. 1 when tilth cannot read `<FILE>` or cannot write the cache file: stderr has a message, and stdout is empty. 2 on a usage error, which includes a tilth build without `--append`.
 - To search for the word `claude` or `codex`, run `tilth -- claude`.
 
 To use the preamble in another harness:
@@ -132,6 +137,7 @@ To use the preamble in another harness:
 tilth preamble >> AGENTS.md                               # add it to project instructions
 claude --append-system-prompt "$(tilth preamble)"         # add it after the built-in prompt
 <harness> --system-prompt-file "$(tilth preamble --path)" # give the cache file to a harness
+<harness> --system-prompt-file "$(tilth preamble --path --append my-rules.md)" # one file: the preamble, then your text
 ```
 
 `tilth preamble --path` writes the cache file and prints its path.

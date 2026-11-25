@@ -122,10 +122,15 @@ enum Command {
     Codex,
     /// Print the tilth preamble, so that you can give it to another harness.
     /// With `--path`, write it to the cache file and print the path of that file.
+    /// With `--append`, the text also holds your own file after the preamble.
     Preamble {
         /// Print the path of the cache file, not the text.
         #[arg(long)]
         path: bool,
+
+        /// Add one empty line and the content of FILE after the preamble.
+        #[arg(long, value_name = "FILE")]
+        append: Option<PathBuf>,
     },
 }
 
@@ -201,8 +206,8 @@ fn main() {
                     allow_capture.into(),
                 ));
             }
-            Command::Preamble { path } => {
-                process::exit(tilth::launch::print_preamble(path));
+            Command::Preamble { path, ref append } => {
+                process::exit(tilth::launch::print_preamble(path, append.as_deref()));
             }
             // `launch_from_argv` handles `claude` / `codex` as argv[1], so clap reaches
             // these only when another argument comes first.

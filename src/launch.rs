@@ -1,14 +1,15 @@
 //! `tilth claude` and `tilth codex`: start the harness with the bundled tilth preamble.
 //! `tilth preamble`: print the preamble, or the path of its cache file, for other harnesses.
+//! `--append` adds the text of the caller after the bundled text.
 
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 const PREAMBLE: &str = include_str!("../prompts/preamble.md");
 
-/// A cache file of another preamble revision that no launch used for this long is removed.
+/// A cache file of another preamble text that no call used for this long is removed.
 const STALE_AFTER: Duration = Duration::from_hours(30 * 24);
 
 #[derive(Clone, Copy, Debug)]
@@ -26,11 +27,22 @@ impl Harness {
     }
 }
 
-/// Print the bundled preamble. With `path`, write the cache file and print its path.
+/// Print the bundled preamble. With `append`, add one empty line and the bytes of that file.
+/// With `path`, write the text to its cache file and print the path of that file.
 #[must_use]
-pub fn print_preamble(path: bool) -> i32 {
+pub fn print_preamble(path: bool, append: Option<&Path>) -> i32 {
+    let text = match append {
+        Some(file) => match joined_preamble(file) {
+            Ok(text) => text,
+            Err(e) => {
+                eprintln!("tilth: cannot read {}: {e}", file.display());
+                return 1;
+            }
+        },
+        None => PREAMBLE.as_bytes().to_vec(),
+    };
     let out = if path {
-        match ensure_preamble_file() {
+        match ensure_preamble_file(&text, append) {
             Ok(f) => {
                 let mut bytes = f.into_os_string().into_encoded_bytes();
                 bytes.push(b'\n');
@@ -42,7 +54,7 @@ pub fn print_preamble(path: bool) -> i32 {
             }
         }
     } else {
-        PREAMBLE.as_bytes().to_vec()
+        text
     };
     let mut stdout = io::stdout().lock();
     match io::Write::write_all(&mut stdout, &out).and_then(|()| io::Write::flush(&mut stdout)) {
@@ -63,7 +75,7 @@ pub fn print_preamble(path: bool) -> i32 {
 pub fn run(harness: Harness, args: Vec<OsString>) -> i32 {
     let mut argv: Vec<OsString> = Vec::new();
     if !caller_overrides(harness, &args) {
-        let file = match ensure_preamble_file() {
+        let file = match ensure_preamble_file(PREAMBLE.as_bytes(), None) {
             Ok(f) => f,
             Err(e) => {
                 eprintln!("tilth: cannot write the preamble file: {e}");
@@ -149,32 +161,74 @@ fn cache_dir(xdg: Option<OsString>, home: Option<PathBuf>) -> Option<PathBuf> {
     Some(base.join("tilth"))
 }
 
-fn preamble_name() -> String {
-    let hash = twox_hash::XxHash3_64::oneshot(PREAMBLE.as_bytes());
+/// The bundled preamble, one empty line, and the bytes of `file` unchanged.
+/// The bundled text comes first, so the first line stays the tilth heading.
+fn joined_preamble(file: &Path) -> io::Result<Vec<u8>> {
+    let addendum = std::fs::read(file)?;
+    Ok([PREAMBLE.as_bytes(), b"\n", addendum.as_slice()].concat())
+}
+
+fn preamble_name(text: &[u8]) -> String {
+    let hash = twox_hash::XxHash3_64::oneshot(text);
     format!("preamble-{hash:016x}.md")
 }
 
-fn ensure_preamble_file() -> io::Result<PathBuf> {
+/// Return the cache file that holds `text`. Write the file when it does not hold `text`.
+fn ensure_preamble_file(text: &[u8], append: Option<&Path>) -> io::Result<PathBuf> {
     let dir = cache_dir(std::env::var_os("XDG_CACHE_HOME"), home::home_dir())
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no cache directory found"))?;
     create_private_dir(&dir)?;
-    let name = preamble_name();
+    let name = preamble_name(text);
     let file = dir.join(&name);
-    if std::fs::read(&file).ok().as_deref() == Some(PREAMBLE.as_bytes()) {
-        // Mark the file as in use, so another tilth version does not remove it.
-        let _ = std::fs::File::options()
-            .write(true)
-            .open(&file)
-            .and_then(|f| f.set_modified(SystemTime::now()));
-    } else {
-        crate::util::atomic_write_bytes(&file, PREAMBLE.as_bytes())?;
-        remove_stale_preambles(&dir, &name);
+    if let Some(mut existing) = open_private_preamble(&file) {
+        let mut bytes = Vec::new();
+        if existing.read_to_end(&mut bytes).is_ok() && bytes == text {
+            let _ = existing.set_modified(SystemTime::now());
+            return Ok(file);
+        }
     }
+    write_private_preamble(&file, text)?;
+    let source = append.and_then(|path| std::fs::canonicalize(path).ok());
+    remove_stale_preambles(&dir, &name, source.as_deref());
     Ok(file)
 }
 
-/// Remove cache files of other preamble revisions that no launch used for `STALE_AFTER`.
-fn remove_stale_preambles(dir: &Path, keep: &str) {
+fn open_private_preamble(path: &Path) -> Option<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        const GROUP_OR_OTHER_PERMISSIONS: u32 = 0o077;
+        options.custom_flags(libc::O_NOFOLLOW);
+        let file = options.open(path).ok()?;
+        let meta = file.metadata().ok()?;
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        (meta.is_file() && meta.uid() == uid && meta.mode() & GROUP_OR_OTHER_PERMISSIONS == 0)
+            .then_some(file)
+    }
+    #[cfg(not(unix))]
+    {
+        options.open(path).ok()
+    }
+}
+
+fn write_private_preamble(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".tilth-tmp.");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o600));
+    }
+    let mut temp = builder.tempfile_in(path.parent().unwrap_or_else(|| Path::new(".")))?;
+    temp.write_all(bytes)?;
+    temp.persist(path).map(|_| ()).map_err(|error| error.error)
+}
+
+/// Remove cache files of other preamble texts that no call used for `STALE_AFTER`.
+fn remove_stale_preambles(dir: &Path, keep: &str, source: Option<&Path>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -186,7 +240,10 @@ fn remove_stale_preambles(dir: &Path, keep: &str) {
         let ours = name
             .strip_prefix("preamble-")
             .is_some_and(|n| n.strip_suffix(".md").is_some());
-        if name == keep || !ours {
+        if name == keep
+            || !ours
+            || source.is_some_and(|s| entry.path().canonicalize().ok().as_deref() == Some(s))
+        {
             continue;
         }
         let stale = entry

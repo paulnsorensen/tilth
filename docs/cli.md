@@ -143,7 +143,7 @@ tilth "*.md" --scope prompts       # glob
 | `tilth install <host> [--hook]` | Write MCP config. See [hosts.md](hosts.md). |
 | `tilth hook` | Shell guard. See [hosts.md](hosts.md#shell-guard-hook). |
 | `tilth claude ...` / `tilth codex ...` | Start the harness with the preamble. See the [README](../README.md#launcher-and-preamble). |
-| `tilth preamble [--path]` | Print the preamble or its cache path. |
+| `tilth preamble [--path] [--append <FILE>]` | Print the preamble or its cache path. `--append` adds the file's bytes after the bundled text. |
 
 `claude`, `codex`, `preamble`, `install`, and `hook` are subcommands. To search for one of these words, run `tilth -- <word>`. Put other flags before `--`.
 

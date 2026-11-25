@@ -759,3 +759,324 @@ fn launch_preamble_path_fails_cleanly_on_a_bad_cache_dir() {
     launch_assert_clean_failure(&out, &sb);
     assert!(out.stdout.is_empty(), "{out:?}");
 }
+
+/// The text that `tilth preamble --append` must give: the bundled bytes, one empty line,
+/// and `addendum` unchanged.
+fn joined(addendum: &[u8]) -> Vec<u8> {
+    [PREAMBLE, b"\n", addendum].concat()
+}
+
+/// Run `tilth preamble --path <extra>` and return the path that it prints.
+fn preamble_path(sb: &Sandbox, extra: &[&OsStr]) -> PathBuf {
+    let out = sb
+        .tilth(&["preamble", "--path"])
+        .args(extra)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let line = stdout
+        .strip_suffix('\n')
+        .expect("one line ending in a newline");
+    assert!(!line.contains('\n'), "{stdout:?}");
+    PathBuf::from(line)
+}
+
+/// Run `tilth preamble --path --append <source>` and return the path that it prints.
+fn append_path(sb: &Sandbox, source: &Path) -> PathBuf {
+    preamble_path(sb, &[OsStr::new("--append"), source.as_os_str()])
+}
+
+fn set_age_in_days(file: &Path, days: u32) {
+    use std::time::{Duration, SystemTime};
+    let mtime = SystemTime::now() - days * Duration::from_hours(24);
+    fs::File::options()
+        .write(true)
+        .open(file)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+}
+
+#[test]
+fn launch_preamble_append_prints_the_joined_text() {
+    let sb = Sandbox::new();
+    let source = sb.home.join("addendum.md");
+    // The bytes of the file pass through unchanged.
+    for addendum in [
+        &b"# Mine\n\nUse the project notes.\n"[..],
+        b"no final newline",
+        b"crlf\r\nand a byte that is not UTF-8: \xff\n",
+        b"",
+    ] {
+        fs::write(&source, addendum).unwrap();
+        let out = sb
+            .tilth(&["preamble", "--append"])
+            .arg(&source)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(out.stdout, joined(addendum));
+        assert!(out.stderr.is_empty(), "{out:?}");
+    }
+    assert!(
+        !sb.xdg.exists(),
+        "printing the text must not write the cache"
+    );
+}
+
+#[test]
+fn launch_preamble_append_path_writes_and_reuses_the_joined_file() {
+    use std::os::unix::fs::MetadataExt;
+    let sb = Sandbox::new();
+    let addendum = b"# Mine\n\nUse the project notes.\n";
+    let source = sb.home.join("addendum.md");
+    fs::write(&source, addendum).unwrap();
+
+    let file = append_path(&sb, &source);
+    assert_eq!(file, Sandbox::preamble_file(&sb.xdg.join("tilth")));
+    assert!(is_preamble_name(&file), "{}", file.display());
+    assert_eq!(fs::read(&file).unwrap(), joined(addendum));
+
+    // An equal file is reused: the inode stays, and a new mtime marks the file as in use.
+    let inode = fs::metadata(&file).unwrap().ino();
+    set_age_in_days(&file, 40);
+    assert_eq!(append_path(&sb, &source), file);
+    let meta = fs::metadata(&file).unwrap();
+    assert_eq!(meta.ino(), inode, "an equal file must not be written again");
+    let age = meta.modified().unwrap().elapsed().unwrap();
+    assert!(age.as_secs() < 3600, "mtime not refreshed: {age:?}");
+
+    // The name does not prove the content, so a file with other content is written again.
+    fs::write(&file, b"junk").unwrap();
+    assert_eq!(append_path(&sb, &source), file);
+    assert_eq!(
+        fs::read(&file).unwrap(),
+        joined(addendum),
+        "junk must be repaired"
+    );
+}
+
+#[test]
+fn launch_preamble_append_path_names_the_file_by_its_content() {
+    let sb = Sandbox::new();
+    let source = sb.home.join("addendum.md");
+
+    fs::write(&source, b"first\n").unwrap();
+    let first = append_path(&sb, &source);
+    fs::write(&source, b"second\n").unwrap();
+    let second = append_path(&sb, &source);
+    assert_ne!(first, second, "changed text must give a new file name");
+    // A session that started with the first file keeps it.
+    assert_eq!(fs::read(&first).unwrap(), joined(b"first\n"));
+    assert_eq!(fs::read(&second).unwrap(), joined(b"second\n"));
+
+    // The name holds the content, not the path of the appended file.
+    let copy = sb.home.join("copy.md");
+    fs::write(&copy, b"second\n").unwrap();
+    assert_eq!(append_path(&sb, &copy), second);
+
+    // The plain file is a third file. The launcher still passes that file to the harness.
+    let plain = preamble_path(&sb, &[]);
+    assert!(plain != first && plain != second, "{}", plain.display());
+    assert_eq!(fs::read(&plain).unwrap(), PREAMBLE);
+    sb.fake("claude", 0);
+    assert!(sb.cmd("claude", &["-p"]).output().unwrap().status.success());
+    assert_eq!(sb.argv()[1], plain.to_str().unwrap());
+    assert_eq!(fs::read_dir(sb.xdg.join("tilth")).unwrap().count(), 3);
+}
+
+#[test]
+fn launch_preamble_append_path_removes_only_stale_cache_files() {
+    let sb = Sandbox::new();
+    let source = sb.home.join("addendum.md");
+    fs::write(&source, b"first\n").unwrap();
+    let stale = preamble_path(&sb, &[]);
+    let recent = append_path(&sb, &source);
+    set_age_in_days(&stale, 40);
+    set_age_in_days(&recent, 2);
+
+    // A write of a new joined file applies the rule of the launcher: 30 days without use.
+    fs::write(&source, b"second\n").unwrap();
+    let new = append_path(&sb, &source);
+    assert!(!stale.exists(), "a stale file must go");
+    assert!(recent.exists(), "a recent file must stay");
+    assert_eq!(fs::read(&new).unwrap(), joined(b"second\n"));
+}
+
+#[test]
+fn launch_preamble_append_fails_cleanly_on_a_file_it_cannot_read() {
+    let sb = Sandbox::new();
+    let missing = sb.home.join("missing.md");
+    let directory = sb.home.clone();
+    for file in [&missing, &directory] {
+        for flags in [
+            &["preamble", "--append"][..],
+            &["preamble", "--path", "--append"],
+        ] {
+            let out = sb.tilth(flags).arg(file).output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(out.status.code(), Some(1), "{flags:?} {file:?}: {stderr}");
+            assert!(out.stdout.is_empty(), "{flags:?} {file:?}: {out:?}");
+            assert!(stderr.starts_with("tilth: cannot read "), "{stderr}");
+            assert!(stderr.contains(file.to_str().unwrap()), "{stderr}");
+        }
+    }
+    assert!(!sb.xdg.exists(), "a failed read must not write the cache");
+}
+
+#[test]
+fn launch_preamble_append_usage_errors_exit_2() {
+    let sb = Sandbox::new();
+    let source = sb.home.join("addendum.md");
+    fs::write(&source, b"mine\n").unwrap();
+    let source = source.to_str().unwrap();
+    let cases: &[&[&str]] = &[
+        // The option needs a file.
+        &["preamble", "--append"],
+        &["preamble", "--path", "--append"],
+        // The option does not repeat.
+        &["preamble", "--append", source, "--append", source],
+    ];
+    for argv in cases {
+        let out = sb.tilth(argv).output().unwrap();
+        assert_eq!(out.status.code(), Some(2), "{argv:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "{argv:?}: {out:?}");
+    }
+    assert!(!sb.xdg.exists(), "a usage error must not write the cache");
+}
+
+#[test]
+fn launch_preamble_append_path_refuses_an_unsafe_cache_dir() {
+    let sb = Sandbox::new();
+    let source = sb.home.join("addendum.md");
+    fs::write(&source, b"mine\n").unwrap();
+    let dir = sb.xdg.join("tilth");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).unwrap();
+
+    let out = sb
+        .tilth(&["preamble", "--path", "--append"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "no path may print: {out:?}");
+    assert!(stderr.contains(dir.to_str().unwrap()), "{stderr}");
+    assert_eq!(
+        fs::read_dir(&dir).unwrap().count(),
+        0,
+        "nothing may be written"
+    );
+
+    // Printing the text does not use the cache, so the unsafe dir does not matter.
+    let out = sb
+        .tilth(&["preamble", "--append"])
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(out.stdout, joined(b"mine\n"));
+}
+
+#[test]
+fn launch_preamble_append_takes_a_relative_file_and_the_plain_cache_file() {
+    let sb = Sandbox::new();
+    let work = sb.home.join("work");
+    fs::create_dir_all(&work).unwrap();
+    fs::write(work.join("notes.md"), b"relative\n").unwrap();
+    let out = sb
+        .tilth(&["preamble", "--append", "notes.md"])
+        .current_dir(&work)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(out.stdout, joined(b"relative\n"));
+
+    // The plain cache file is a valid FILE. Its bytes append unchanged.
+    let plain = preamble_path(&sb, &[]);
+    let file = append_path(&sb, &plain);
+    assert_ne!(file, plain);
+    assert_eq!(fs::read(&plain).unwrap(), PREAMBLE, "the plain file stays");
+    assert_eq!(fs::read(&file).unwrap(), joined(PREAMBLE));
+}
+
+#[test]
+fn launch_preamble_append_keeps_an_aged_cache_source() {
+    let sb = Sandbox::new();
+    let plain = preamble_path(&sb, &[]);
+    set_age_in_days(&plain, 40);
+
+    let alias = sb.home.join("source.md");
+    std::os::unix::fs::symlink(&plain, &alias).unwrap();
+    let work = sb.home.join("work");
+    fs::create_dir_all(&work).unwrap();
+    std::os::unix::fs::symlink(&alias, work.join("notes.md")).unwrap();
+    for _ in 0..2 {
+        let out = sb
+            .tilth(&["preamble", "--path", "--append", "notes.md"])
+            .current_dir(&work)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let path = PathBuf::from(String::from_utf8(out.stdout).unwrap().trim_end());
+        assert_eq!(fs::read(path).unwrap(), joined(PREAMBLE));
+        assert_eq!(
+            fs::read(&plain).unwrap(),
+            PREAMBLE,
+            "append source must stay"
+        );
+    }
+}
+
+#[test]
+fn launch_preamble_files_have_owner_only_permissions() {
+    let sb = Sandbox::new();
+    let dir = sb.xdg.join("tilth");
+    fs::create_dir_all(&dir).unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    let source = sb.home.join("source.md");
+    fs::write(&source, b"private notes\n").unwrap();
+
+    let joined_file = append_path(&sb, &source);
+    assert_eq!(fs::read(&joined_file).unwrap(), joined(b"private notes\n"));
+    assert_eq!(
+        fs::metadata(&joined_file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    let plain = preamble_path(&sb, &[]);
+    assert_eq!(
+        fs::metadata(&plain).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn launch_preamble_replaces_public_or_symlink_cache_files() {
+    use std::os::unix::fs::MetadataExt;
+
+    let sb = Sandbox::new();
+    let source = sb.home.join("source.md");
+    fs::write(&source, b"private notes\n").unwrap();
+    let file = append_path(&sb, &source);
+    let original_inode = fs::metadata(&file).unwrap().ino();
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(append_path(&sb, &source), file);
+    let meta = fs::metadata(&file).unwrap();
+    assert_ne!(meta.ino(), original_inode, "a public file must be replaced");
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+
+    let target = sb.home.join("target.md");
+    fs::write(&target, b"leave target unchanged\n").unwrap();
+    fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&target, &file).unwrap();
+    assert_eq!(append_path(&sb, &source), file);
+    assert_eq!(fs::read(&target).unwrap(), b"leave target unchanged\n");
+    assert_eq!(fs::read(&file).unwrap(), joined(b"private notes\n"));
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}

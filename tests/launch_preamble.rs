@@ -47,3 +47,15 @@ fn launch_preamble_first_line_is_unique_heading() {
     let h1_count = PREAMBLE.lines().filter(|l| l.starts_with("# ")).count();
     assert_eq!(h1_count, 1, "preamble must have exactly one H1");
 }
+
+/// Callers test this line to detect a usable preamble file, so its text is a contract.
+#[test]
+fn launch_preamble_first_line_is_the_detection_marker() {
+    assert_eq!(PREAMBLE.lines().next(), Some("# tilth agent preamble"));
+}
+
+/// `tilth preamble --append` adds one `\n` after this text, and that makes one empty line.
+#[test]
+fn launch_preamble_ends_with_one_newline() {
+    assert!(PREAMBLE.ends_with('\n') && !PREAMBLE.ends_with("\n\n"));
+}
